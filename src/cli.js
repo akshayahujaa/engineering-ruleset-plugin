@@ -2,9 +2,10 @@
 /**
  * enforce-rules — sync branch rulesets into the current GitHub repository.
  *
- *   enforce-rules            print the plan, write nothing
- *   enforce-rules --apply    print the plan, then apply it
- *   enforce-rules --json     machine-readable plan
+ *   enforce-rules                       plan for the repo in the current directory
+ *   enforce-rules --repo owner/name     plan for any repo, no clone needed
+ *   enforce-rules --apply               apply instead of only planning
+ *   enforce-rules --json                machine-readable plan
  */
 
 import { readFileSync, existsSync } from "node:fs";
@@ -46,8 +47,12 @@ async function main() {
   const asJson = args.includes("--json");
   const cwd = process.cwd();
 
+  // --repo owner/name targets any repository without cloning or cd-ing into it.
+  const repoFlag = args.find((a) => a.startsWith("--repo="))?.split("=")[1] ?? args[args.indexOf("--repo") + 1];
+  const repo = args.includes("--repo") || args.some((a) => a.startsWith("--repo=")) ? repoFlag : undefined;
+
   const { config, source } = loadConfig(cwd);
-  const client = createClient({ cwd });
+  const client = createClient({ cwd, repo });
   const context = await client.context();
 
   if (!context.isAdmin) {

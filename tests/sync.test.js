@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { plan, apply, isUnchanged } from "../src/sync.js";
-import { parseRemote } from "../src/github.js";
+import { parseRemote, parseSlug } from "../src/github.js";
 
 const RULESET = {
   name: "Pull Request Compulsion",
@@ -116,4 +116,11 @@ for (const [url, expected] of [
 
 test("an unparseable remote fails with the offending url", () => {
   assert.throws(() => parseRemote("not-a-remote"), /not-a-remote/);
+});
+
+test("--repo accepts owner/name and rejects anything else", () => {
+  assert.deepEqual(parseSlug("tehvault/frontend-app"), { owner: "tehvault", repo: "frontend-app" });
+  assert.deepEqual(parseSlug(" akshayahujaa/shop-ui "), { owner: "akshayahujaa", repo: "shop-ui" });
+  assert.throws(() => parseSlug("https://github.com/a/b"), /expects 'owner\/name'/);
+  assert.throws(() => parseSlug("just-a-name"), /expects 'owner\/name'/);
 });

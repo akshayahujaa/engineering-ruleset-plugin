@@ -115,7 +115,14 @@ async function requestViaToken(method, path, body, token) {
   return parsed;
 }
 
-export function createClient({ cwd = process.cwd() } = {}) {
+/** Accepts an explicit `owner/repo`, so a target need not be cloned or cd'd into. */
+export function parseSlug(slug) {
+  const match = String(slug).trim().match(/^([\w.-]+)\/([\w.-]+)$/);
+  if (!match) throw new GitHubError(`--repo expects 'owner/name', got '${slug}'.`);
+  return { owner: match[1], repo: match[2] };
+}
+
+export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   const useGh = ghCliAvailable();
 
@@ -128,7 +135,7 @@ export function createClient({ cwd = process.cwd() } = {}) {
   const request = (method, path, body) =>
     useGh ? requestViaGh(method, path, body) : requestViaToken(method, path, body, token);
 
-  const { owner, repo } = resolveRepo(cwd);
+  const { owner, repo } = slug ? parseSlug(slug) : resolveRepo(cwd);
   const base = `repos/${owner}/${repo}`;
 
   return {

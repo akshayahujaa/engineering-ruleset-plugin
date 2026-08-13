@@ -33,6 +33,8 @@ Notes:
 
 - If `$ARGUMENTS` contains `--apply`, the user has pre-authorised the write; run the plan, show
   it, then apply without a second prompt.
+- If `$ARGUMENTS` names a repository, pass it straight through as `--repo owner/name`, which
+  targets any repository without cloning it. Everything else is unchanged.
 - Policy lives in `ruleset-config.json` at the plugin root, unless the repository commits its
   own `.github/ruleset-config.json`, which takes precedence.
 - Adding an environment is a one-line edit to that config; never hand-edit rulesets on GitHub,

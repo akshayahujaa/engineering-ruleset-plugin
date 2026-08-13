@@ -17,10 +17,17 @@ plugin is installed on their machine.
 Or directly:
 
 ```bash
+# the repo in the current directory
 node /path/to/engineering-ruleset-plugin/src/cli.js
+
+# any repo, without cloning or cd-ing into it
+node /path/to/engineering-ruleset-plugin/src/cli.js --repo tehvault/website
+node /path/to/engineering-ruleset-plugin/src/cli.js --repo tehvault/website --apply
 ```
 
-The plan is always safe to run. Nothing is written until `--apply`.
+The plan is always safe to run. Nothing is written until `--apply`. Always read the plan before
+applying to a repo that already has rulesets — matching is by name, so an existing ruleset with a
+managed name is overwritten.
 
 ## Adding an environment
 
