@@ -29,6 +29,23 @@ node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --apply
 Report which rulesets were created, updated, or rejected. If any were rejected, quote the API
 message — a 422 usually names the exact field GitHub refused.
 
+## When the repository is not reachable
+
+The CLI exits non-zero with `No repo access to owner/repo` when the target is private-and-unshared
+or does not exist — GitHub returns the same 404 for both, so do not claim the repo exists. Show
+the message as printed; it already names the URL where access is granted.
+
+If instead it reports a **pending admin invitation**, the CLI stops rather than accepting it,
+because accepting joins the user's account to that repository. Ask the user in chat whether to
+accept. Only if they say yes:
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --repo owner/name --accept-invite
+```
+
+Never pass `--accept-invite` on the user's behalf without that answer, and never combine it with
+`--apply` in the same first run — accept access first, show the resulting plan, then apply.
+
 Notes:
 
 - If `$ARGUMENTS` contains `--apply`, the user has pre-authorised the write; run the plan, show

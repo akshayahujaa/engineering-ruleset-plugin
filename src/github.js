@@ -65,6 +65,9 @@ function requestViaGh(method, path, body) {
       input: body === undefined ? undefined : JSON.stringify(body),
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
+      // execFileSync would otherwise let gh's own "gh: Not Found (HTTP 404)"
+      // reach the terminal ahead of the message we build from it.
+      stdio: ["pipe", "pipe", "pipe"],
     });
     return stdout.trim() ? JSON.parse(stdout) : null;
   } catch (error) {
@@ -161,6 +164,16 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       const info = await request("GET", `orgs/${org}/teams/${slug}`);
       return info.id;
     },
+
+    /**
+     * Invitations are account-scoped, not repo-scoped: a repo you cannot see
+     * still has a visible pending invitation, which is what makes the 404 case
+     * recoverable.
+     */
+    listInvitations: () => request("GET", "user/repository_invitations"),
+
+    /** Accepting changes the user's account state; callers must get consent first. */
+    acceptInvitation: (id) => request("PATCH", `user/repository_invitations/${id}`),
 
     /** Listing omits each ruleset's rules, so callers needing them must get() by id. */
     listRulesets: () => request("GET", `${base}/rulesets`),

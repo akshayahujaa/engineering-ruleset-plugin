@@ -6,6 +6,7 @@
  *   enforce-rules --repo owner/name     plan for any repo, no clone needed
  *   enforce-rules --apply               apply instead of only planning
  *   enforce-rules --json                machine-readable plan
+ *   enforce-rules --accept-invite       accept a pending invitation to the target repo
  */
 
 import { readFileSync, existsSync } from "node:fs";
@@ -14,6 +15,7 @@ import path from "node:path";
 import { compile, referencedTeams } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
+import { probeAccess, acceptAndReprobe, invitationGrantsAdmin, AccessDenied } from "./access.js";
 
 const PLUGIN_ROOT =
   process.env.CLAUDE_PLUGIN_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -35,6 +37,63 @@ function loadConfig(cwd) {
 
 const ICON = { create: "CREATE ", update: "UPDATE ", unchanged: "UNCHANGED" };
 
+/** True only on a real terminal; under the slash command stdin is a pipe. */
+const isInteractive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+async function askYesNo(question) {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return /^y(es)?$/i.test((await rl.question(question)).trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Resolves the repository context, negotiating access when the repository is
+ * not reachable.
+ *
+ * Accepting an invitation joins the user to a repository, so it never happens
+ * implicitly: it needs `--accept-invite`, or a yes on a real terminal. When
+ * neither is available the command stops and says what would unblock it.
+ */
+async function resolveContext(client, { acceptInvite }) {
+  const probe = await probeAccess(client);
+  if (probe.ok) return probe.context;
+
+  const target = `${client.owner}/${client.repo}`;
+
+  if (!probe.invitation) throw new AccessDenied(probe.message);
+
+  console.log(`\n${probe.message}\n`);
+
+  if (!invitationGrantsAdmin(probe.invitation)) {
+    throw new AccessDenied(
+      `The pending invitation to ${target} does not grant admin, and rulesets cannot be managed without it.\n` +
+        "Ask the owner to re-invite you as an admin, then re-run.",
+    );
+  }
+
+  if (acceptInvite) {
+    console.log("Accepting the invitation (--accept-invite).\n");
+    return acceptAndReprobe(client, probe.invitation);
+  }
+
+  if (!isInteractive()) {
+    throw new AccessDenied(
+      `No repo access to ${target} yet — but a pending admin invitation was found.\n\n` +
+        "Accepting it adds your account to the repository, so it is not done automatically.\n" +
+        "Re-run with --accept-invite to accept it and continue.",
+    );
+  }
+
+  if (!(await askYesNo(`Accept this invitation and continue? [y/N] `))) {
+    throw new AccessDenied(`Invitation left pending. No repo access to ${target}; nothing was changed.`);
+  }
+  return acceptAndReprobe(client, probe.invitation);
+}
+
 function describeScope(ruleset) {
   const { include = [], exclude = [] } = ruleset.conditions?.ref_name ?? {};
   const shown = include.map((r) => r.replace("refs/heads/", "")).join(", ");
@@ -45,6 +104,7 @@ async function main() {
   const args = process.argv.slice(2);
   const shouldApply = args.includes("--apply");
   const asJson = args.includes("--json");
+  const acceptInvite = args.includes("--accept-invite");
   const cwd = process.cwd();
 
   // --repo owner/name targets any repository without cloning or cd-ing into it.
@@ -53,7 +113,7 @@ async function main() {
 
   const { config, source } = loadConfig(cwd);
   const client = createClient({ cwd, repo });
-  const context = await client.context();
+  const context = await resolveContext(client, { acceptInvite });
 
   if (!context.isAdmin) {
     throw new GitHubError(
@@ -151,6 +211,13 @@ function explain(error) {
 }
 
 main().catch((error) => {
+  // An access refusal is already written for a human; printing it verbatim
+  // keeps its layout and avoids dressing it up as an API failure.
+  if (error instanceof AccessDenied) {
+    console.error(`\n${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   console.error(`\nenforce-rules: ${explain(error)}\n`);
   process.exitCode = 1;
 });

@@ -29,6 +29,31 @@ The plan is always safe to run. Nothing is written until `--apply`. Always read 
 applying to a repo that already has rulesets — matching is by name, so an existing ruleset with a
 managed name is overwritten.
 
+## Repositories you don't have access to
+
+Targeting a repo you cannot reach stops before anything is written:
+
+```
+No repo access to acme/widgets.
+
+It is either private and not shared with your account, or it does not exist.
+GitHub returns the same 404 for both, so this cannot be narrowed down from here.
+
+To continue, ask an owner to grant you admin on the repository:
+  https://github.com/acme/widgets/settings/access
+```
+
+If someone has already invited you, the pending invitation is detected and described — who sent
+it and what it grants. Accepting joins your account to that repository, so it never happens
+automatically:
+
+```bash
+node src/cli.js --repo acme/widgets --accept-invite
+```
+
+On a real terminal you are asked instead of needing the flag. An invitation that grants less than
+admin is refused up front, since rulesets cannot be managed without it.
+
 ## Adding an environment
 
 Everything is generated from `ruleset-config.json`. Adding an environment is one line:
