@@ -1,0 +1,9 @@
+{
+  "name": "engineering-ruleset-plugin",
+  "version": "1.0.0",
+  "description": "Syncs branch rulesets into any GitHub repository from a single environment-driven config.",
+  "type": "module",
+  "private": true,
+  "bin": { "enforce-rules": "./src/cli.js" },
+  "scripts": { "test": "node --test tests/*.test.js" }
+}

@@ -1,0 +1,33 @@
+{
+  "baseline": {
+    "rulesetName": "Pull Request Compulsion",
+    "includeDefaultBranch": true,
+    "requirePullRequest": true,
+    "requiredApprovals": 0,
+    "preventDeletion": true,
+    "preventForcePush": true,
+    "allowedMergeMethods": ["merge", "squash", "rebase"]
+  },
+
+  "environments": {
+    "dev": {
+      "statusChecks": ["pr-scope/check"],
+      "statusCheckRuleset": "PR-SCOPE-CHECK"
+    },
+    "test": {},
+    "prod": {
+      "requiredApprovals": 1,
+      "reviewerTeams": ["tehvault/reviewers"],
+      "reviewerRuleset": "team-only-reviewer"
+    }
+  },
+
+  "branchNaming": {
+    "rulesetName": "Enforce Branch Nomenclature",
+    "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],
+    "restrictCreation": true,
+    "preventForcePush": true,
+    "requiredApprovals": 1,
+    "reviewerTeams": ["tehvault/reviewers"]
+  }
+}

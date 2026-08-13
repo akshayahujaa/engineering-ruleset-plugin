@@ -1,0 +1,8 @@
+{
+  "name": "engineering-ruleset-plugin",
+  "description": "Syncs GitHub branch rulesets into any repository from a single environment-driven config.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Engineering Platform Team"
+  }
+}
