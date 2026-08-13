@@ -70,16 +70,24 @@ function requestViaGh(method, path, body) {
   } catch (error) {
     const raw = `${error.stdout ?? ""}${error.stderr ?? ""}`;
     const status = Number(raw.match(/HTTP (\d{3})/)?.[1]) || undefined;
+
+    // gh interleaves its own "gh: ..." lines with the API's JSON body, so a
+    // plain JSON.parse of the tail fails; fall back to lifting the message out.
     let parsed;
-    try {
-      parsed = JSON.parse(raw.slice(raw.indexOf("{")));
-    } catch {
-      /* leave unparsed */
+    const start = raw.indexOf("{");
+    if (start !== -1) {
+      for (let end = raw.lastIndexOf("}"); end > start; end = raw.lastIndexOf("}", end - 1)) {
+        try {
+          parsed = JSON.parse(raw.slice(start, end + 1));
+          break;
+        } catch {
+          /* try the next closing brace */
+        }
+      }
     }
-    throw new GitHubError(parsed?.message ?? raw.trim() ?? `gh api ${method} ${path} failed`, {
-      status,
-      body: parsed,
-    });
+    const message = parsed?.message ?? raw.match(/"message"\s*:\s*"([^"]+)"/)?.[1] ?? raw.trim();
+
+    throw new GitHubError(message || `gh api ${method} ${path} failed`, { status, body: parsed });
   }
 }
 

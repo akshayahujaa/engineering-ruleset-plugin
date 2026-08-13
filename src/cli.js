@@ -131,7 +131,21 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
+/** Turns the API's terser refusals into something actionable. */
+function explain(error) {
+  if (/Upgrade to GitHub Pro/i.test(error.message)) {
+    return (
+      "This repository is private and owned by a personal account, where rulesets are a paid " +
+      "feature.\n  Make the repo public, move it to an organisation, or upgrade to GitHub Pro."
+    );
+  }
+  if (error.status === 404) {
+    return `${error.message}\n  Check the repository exists and your token can see it.`;
+  }
+  return error.message;
+}
+
 main().catch((error) => {
-  console.error(`\nenforce-rules: ${error.message}\n`);
+  console.error(`\nenforce-rules: ${explain(error)}\n`);
   process.exitCode = 1;
 });

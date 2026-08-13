@@ -1,0 +1,13 @@
+{
+  "name": "tehvault-engineering",
+  "owner": {
+    "name": "Engineering Platform Team"
+  },
+  "plugins": [
+    {
+      "name": "engineering-ruleset-plugin",
+      "source": "./",
+      "description": "Syncs GitHub branch rulesets into any repository from a single environment-driven config."
+    }
+  ]
+}
