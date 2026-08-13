@@ -173,10 +173,19 @@ function nomenclatureRuleset(config, context, degradations) {
   const name = naming.rulesetName ?? "branch-nomenclature";
   const environments = Object.keys(config.environments ?? {});
 
+  // Excluded refs are the *permitted* ones. Requiring a task id narrows each
+  // prefix from "anything below it" to "a task-id segment, optionally followed
+  // by a description", which is what lets a merge be traced back to a task.
+  const permitted = (naming.allowedPrefixes ?? []).flatMap((prefix) => {
+    if (!naming.requireTaskId) return [`${ref(prefix)}/**/*`];
+    const id = `${ref(prefix)}/${naming.taskIdPrefix ?? "CU-"}*`;
+    return [id, `${id}/**`];
+  });
+
   const exclude = [
     ...environments.map(ref),
     ...(context.defaultBranch ? [ref(context.defaultBranch)] : []),
-    ...(naming.allowedPrefixes ?? []).map((prefix) => `${ref(prefix)}/**/*`),
+    ...permitted,
   ];
 
   const rules = [];

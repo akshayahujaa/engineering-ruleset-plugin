@@ -15,6 +15,7 @@ import path from "node:path";
 import { compile, referencedTeams } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
+import { planClickUp, applyClickUp } from "./clickup.js";
 import {
   probeAccess,
   acceptAndReprobe,
@@ -149,6 +150,7 @@ async function main() {
 
   const { rulesets, degradations } = compile(config, { ...context, teamIds });
   const { steps, undeclared } = await plan(client, rulesets);
+  const clickup = await planClickUp(client, config.clickup);
 
   if (asJson) {
     console.log(JSON.stringify({ repo: `${client.owner}/${client.repo}`, steps, degradations, undeclared }, null, 2));
@@ -171,6 +173,13 @@ async function main() {
     console.log(`  UNMANAGED  ${name.padEnd(30)} → not in config; left untouched`);
   }
 
+  if (clickup) {
+    console.log(
+      `\n  ${ICON[clickup.action]}  ${clickup.path.padEnd(30)} → on merge into ` +
+        `${config.clickup.targetBranch ?? "dev"}, move the task to '${config.clickup.targetStatus ?? "in progress"}'`,
+    );
+  }
+
   const writes = steps.filter((s) => s.action !== "unchanged");
   const guardsDefault = rulesets.some((r) =>
     (r.conditions?.ref_name?.include ?? []).includes("~DEFAULT_BRANCH"),
@@ -183,11 +192,26 @@ async function main() {
     );
   }
 
+  // The token is requested, never captured: passing it through this process
+  // would put it in shell history and the process table. `gh secret set` reads
+  // it silently and encrypts it before it leaves the machine.
+  if (clickup && !clickup.hasToken) {
+    console.log(
+      `\n  The ${clickup.secretName} secret is not set on this repository, so the workflow` +
+        `\n  will skip every task until it is. Set it yourself — it is never typed here:` +
+        `\n\n      gh secret set ${clickup.secretName} --repo ${client.owner}/${client.repo}` +
+        `\n\n  Paste your ClickUp personal API token at the prompt. Get one from ClickUp:` +
+        `\n  Settings → Apps → API Token.`,
+    );
+  }
+
+  const pending = writes.length + (clickup && clickup.action !== "unchanged" ? 1 : 0);
+
   if (!shouldApply) {
     console.log(
-      writes.length === 0
+      pending === 0
         ? "\nAlready in sync. Nothing to apply.\n"
-        : `\nPlan only — nothing written. Re-run with --apply to make these ${writes.length} change(s).\n`,
+        : `\nPlan only — nothing written. Re-run with --apply to make these ${pending} change(s).\n`,
     );
     return;
   }
@@ -205,7 +229,21 @@ async function main() {
     }
   }
 
-  console.log(`\n${applied.length} applied, ${results.length - applied.length - failed.length} unchanged, ${failed.length} failed\n`);
+  let workflowNote = "";
+  if (clickup && clickup.action !== "unchanged") {
+    try {
+      await applyClickUp(client, clickup);
+      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
+    } catch (error) {
+      // A token without the 'workflow' scope cannot write under .github/workflows.
+      const scope = error.status === 403 ? " (the credential lacks the 'workflow' scope)" : "";
+      console.log(`  ✗ ${clickup.path}: ${error.message}${scope}`);
+      workflowNote = " 1 workflow failed";
+      process.exitCode = 1;
+    }
+  }
+
+  console.log(`\n${applied.length} applied, ${results.length - applied.length - failed.length} unchanged, ${failed.length} failed.${workflowNote}\n`);
   if (failed.length > 0) process.exitCode = 1;
 }
 

@@ -80,6 +80,47 @@ have to be applied by the owner, or the repo moved into an organisation.
 Because the plugin authenticates through `gh`, running `gh auth switch` to an account that does
 have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
+## ClickUp task sync
+
+When `clickup.enabled` is set, the sync also installs
+`.github/workflows/clickup-sync.yml` in the target repo. On a merged PR into `dev` it reads the
+task id from the branch name and moves the task to **in progress** — but only if it is still in a
+to-do status. A task already in progress, in review, or done is left alone, so a later merge can
+never drag it backwards.
+
+This runs on GitHub rather than locally because a merge is a GitHub event: nothing on a
+developer's machine can react to someone else merging a PR.
+
+### The branch name is the link
+
+`branchNaming.requireTaskId` narrows every prefix from `feature/**` to `feature/CU-<id>[/…]`, so
+the ruleset itself guarantees each branch carries a task:
+
+```
+feature/CU-123/checkout-redirect     ✓ task 123
+feature/CU-86c1abcde                 ✓ task 86c1abcde
+feature/checkout-redirect            ✗ blocked at creation
+```
+
+**This tightens an existing rule.** Once applied, branches without an id are refused at creation.
+Existing branches are untouched, but the next one your team makes must carry a task id.
+
+### The token
+
+The plugin never handles it. The sync only *checks whether* the secret exists and prints the
+command to set it — the value is read straight into GitHub's encrypted store, never through this
+tool, your shell history, or the process table:
+
+```bash
+gh secret set CLICKUP_TOKEN --repo owner/name
+```
+
+Get the token from ClickUp: **Settings → Apps → API Token**. If your workspace uses ClickUp
+Custom Task IDs, also set `CLICKUP_TEAM_ID`; the workflow switches to the custom-id endpoint when
+it is present.
+
+Without the secret the workflow still runs, logs a warning, and changes nothing.
+
 ## Adding an environment
 
 Everything is generated from `ruleset-config.json`. Adding an environment is one line:

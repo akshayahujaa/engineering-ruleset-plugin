@@ -61,21 +61,28 @@ test("dev's status check becomes its own ruleset scoped to dev", () => {
   );
 });
 
-test("nomenclature excludes environments, default branch, and allowed prefixes", () => {
+test("requiring a task id narrows each prefix to id-bearing branches", () => {
   const { rulesets } = compile(CANONICAL, PERSONAL);
   const naming = byName(rulesets, "Enforce Branch Nomenclature");
 
   assert.deepEqual(naming.conditions.ref_name.include, ["~ALL"]);
+  // Excluded refs are the permitted ones; a bare `feature/**/*` would let a
+  // branch through with no task to advance on merge.
   assert.deepEqual(naming.conditions.ref_name.exclude, [
     "refs/heads/dev",
     "refs/heads/test",
     "refs/heads/prod",
     "refs/heads/main",
-    "refs/heads/feature/**/*",
-    "refs/heads/bugfix/**/*",
-    "refs/heads/hotfix/**/*",
-    "refs/heads/docs/**/*",
-    "refs/heads/chore/**/*",
+    "refs/heads/feature/CU-*",
+    "refs/heads/feature/CU-*/**",
+    "refs/heads/bugfix/CU-*",
+    "refs/heads/bugfix/CU-*/**",
+    "refs/heads/hotfix/CU-*",
+    "refs/heads/hotfix/CU-*/**",
+    "refs/heads/docs/CU-*",
+    "refs/heads/docs/CU-*/**",
+    "refs/heads/chore/CU-*",
+    "refs/heads/chore/CU-*/**",
   ]);
   assert.ok(naming.rules.some((r) => r.type === "creation"), "creation rule is what blocks bad names");
 });
@@ -223,4 +230,25 @@ test("review booleans are configurable per scope", () => {
   assert.equal(params.require_code_owner_review, true);
   assert.equal(params.require_last_push_approval, true);
   assert.equal(params.dismiss_stale_reviews_on_push, false, "unset options stay off");
+});
+
+test("without requireTaskId a prefix still permits any branch below it", () => {
+  const relaxed = {
+    ...CANONICAL,
+    branchNaming: { ...CANONICAL.branchNaming, requireTaskId: false },
+  };
+  const naming = byName(compile(relaxed, PERSONAL).rulesets, "Enforce Branch Nomenclature");
+
+  assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/**/*"));
+  assert.ok(!naming.conditions.ref_name.exclude.some((p) => p.includes("CU-")));
+});
+
+test("the task id prefix used by nomenclature is configurable", () => {
+  const custom = {
+    ...CANONICAL,
+    branchNaming: { ...CANONICAL.branchNaming, taskIdPrefix: "TASK-" },
+  };
+  const naming = byName(compile(custom, PERSONAL).rulesets, "Enforce Branch Nomenclature");
+
+  assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*"));
 });

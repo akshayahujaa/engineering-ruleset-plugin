@@ -52,6 +52,16 @@ Do not suggest workarounds it rules out — in particular, if the repo is owned 
 account, admin cannot be delegated to anyone, so being added as a collaborator will not help and
 the owner has to run the command instead.
 
+## ClickUp
+
+When the plan includes `.github/workflows/clickup-sync.yml`, applying commits that file to the
+repository — call that out, since every other change is a settings change.
+
+If it reports that `CLICKUP_TOKEN` is not set, relay the `gh secret set` command for the user to
+run themselves. **Never ask the user to paste the token into the chat, and never put a token
+value into a command, file, or environment variable on their behalf.** `gh secret set` reads it
+without echoing and encrypts it before it leaves the machine; that is the only route.
+
 Notes:
 
 - If `$ARGUMENTS` contains `--apply`, the user has pre-authorised the write; run the plan, show

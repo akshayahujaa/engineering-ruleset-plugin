@@ -185,6 +185,40 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
     /** Accepting changes the user's account state; callers must get consent first. */
     acceptInvitation: (id) => request("PATCH", `user/repository_invitations/${id}`),
 
+    /** Returns the file's decoded content and blob sha, or null when absent. */
+    async getFile(filePath) {
+      try {
+        const info = await request("GET", `${base}/contents/${filePath}`);
+        return { sha: info.sha, content: Buffer.from(info.content ?? "", "base64").toString("utf8") };
+      } catch (error) {
+        if (error.status === 404) return null;
+        throw error;
+      }
+    },
+
+    /** Creating or updating a file needs the prior sha, or GitHub rejects the write. */
+    putFile(filePath, content, message, sha) {
+      return request("PUT", `${base}/contents/${filePath}`, {
+        message,
+        content: Buffer.from(content, "utf8").toString("base64"),
+        ...(sha ? { sha } : {}),
+      });
+    },
+
+    /**
+     * Whether a secret exists. The API never returns a secret's value, so this
+     * can confirm the token is configured without ever reading it.
+     */
+    async hasSecret(name) {
+      try {
+        await request("GET", `${base}/actions/secrets/${name}`);
+        return true;
+      } catch (error) {
+        if (error.status === 404) return false;
+        throw error;
+      }
+    },
+
     /** Listing omits each ruleset's rules, so callers needing them must get() by id. */
     listRulesets: () => request("GET", `${base}/rulesets`),
     getRuleset: (id) => request("GET", `${base}/rulesets/${id}`),

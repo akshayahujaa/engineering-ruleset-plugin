@@ -22,9 +22,20 @@
     }
   },
 
+  "clickup": {
+    "enabled": true,
+    "targetBranch": "dev",
+    "taskIdPrefix": "CU-",
+    "todoStatuses": ["to do", "todo", "open", "backlog", "pending"],
+    "targetStatus": "in progress",
+    "secretName": "CLICKUP_TOKEN"
+  },
+
   "branchNaming": {
     "rulesetName": "Enforce Branch Nomenclature",
     "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],
+    "requireTaskId": true,
+    "taskIdPrefix": "CU-",
     "restrictCreation": true,
     "preventForcePush": true,
     "requiredApprovals": 1,
