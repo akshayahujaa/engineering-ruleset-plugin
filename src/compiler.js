@@ -23,8 +23,16 @@ function teamIsUsable(team, context) {
  * repo cannot honour it. Every drop is recorded so the plan can report it
  * instead of silently weakening the policy.
  */
-function pullRequestRule({ approvals, teams, mergeMethods }, context, rulesetName, degradations) {
-  const parameters = { required_approving_review_count: approvals ?? 0 };
+function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, context, rulesetName, degradations) {
+  // GitHub's schema requires all four review booleans alongside the approval
+  // count; sending the count alone is rejected with a 422 on the rule index.
+  const parameters = {
+    required_approving_review_count: approvals ?? 0,
+    dismiss_stale_reviews_on_push: review.dismissStaleReviewsOnPush ?? false,
+    require_code_owner_review: review.requireCodeOwnerReview ?? false,
+    require_last_push_approval: review.requireLastPushApproval ?? false,
+    required_review_thread_resolution: review.requireReviewThreadResolution ?? false,
+  };
 
   if (mergeMethods) parameters.allowed_merge_methods = mergeMethods;
 
@@ -74,6 +82,7 @@ function baselineRuleset(config, context, degradations) {
           approvals: baseline.requiredApprovals,
           teams: baseline.reviewerTeams,
           mergeMethods: baseline.allowedMergeMethods,
+          review: baseline.review,
         },
         context,
         name,
@@ -140,6 +149,7 @@ function reviewerRulesets(config, context, degradations) {
               approvals: env.requiredApprovals,
               teams: env.reviewerTeams,
               mergeMethods: env.allowedMergeMethods ?? config.baseline?.allowedMergeMethods,
+              review: env.review ?? config.baseline?.review,
             },
             context,
             name,
@@ -178,6 +188,7 @@ function nomenclatureRuleset(config, context, degradations) {
         approvals: naming.requiredApprovals,
         teams: naming.reviewerTeams,
         mergeMethods: naming.allowedMergeMethods,
+        review: naming.review,
       },
       context,
       name,

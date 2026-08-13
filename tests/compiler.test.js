@@ -182,3 +182,45 @@ test("payloads carry no response-only fields", () => {
 test("referencedTeams collects every team the config mentions, deduped", () => {
   assert.deepEqual(referencedTeams(CANONICAL), ["tehvault/reviewers"]);
 });
+
+/**
+ * Regression: GitHub rejects a pull_request rule carrying only the approval
+ * count with "Invalid property /rules/N: data matches no possible input".
+ * Verified against the live API — the count alone and count plus merge methods
+ * both 422; the count plus all four booleans is accepted.
+ */
+test("every pull_request rule carries all four review booleans", () => {
+  const { rulesets } = compile(CANONICAL, PERSONAL);
+  const required = [
+    "required_approving_review_count",
+    "dismiss_stale_reviews_on_push",
+    "require_code_owner_review",
+    "require_last_push_approval",
+    "required_review_thread_resolution",
+  ];
+
+  const pullRequestRules = rulesets.flatMap((r) =>
+    r.rules.filter((rule) => rule.type === "pull_request").map((rule) => [r.name, rule]),
+  );
+  assert.ok(pullRequestRules.length >= 3, "the canonical config has several pull_request rules");
+
+  for (const [rulesetName, rule] of pullRequestRules) {
+    for (const field of required) {
+      assert.notEqual(rule.parameters[field], undefined, `${rulesetName} is missing '${field}'`);
+    }
+  }
+});
+
+test("review booleans are configurable per scope", () => {
+  const config = clone(CANONICAL);
+  config.branchNaming.review = { requireCodeOwnerReview: true, requireLastPushApproval: true };
+
+  const { rulesets } = compile(config, PERSONAL);
+  const params = byName(rulesets, "Enforce Branch Nomenclature").rules.find(
+    (r) => r.type === "pull_request",
+  ).parameters;
+
+  assert.equal(params.require_code_owner_review, true);
+  assert.equal(params.require_last_push_approval, true);
+  assert.equal(params.dismiss_stale_reviews_on_push, false, "unset options stay off");
+});
