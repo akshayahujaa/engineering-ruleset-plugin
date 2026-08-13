@@ -8,6 +8,8 @@ import {
   noAccessMessage,
   probeAccess,
   acceptAndReprobe,
+  describePermission,
+  needsAdminMessage,
 } from "../src/access.js";
 
 const CONTEXT = {
@@ -113,6 +115,67 @@ test("the no-access message refuses to claim the repository exists", () => {
   assert.match(text, /No repo access to acme\/widgets/);
   assert.match(text, /or it does not exist/);
   assert.match(text, /settings\/access/);
+});
+
+// --- visible but not admin ---------------------------------------------------
+
+test("the effective role reported is the highest one held", () => {
+  assert.equal(describePermission({ admin: true, push: true, pull: true }), "admin");
+  assert.equal(describePermission({ maintain: true, push: true, pull: true }), "maintain");
+  assert.equal(describePermission({ push: true, pull: true }), "write");
+  assert.equal(describePermission({ triage: true, pull: true }), "triage");
+  assert.equal(describePermission({ pull: true }), "read");
+  assert.equal(describePermission({}), "no");
+});
+
+test("a personal-account repo says admin cannot be delegated at all", () => {
+  const text = needsAdminMessage({
+    owner: "shubhamsatpute-ship-it",
+    repo: "day1_goal",
+    ownerType: "User",
+    ownerLogin: "shubhamsatpute-ship-it",
+    permissions: { pull: true },
+    viewer: "akshayahujaa",
+  });
+
+  assert.match(text, /authenticated as 'akshayahujaa', who has read access/);
+  assert.match(text, /collaborators cannot go above write/);
+  assert.match(text, /ask shubhamsatpute-ship-it to run this command themselves/);
+  // Pointing at settings/access would be false hope on a personal repo.
+  assert.doesNotMatch(text, /settings\/access/);
+});
+
+test("an org repo points at the page where admin can actually be granted", () => {
+  const text = needsAdminMessage({
+    owner: "acme",
+    repo: "widgets",
+    ownerType: "Organization",
+    ownerLogin: "acme",
+    permissions: { push: true, pull: true },
+    viewer: "akshayahujaa",
+  });
+
+  assert.match(text, /who has write access/);
+  assert.match(text, /grant you the Admin role/);
+  assert.match(text, /https:\/\/github\.com\/acme\/widgets\/settings\/access/);
+  assert.doesNotMatch(text, /cannot go above write/);
+});
+
+test("both variants offer switching to an account that has admin", () => {
+  for (const ownerType of ["User", "Organization"]) {
+    const text = needsAdminMessage({
+      owner: "o", repo: "r", ownerType, ownerLogin: "o", permissions: { pull: true }, viewer: "me",
+    });
+    assert.match(text, /gh auth switch/);
+  }
+});
+
+test("an unknown viewer degrades without printing 'undefined'", () => {
+  const text = needsAdminMessage({
+    owner: "o", repo: "r", ownerType: "User", ownerLogin: "o", permissions: { pull: true }, viewer: null,
+  });
+  assert.match(text, /Your credentials have read access/);
+  assert.doesNotMatch(text, /undefined|null/);
 });
 
 // --- probing -----------------------------------------------------------------

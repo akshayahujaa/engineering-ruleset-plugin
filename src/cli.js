@@ -15,7 +15,13 @@ import path from "node:path";
 import { compile, referencedTeams } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
-import { probeAccess, acceptAndReprobe, invitationGrantsAdmin, AccessDenied } from "./access.js";
+import {
+  probeAccess,
+  acceptAndReprobe,
+  invitationGrantsAdmin,
+  needsAdminMessage,
+  AccessDenied,
+} from "./access.js";
 
 const PLUGIN_ROOT =
   process.env.CLAUDE_PLUGIN_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -116,8 +122,15 @@ async function main() {
   const context = await resolveContext(client, { acceptInvite });
 
   if (!context.isAdmin) {
-    throw new GitHubError(
-      `You need admin on ${client.owner}/${client.repo} to manage rulesets; your token does not have it.`,
+    throw new AccessDenied(
+      needsAdminMessage({
+        owner: client.owner,
+        repo: client.repo,
+        ownerType: context.ownerType,
+        ownerLogin: context.ownerLogin,
+        permissions: context.permissions,
+        viewer: await client.viewer(),
+      }),
     );
   }
 

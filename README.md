@@ -54,6 +54,32 @@ node src/cli.js --repo acme/widgets --accept-invite
 On a real terminal you are asked instead of needing the flag. An invitation that grants less than
 admin is refused up front, since rulesets cannot be managed without it.
 
+## Repositories you can see but cannot administer
+
+A repo you have read or write access to fails differently — it names the account you are
+authenticated as, your effective role, and whether the gap is fixable:
+
+```
+No admin access to acme/widgets.
+
+You are authenticated as 'akshayahujaa', who has write access.
+Managing rulesets requires admin.
+
+Ask an owner of the 'acme' organisation to grant you the Admin role:
+  https://github.com/acme/widgets/settings/access
+
+If a different account of yours already has admin, switch to it and re-run:
+  gh auth switch          (or: gh auth login)
+```
+
+**Personal-account repositories are a dead end.** GitHub reserves admin on them for the owner —
+collaborators top out at write — so no invitation, role change, or access link will unblock a
+sync. The command says so rather than sending you to a settings page that cannot help. The rules
+have to be applied by the owner, or the repo moved into an organisation.
+
+Because the plugin authenticates through `gh`, running `gh auth switch` to an account that does
+have admin is all that is needed; nothing in the plugin has to be reconfigured.
+
 ## Adding an environment
 
 Everything is generated from `ruleset-config.json`. Adding an environment is one line:

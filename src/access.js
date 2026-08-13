@@ -93,6 +93,60 @@ export function noAccessMessage(owner, repo) {
   ].join("\n");
 }
 
+/** Highest-to-lowest, so the caller's effective role can be named in a message. */
+const ROLE_ORDER = [
+  ["admin", "admin"],
+  ["maintain", "maintain"],
+  ["push", "write"],
+  ["triage", "triage"],
+  ["pull", "read"],
+];
+
+export function describePermission(permissions) {
+  const found = ROLE_ORDER.find(([key]) => permissions?.[key]);
+  return found ? found[1] : "no";
+}
+
+/**
+ * The message for a repository you can see but cannot administer.
+ *
+ * The owner type decides whether this is fixable at all: an organisation can
+ * grant the Admin role to anyone, whereas a repository owned by a personal
+ * account reserves admin for the owner — its collaborators top out at write —
+ * so no invitation will ever unblock it.
+ */
+export function needsAdminMessage({ owner, repo, ownerType, ownerLogin, permissions, viewer }) {
+  const role = describePermission(permissions);
+  const who = viewer ? `You are authenticated as '${viewer}', who has ${role} access.` : `Your credentials have ${role} access.`;
+
+  const lines = [`No admin access to ${owner}/${repo}.`, "", who, "Managing rulesets requires admin.", ""];
+
+  if (ownerType === "Organization") {
+    lines.push(
+      `Ask an owner of the '${ownerLogin}' organisation to grant you the Admin role:`,
+      `  https://github.com/${owner}/${repo}/settings/access`,
+    );
+  } else {
+    lines.push(
+      "This repository belongs to a personal account, and GitHub reserves admin on",
+      `those for the owner alone — collaborators cannot go above write. Being added`,
+      "to the repository therefore will not unblock this.",
+      "",
+      "The rules have to be applied by the owner instead. Either:",
+      `  - ask ${ownerLogin} to run this command themselves, or`,
+      `  - have the repository transferred to an organisation, where admin can be granted.`,
+    );
+  }
+
+  lines.push(
+    "",
+    "If a different account of yours already has admin, switch to it and re-run:",
+    "  gh auth switch          (or: gh auth login)",
+  );
+
+  return lines.join("\n");
+}
+
 /**
  * Probes the target repository, returning either its context or a description
  * of what is blocking. Never mutates anything.

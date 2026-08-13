@@ -146,6 +146,15 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
     repo,
     authMode: useGh ? "gh cli" : "token",
 
+    /** The login the current credentials belong to, for naming it in access errors. */
+    async viewer() {
+      try {
+        return (await request("GET", "user"))?.login ?? null;
+      } catch {
+        return null;
+      }
+    },
+
     /** Everything the compiler needs to know about the target repository. */
     async context() {
       const info = await request("GET", base);
@@ -155,6 +164,7 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
         defaultBranch: info.default_branch,
         visibility: info.visibility,
         isAdmin: Boolean(info.permissions?.admin),
+        permissions: info.permissions ?? {},
       };
     },
 
