@@ -121,6 +121,30 @@ it is present.
 
 Without the secret the workflow still runs, logs a warning, and changes nothing.
 
+## Environment branches
+
+Connecting a repo creates `dev`, `test`, and `prod` from the default branch if they are missing —
+a ruleset naming `refs/heads/dev` protects nothing while that branch does not exist.
+
+**The order is forced.** `Pull Request Compulsion` requires a pull request for `dev`, and creating
+a branch counts as a direct push, so once that ruleset is active GitHub refuses the creation with
+a 422. Branches are therefore created *before* rulesets are written.
+
+On a repo that has already been synced, the rulesets that would refuse the creation are dropped to
+`evaluate`, the branches are created, and enforcement is restored — reported in the plan before
+anything happens:
+
+```
+  CREATE   dev, test, prod                → environment branch(es), from main
+             [PR-SCOPE-CHECK, Pull Request Compulsion, team-only-reviewer would refuse this;
+              each is dropped to 'evaluate' only while the branches are created,
+              then restored to 'active']
+```
+
+The restore runs in a `finally`, so a branch that fails to create cannot leave the repository
+unprotected. There is a test for exactly that. It is still a brief window where the default branch
+is unguarded, which is why the plan says so up front.
+
 ## Adding an environment
 
 Everything is generated from `ruleset-config.json`. Adding an environment is one line:

@@ -219,8 +219,39 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       }
     },
 
+    listBranches: async () =>
+      (await request("GET", `${base}/branches?per_page=100`)).map((b) => b.name),
+
+    refSha: async (branch) => (await request("GET", `${base}/git/ref/heads/${branch}`)).object.sha,
+
+    createRef: (ref, sha) => request("POST", `${base}/git/refs`, { ref, sha }),
+
+    /**
+     * Flips enforcement on an existing ruleset.
+     *
+     * Sends the whole ruleset rather than just the changed field: whether PUT
+     * merges or replaces is not worth betting a repository's rules on, and a
+     * whitelist is correct under either. Response-only fields are dropped
+     * because GitHub rejects a payload carrying them.
+     */
+    setEnforcement: (ruleset, enforcement) =>
+      request("PUT", `${base}/rulesets/${ruleset.id}`, {
+        name: ruleset.name,
+        target: ruleset.target,
+        enforcement,
+        bypass_actors: ruleset.bypass_actors ?? [],
+        conditions: ruleset.conditions,
+        rules: ruleset.rules,
+      }),
+
     /** Listing omits each ruleset's rules, so callers needing them must get() by id. */
     listRulesets: () => request("GET", `${base}/rulesets`),
+
+    /** Rules and conditions are needed to tell which ruleset blocks a creation. */
+    async fullRulesets() {
+      const summaries = await request("GET", `${base}/rulesets`);
+      return Promise.all(summaries.map((r) => request("GET", `${base}/rulesets/${r.id}`)));
+    },
     getRuleset: (id) => request("GET", `${base}/rulesets/${id}`),
     createRuleset: (payload) => request("POST", `${base}/rulesets`, payload),
     updateRuleset: (id, payload) => request("PUT", `${base}/rulesets/${id}`, payload),

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { compile, referencedTeams } from "../src/compiler.js";
+import { compile, referencedTeams, addEnvironments } from "../src/compiler.js";
 
 const CANONICAL = JSON.parse(
   readFileSync(fileURLToPath(new URL("../ruleset-config.json", import.meta.url)), "utf8"),
@@ -251,4 +251,23 @@ test("the task id prefix used by nomenclature is configurable", () => {
   const naming = byName(compile(custom, PERSONAL).rulesets, "Enforce Branch Nomenclature");
 
   assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*"));
+});
+
+test("adding an environment reports only the genuinely new ones", () => {
+  const config = clone(CANONICAL);
+  assert.deepEqual(addEnvironments(config, ["staging", "dev"]), ["staging"]);
+  assert.deepEqual(config.environments.staging, {}, "a bare env still inherits the baseline");
+});
+
+test("an added environment flows into the compiled rulesets", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["staging"]);
+  const { rulesets } = compile(config, PERSONAL);
+
+  assert.ok(
+    byName(rulesets, "Pull Request Compulsion").conditions.ref_name.include.includes("refs/heads/staging"),
+  );
+  assert.ok(
+    byName(rulesets, "Enforce Branch Nomenclature").conditions.ref_name.exclude.includes("refs/heads/staging"),
+  );
 });

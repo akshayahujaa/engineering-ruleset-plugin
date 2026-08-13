@@ -52,6 +52,31 @@ Do not suggest workarounds it rules out — in particular, if the repo is owned 
 account, admin cannot be delegated to anyone, so being added as a collaborator will not help and
 the owner has to run the command instead.
 
+## Environments
+
+The config carries `dev`, `test`, and `prod`. The sync creates any that are missing, from the
+default branch, **before** writing rulesets — a ruleset requiring a pull request for `dev` also
+refuses the push that creates `dev`, so the order is not optional.
+
+On a repo already synced, the blocking rulesets are dropped to `evaluate` for the moment it takes
+to create the branches, then restored to `active`. Say so before applying: it is a brief window
+where the default branch is unprotected.
+
+**On a repo's first sync only** — recognisable because every ruleset shows `CREATE` and the repo
+has no rulesets yet — ask the user, using AskUserQuestion, whether they want any environment
+beyond `dev`, `test`, and `prod`. Offer the three defaults as the recommended answer. If they name
+others, pass them through:
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --env staging --env uat
+```
+
+Do not ask on a repo that already has rulesets — a re-sync should be quiet.
+
+An added environment is written into the plugin's own `ruleset-config.json` on `--apply`, so it
+applies to **every** repo synced from then on. Tell the user that; if they only want it for one
+repo, that is a per-repo `.github/ruleset-config.json` instead.
+
 ## ClickUp
 
 When the plan includes `.github/workflows/clickup-sync.yml`, applying commits that file to the

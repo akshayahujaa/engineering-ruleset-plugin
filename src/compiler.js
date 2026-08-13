@@ -255,3 +255,23 @@ export function referencedTeams(config) {
   ];
   return dedupe(teams);
 }
+
+/**
+ * Adds environments to a config, returning the names that were genuinely new.
+ *
+ * A bare `{}` is deliberate: an environment with no settings still picks up
+ * the baseline PR requirement and is excluded from the nomenclature ruleset,
+ * which is the whole point of the environment list.
+ */
+export function addEnvironments(config, names) {
+  config.environments ??= {};
+  const added = [];
+
+  for (const name of names) {
+    if (Object.hasOwn(config.environments, name)) continue;
+    config.environments[name] = {};
+    added.push(name);
+  }
+
+  return added;
+}

@@ -7,15 +7,17 @@
  *   enforce-rules --apply               apply instead of only planning
  *   enforce-rules --json                machine-readable plan
  *   enforce-rules --accept-invite       accept a pending invitation to the target repo
+ *   enforce-rules --env staging         add an environment; persisted on --apply
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { compile, referencedTeams } from "./compiler.js";
+import { compile, referencedTeams, addEnvironments } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
 import { planClickUp, applyClickUp } from "./clickup.js";
+import { planBranches, applyBranches } from "./branches.js";
 import {
   probeAccess,
   acceptAndReprobe,
@@ -114,11 +116,20 @@ async function main() {
   const acceptInvite = args.includes("--accept-invite");
   const cwd = process.cwd();
 
+  // --env may repeat and may carry a comma-separated list.
+  const requestedEnvs = args
+    .flatMap((a, i) => (a === "--env" ? [args[i + 1]] : a.startsWith("--env=") ? [a.slice(6)] : []))
+    .filter(Boolean)
+    .flatMap((v) => v.split(","))
+    .map((v) => v.trim())
+    .filter((v) => v && !v.startsWith("--"));
+
   // --repo owner/name targets any repository without cloning or cd-ing into it.
   const repoFlag = args.find((a) => a.startsWith("--repo="))?.split("=")[1] ?? args[args.indexOf("--repo") + 1];
   const repo = args.includes("--repo") || args.some((a) => a.startsWith("--repo=")) ? repoFlag : undefined;
 
   const { config, source } = loadConfig(cwd);
+  const addedEnvs = addEnvironments(config, requestedEnvs);
   const client = createClient({ cwd, repo });
   const context = await resolveContext(client, { acceptInvite });
 
@@ -151,6 +162,7 @@ async function main() {
   const { rulesets, degradations } = compile(config, { ...context, teamIds });
   const { steps, undeclared } = await plan(client, rulesets);
   const clickup = await planClickUp(client, config.clickup);
+  const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch);
 
   if (asJson) {
     console.log(JSON.stringify({ repo: `${client.owner}/${client.repo}`, steps, degradations, undeclared }, null, 2));
@@ -171,6 +183,26 @@ async function main() {
 
   for (const name of undeclared) {
     console.log(`  UNMANAGED  ${name.padEnd(30)} → not in config; left untouched`);
+  }
+
+  if (addedEnvs.length > 0) {
+    console.log(
+      `\n  NEW ENV  ${addedEnvs.join(", ").padEnd(30)} → will be added to ` +
+        `${path.relative(cwd, source) || source}, affecting every repo synced with it`,
+    );
+  }
+
+  if (branches.missing.length > 0) {
+    console.log(
+      `\n  CREATE   ${branches.missing.join(", ").padEnd(30)} → environment branch(es), from ${context.defaultBranch}`,
+    );
+    if (branches.blocked.length > 0) {
+      console.log(
+        `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
+          `\n              each is dropped to 'evaluate' only while the branches are created,` +
+          `\n              then restored to 'active']`,
+      );
+    }
   }
 
   if (clickup) {
@@ -205,7 +237,8 @@ async function main() {
     );
   }
 
-  const pending = writes.length + (clickup && clickup.action !== "unchanged" ? 1 : 0);
+  const pending =
+    writes.length + (clickup && clickup.action !== "unchanged" ? 1 : 0) + branches.missing.length;
 
   if (!shouldApply) {
     console.log(
@@ -216,11 +249,30 @@ async function main() {
     return;
   }
 
+  console.log("");
+
+  // Persisting the new environment is what makes it apply to every future
+  // repo; without it the next run would plan the environment away again.
+  if (addedEnvs.length > 0) {
+    writeFileSync(source, `${JSON.stringify(config, null, 2)}\n`);
+    console.log(`  ✓ added ${addedEnvs.join(", ")} to ${path.relative(cwd, source) || source}`);
+  }
+
+  // Branches first: a ruleset requiring a PR for dev makes creating dev
+  // impossible, so the guard has to go up after the branch exists.
+  for (const result of await applyBranches(client, branches, context.defaultBranch)) {
+    console.log(
+      result.status === "created"
+        ? `  ✓ created branch ${result.name}`
+        : `  ✗ branch ${result.name}: ${result.error}`,
+    );
+    if (result.status === "failed") process.exitCode = 1;
+  }
+
   const results = await apply(client, steps);
   const applied = results.filter((r) => r.status === "applied");
   const failed = results.filter((r) => r.status === "failed");
 
-  console.log("");
   for (const result of applied) console.log(`  ✓ ${result.action === "create" ? "created" : "updated"} ${result.name}`);
   for (const result of failed) {
     console.log(`  ✗ ${result.name}: ${result.error}`);
