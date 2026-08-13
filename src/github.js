@@ -219,8 +219,15 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       }
     },
 
-    listBranches: async () =>
-      (await request("GET", `${base}/branches?per_page=100`)).map((b) => b.name),
+    /** Paginated: a repo with >100 branches must not misreport one as missing. */
+    listBranches: async () => {
+      const names = [];
+      for (let page = 1; ; page += 1) {
+        const batch = await request("GET", `${base}/branches?per_page=100&page=${page}`);
+        names.push(...batch.map((b) => b.name));
+        if (batch.length < 100) return names;
+      }
+    },
 
     refSha: async (branch) => (await request("GET", `${base}/git/ref/heads/${branch}`)).object.sha,
 
@@ -244,12 +251,17 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
         rules: ruleset.rules,
       }),
 
-    /** Listing omits each ruleset's rules, so callers needing them must get() by id. */
-    listRulesets: () => request("GET", `${base}/rulesets`),
+    /**
+     * Listing omits each ruleset's rules, so callers needing them must get()
+     * by id. `includes_parents=false` keeps org-level rulesets out: they are
+     * not managed here, would pollute drift detection, and cannot be updated
+     * through the repo endpoint anyway.
+     */
+    listRulesets: () => request("GET", `${base}/rulesets?per_page=100&includes_parents=false`),
 
     /** Rules and conditions are needed to tell which ruleset blocks a creation. */
     async fullRulesets() {
-      const summaries = await request("GET", `${base}/rulesets`);
+      const summaries = await request("GET", `${base}/rulesets?per_page=100&includes_parents=false`);
       return Promise.all(summaries.map((r) => request("GET", `${base}/rulesets/${r.id}`)));
     },
     getRuleset: (id) => request("GET", `${base}/rulesets/${id}`),

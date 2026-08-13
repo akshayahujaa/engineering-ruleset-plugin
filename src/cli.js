@@ -10,9 +10,14 @@
  *   enforce-rules --env staging         add an environment; persisted on --apply
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
+import { writeFileSync } from "node:fs";
+import {
+  resolveConfig,
+  isMarketplaceClone,
+  isValidEnvName,
+  parseEnvList,
+  OVERRIDE_PATH,
+} from "./config.js";
 import { compile, referencedTeams, addEnvironments } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
@@ -26,24 +31,6 @@ import {
   AccessDenied,
 } from "./access.js";
 
-const PLUGIN_ROOT =
-  process.env.CLAUDE_PLUGIN_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-/**
- * A repository may override the bundled policy by committing its own config,
- * which keeps the plugin generic while letting one repo diverge.
- */
-function loadConfig(cwd) {
-  const override = path.join(cwd, ".github", "ruleset-config.json");
-  const source = existsSync(override) ? override : path.join(PLUGIN_ROOT, "ruleset-config.json");
-
-  try {
-    return { config: JSON.parse(readFileSync(source, "utf8")), source };
-  } catch (error) {
-    throw new Error(`Cannot read ruleset config at ${source}: ${error.message}`);
-  }
-}
-
 const ICON = { create: "CREATE ", update: "UPDATE ", unchanged: "UNCHANGED" };
 
 /** True only on a real terminal; under the slash command stdin is a pipe. */
@@ -54,6 +41,27 @@ async function askYesNo(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return /^y(es)?$/i.test((await rl.question(question)).trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * On a repository's very first sync, offers to extend the default
+ * environments. TTY-only by construction: under the slash command stdin is a
+ * pipe, and the command's own instructions gather this answer with a widget
+ * and pass it back as `--env`, so the CLI prompting there would either hang
+ * or ask a question nobody can answer.
+ */
+async function askExtraEnvironments(defaults) {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    console.log(`\nFirst sync of this repository. Default environments: ${defaults.join(", ")}.`);
+    const answer = await rl.question(
+      "Extra environments beyond these? (comma-separated, empty for none) ",
+    );
+    return parseEnvList(answer);
   } finally {
     rl.close();
   }
@@ -120,16 +128,24 @@ async function main() {
   const requestedEnvs = args
     .flatMap((a, i) => (a === "--env" ? [args[i + 1]] : a.startsWith("--env=") ? [a.slice(6)] : []))
     .filter(Boolean)
-    .flatMap((v) => v.split(","))
-    .map((v) => v.trim())
-    .filter((v) => v && !v.startsWith("--"));
+    .flatMap(parseEnvList)
+    .filter((v) => !v.startsWith("--"));
+
+  const badEnvs = requestedEnvs.filter((name) => !isValidEnvName(name));
+  if (badEnvs.length > 0) {
+    throw new Error(`Not usable as branch names: ${badEnvs.join(", ")}`);
+  }
+
+  if (asJson && shouldApply) {
+    // Refusing beats the old behaviour, which returned the JSON plan and
+    // silently skipped the apply while exiting 0.
+    throw new Error("--json is a plan format; run --apply without it.");
+  }
 
   // --repo owner/name targets any repository without cloning or cd-ing into it.
   const repoFlag = args.find((a) => a.startsWith("--repo="))?.split("=")[1] ?? args[args.indexOf("--repo") + 1];
   const repo = args.includes("--repo") || args.some((a) => a.startsWith("--repo=")) ? repoFlag : undefined;
 
-  const { config, source } = loadConfig(cwd);
-  const addedEnvs = addEnvironments(config, requestedEnvs);
   const client = createClient({ cwd, repo });
   const context = await resolveContext(client, { acceptInvite });
 
@@ -143,6 +159,40 @@ async function main() {
         permissions: context.permissions,
         viewer: await client.viewer(),
       }),
+    );
+  }
+
+  // Config resolution needs the client (a --repo override is fetched from the
+  // target repository), so it sits after access and admin are established:
+  // fetching earlier would turn "no access yet" into a silent wrong answer,
+  // since a 404 for the override is indistinguishable from the file being absent.
+  const { config, origin, label: policyLabel, writablePath } = await resolveConfig({
+    client,
+    repoMode: Boolean(repo),
+    cwd,
+  });
+
+  // First sync of a repository: offer to extend the default environments.
+  // Only on a real terminal, only when --env did not already answer, and
+  // never in --json mode, whose output must stay parseable.
+  const preexisting = await client.listRulesets();
+  if (preexisting.length === 0 && requestedEnvs.length === 0 && isInteractive() && !asJson) {
+    const extras = await askExtraEnvironments(Object.keys(config.environments ?? {}));
+    const invalid = extras.filter((name) => !isValidEnvName(name));
+    if (invalid.length > 0) throw new Error(`Not usable as branch names: ${invalid.join(", ")}`);
+    requestedEnvs.push(...extras);
+  }
+
+  const addedEnvs = addEnvironments(config, requestedEnvs);
+
+  // A committed override can only be changed by a pull request to that repo —
+  // the plugin must not try to write it, and pretending the env was added
+  // while persisting nothing would plan a policy the next run forgets.
+  if (addedEnvs.length > 0 && writablePath == null) {
+    throw new AccessDenied(
+      `This repository's policy comes from its committed ${OVERRIDE_PATH}, which cannot be ` +
+        `edited from here.\nAdd ${addedEnvs.map((e) => `'${e}'`).join(", ")} to "environments" in ` +
+        `that file via a pull request, then re-run.`,
     );
   }
 
@@ -165,12 +215,32 @@ async function main() {
   const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch);
 
   if (asJson) {
-    console.log(JSON.stringify({ repo: `${client.owner}/${client.repo}`, steps, degradations, undeclared }, null, 2));
+    // Branches carry the relax-to-evaluate window — the plan's most dangerous
+    // step — so machine consumers must see it too, not only humans.
+    console.log(
+      JSON.stringify(
+        {
+          repo: `${client.owner}/${client.repo}`,
+          policy: { origin, label: policyLabel },
+          steps,
+          degradations,
+          undeclared,
+          branches: {
+            missing: branches.missing,
+            relaxDuringCreation: branches.blocked.map((r) => r.name),
+          },
+          clickup: clickup && { path: clickup.path, action: clickup.action, hasToken: clickup.hasToken },
+          addedEnvironments: addedEnvs,
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
   console.log(`\nRepository: ${client.owner}/${client.repo} (${context.visibility}, ${context.ownerType.toLowerCase()}-owned)`);
-  console.log(`Policy:     ${path.relative(cwd, source) || source}`);
+  console.log(`Policy:     ${policyLabel}`);
   console.log(`Auth:       ${client.authMode}\n`);
 
   for (const step of steps) {
@@ -187,9 +257,15 @@ async function main() {
 
   if (addedEnvs.length > 0) {
     console.log(
-      `\n  NEW ENV  ${addedEnvs.join(", ").padEnd(30)} → will be added to ` +
-        `${path.relative(cwd, source) || source}, affecting every repo synced with it`,
+      `\n  NEW ENV  ${addedEnvs.join(", ").padEnd(30)} → will be added to ${policyLabel}` +
+        (origin === "bundled" ? ", affecting every repo synced with it" : ""),
     );
+    if (isMarketplaceClone(writablePath)) {
+      console.log(
+        `             [this plugin install is a marketplace clone: the edit is lost on` +
+          `\n              'claude plugin marketplace update' — also commit it to the plugin repo]`,
+      );
+    }
   }
 
   if (branches.missing.length > 0) {
@@ -251,22 +327,58 @@ async function main() {
 
   console.log("");
 
-  // Persisting the new environment is what makes it apply to every future
-  // repo; without it the next run would plan the environment away again.
+  // Persisting the new environment is what makes it survive the next run;
+  // without it the next sync would plan the environment away again.
   if (addedEnvs.length > 0) {
-    writeFileSync(source, `${JSON.stringify(config, null, 2)}\n`);
-    console.log(`  ✓ added ${addedEnvs.join(", ")} to ${path.relative(cwd, source) || source}`);
+    writeFileSync(writablePath, `${JSON.stringify(config, null, 2)}\n`);
+    console.log(`  ✓ added ${addedEnvs.join(", ")} to ${policyLabel}`);
   }
 
   // Branches first: a ruleset requiring a PR for dev makes creating dev
   // impossible, so the guard has to go up after the branch exists.
-  for (const result of await applyBranches(client, branches, context.defaultBranch)) {
+  const { results: branchResults, restoreFailures } = await applyBranches(
+    client,
+    branches,
+    context.defaultBranch,
+  );
+  for (const result of branchResults) {
     console.log(
       result.status === "created"
         ? `  ✓ created branch ${result.name}`
         : `  ✗ branch ${result.name}: ${result.error}`,
     );
     if (result.status === "failed") process.exitCode = 1;
+  }
+  for (const failure of restoreFailures) {
+    console.log(
+      `  ✗ RULESET '${failure.name}' IS STILL IN 'evaluate' — its restore failed: ${failure.error}` +
+        `\n    The repository is unprotected by it until a re-run or a manual fix succeeds.`,
+    );
+    process.exitCode = 1;
+  }
+
+  // The ClickUp workflow file goes in BEFORE the rulesets: once Pull Request
+  // Compulsion is active on the default branch (with no bypass actors), the
+  // Contents-API write of this very file would be refused.
+  let workflowNote = "";
+  if (clickup && clickup.action !== "unchanged") {
+    try {
+      await applyClickUp(client, clickup);
+      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
+    } catch (error) {
+      // A token without the 'workflow' scope cannot write under .github/workflows;
+      // on a repo whose rulesets are already active, the write needs a PR instead.
+      const scope = error.status === 403 ? " (the credential lacks the 'workflow' scope)" : "";
+      console.log(`  ✗ ${clickup.path}: ${error.message}${scope}`);
+      if (steps.every((s) => s.action === "unchanged")) {
+        console.log(
+          `      The rulesets are already active, so this file now needs a pull request:` +
+            `\n      commit it to a feature branch and merge it into ${context.defaultBranch}.`,
+        );
+      }
+      workflowNote = " 1 workflow failed";
+      process.exitCode = 1;
+    }
   }
 
   const results = await apply(client, steps);
@@ -278,20 +390,6 @@ async function main() {
     console.log(`  ✗ ${result.name}: ${result.error}`);
     for (const detail of result.detail ?? []) {
       console.log(`      ${detail.message ?? JSON.stringify(detail)}`);
-    }
-  }
-
-  let workflowNote = "";
-  if (clickup && clickup.action !== "unchanged") {
-    try {
-      await applyClickUp(client, clickup);
-      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
-    } catch (error) {
-      // A token without the 'workflow' scope cannot write under .github/workflows.
-      const scope = error.status === 403 ? " (the credential lacks the 'workflow' scope)" : "";
-      console.log(`  ✗ ${clickup.path}: ${error.message}${scope}`);
-      workflowNote = " 1 workflow failed";
-      process.exitCode = 1;
     }
   }
 

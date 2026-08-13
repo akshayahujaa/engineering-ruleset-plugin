@@ -95,13 +95,31 @@ export async function planBranches(client, environments, defaultBranch) {
  *
  * Any ruleset that would refuse the creation is dropped to `evaluate` first
  * and restored in a `finally`, so a failure part-way cannot leave the
- * repository unprotected — that is the whole risk of this operation.
+ * repository unprotected — that is the whole risk of this operation. The
+ * restore handles each ruleset independently: one failed restore must not
+ * abandon the others at `evaluate`, and every failure is reported by name so
+ * the caller can say exactly which guard is still down.
+ *
+ * @returns {Promise<{results: Array<{name, status, error?}>, restoreFailures: Array<{name, error}>}>}
  */
 export async function applyBranches(client, { missing, blocked }, defaultBranch) {
-  if (missing.length === 0) return [];
+  if (missing.length === 0) return { results: [], restoreFailures: [] };
 
-  const head = await client.refSha(defaultBranch);
+  let head;
+  try {
+    head = await client.refSha(defaultBranch);
+  } catch (error) {
+    if (error?.status === 404) {
+      throw new Error(
+        `Branch '${defaultBranch}' has no resolvable head — the repository appears to have ` +
+          "no commits. Push an initial commit, then re-run.",
+      );
+    }
+    throw error;
+  }
+
   const results = [];
+  const restoreFailures = [];
 
   try {
     for (const ruleset of blocked) {
@@ -118,9 +136,13 @@ export async function applyBranches(client, { missing, blocked }, defaultBranch)
     }
   } finally {
     for (const ruleset of blocked) {
-      await client.setEnforcement(ruleset, "active");
+      try {
+        await client.setEnforcement(ruleset, "active");
+      } catch (error) {
+        restoreFailures.push({ name: ruleset.name, error: error.message });
+      }
     }
   }
 
-  return results;
+  return { results, restoreFailures };
 }

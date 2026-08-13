@@ -71,11 +71,25 @@ others, pass them through:
 node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --env staging --env uat
 ```
 
-Do not ask on a repo that already has rulesets — a re-sync should be quiet.
+**Carry the same `--env` flags onto the apply run.** The plan does not persist them — an apply
+without them silently drops the user's answer:
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --env staging --env uat --apply
+```
+
+Do not ask on a repo that already has rulesets — a re-sync should be quiet. (On a real terminal
+the CLI asks this question itself; under this command stdin is a pipe, so it stays silent by
+design and the widget answer is the only route.)
 
 An added environment is written into the plugin's own `ruleset-config.json` on `--apply`, so it
 applies to **every** repo synced from then on. Tell the user that; if they only want it for one
-repo, that is a per-repo `.github/ruleset-config.json` instead.
+repo, that is a per-repo `.github/ruleset-config.json` instead. If the CLI warns the install is a
+marketplace clone, relay that warning: the persisted edit is lost on
+`claude plugin marketplace update`, so it should also be committed to the plugin repo.
+
+If the target repository commits its own `.github/ruleset-config.json`, `--env` is refused — that
+policy can only change by a pull request to that repository. Relay the instruction as printed.
 
 ## ClickUp
 
@@ -94,6 +108,8 @@ Notes:
 - If `$ARGUMENTS` names a repository, pass it straight through as `--repo owner/name`, which
   targets any repository without cloning it. Everything else is unchanged.
 - Policy lives in `ruleset-config.json` at the plugin root, unless the repository commits its
-  own `.github/ruleset-config.json`, which takes precedence.
+  own `.github/ruleset-config.json`, which takes precedence. With `--repo`, that override is
+  fetched from the **target** repository via the API — the caller's working directory plays no
+  part, so the same command gives the same plan from anywhere.
 - Adding an environment is a one-line edit to that config; never hand-edit rulesets on GitHub,
   since the next sync reports them as drift and overwrites them.

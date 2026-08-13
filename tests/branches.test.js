@@ -156,13 +156,18 @@ test("nothing missing means the rulesets are never even listed", async () => {
 
 test("branches are created from the default branch head", async () => {
   const client = stubClient();
-  const results = await applyBranches(client, { missing: ["dev", "test"], blocked: [] }, "main");
+  const { results, restoreFailures } = await applyBranches(
+    client,
+    { missing: ["dev", "test"], blocked: [] },
+    "main",
+  );
 
   assert.deepEqual(client.calls.created, [
     { ref: "refs/heads/dev", sha: "abc123" },
     { ref: "refs/heads/test", sha: "abc123" },
   ]);
   assert.deepEqual(results.map((r) => r.status), ["created", "created"]);
+  assert.deepEqual(restoreFailures, []);
 });
 
 test("a blocking ruleset is relaxed before creation and restored after", async () => {
@@ -174,10 +179,40 @@ test("a blocking ruleset is relaxed before creation and restored after", async (
 /** The property that matters most: a failure must not leave the repo open. */
 test("enforcement is restored even when a branch fails to create", async () => {
   const client = stubClient({ failOn: ["dev"] });
-  const results = await applyBranches(client, { missing: ["dev"], blocked: [BASELINE] }, "main");
+  const { results } = await applyBranches(client, { missing: ["dev"], blocked: [BASELINE] }, "main");
 
   assert.equal(results[0].status, "failed");
   assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
+});
+
+/** One failed restore must not abandon the other rulesets at 'evaluate'. */
+test("a restore failure on one ruleset does not stop the other restores", async () => {
+  const other = { ...BASELINE, id: 9, name: "Other Guard" };
+  const client = stubClient();
+  client.setEnforcement = async (rs, mode) => {
+    client.calls.enforcement.push(`${rs.id}:${mode}`);
+    if (mode === "active" && rs.id === 1) throw new Error("restore refused");
+  };
+
+  const { restoreFailures } = await applyBranches(
+    client,
+    { missing: ["dev"], blocked: [BASELINE, other] },
+    "main",
+  );
+
+  assert.deepEqual(restoreFailures, [{ name: "Pull Request Compulsion", error: "restore refused" }]);
+  assert.ok(client.calls.enforcement.includes("9:active"), "the second ruleset must still be restored");
+});
+
+test("an empty repository fails with instructions rather than a bare 404", async () => {
+  const client = stubClient();
+  client.refSha = async () => {
+    throw Object.assign(new Error("Not Found"), { status: 404 });
+  };
+  await assert.rejects(
+    () => applyBranches(client, { missing: ["dev"], blocked: [] }, "main"),
+    /no commits/,
+  );
 });
 
 test("enforcement is restored even when the ref lookup throws", async () => {
@@ -197,6 +232,9 @@ test("enforcement is restored even when the ref lookup throws", async () => {
 
 test("no missing branches means no writes at all", async () => {
   const client = stubClient();
-  assert.deepEqual(await applyBranches(client, { missing: [], blocked: [BASELINE] }, "main"), []);
+  assert.deepEqual(await applyBranches(client, { missing: [], blocked: [BASELINE] }, "main"), {
+    results: [],
+    restoreFailures: [],
+  });
   assert.deepEqual(client.calls.enforcement, []);
 });

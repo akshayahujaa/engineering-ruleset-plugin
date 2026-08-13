@@ -141,9 +141,40 @@ anything happens:
               then restored to 'active']
 ```
 
-The restore runs in a `finally`, so a branch that fails to create cannot leave the repository
-unprotected. There is a test for exactly that. It is still a brief window where the default branch
-is unguarded, which is why the plan says so up front.
+The restore runs in a `finally` and handles each ruleset independently, so neither a branch that
+fails to create nor one failed restore can leave the rest of the repository unprotected — and a
+ruleset whose restore did fail is reported by name, loudly, with a non-zero exit. There are tests
+for exactly those cases. It is still a brief window where the default branch is unguarded, which
+is why the plan says so up front.
+
+### First sync of a repository
+
+On a repo with no rulesets yet, the CLI (on a real terminal) asks once whether you want any
+environment beyond the defaults:
+
+```
+First sync of this repository. Default environments: dev, test, prod.
+Extra environments beyond these? (comma-separated, empty for none)
+```
+
+Under the `/enforce-rules` slash command stdin is a pipe, so the CLI stays silent and Claude asks
+the same question with a widget instead, passing the answer back as `--env`. A re-sync never asks.
+
+### Which policy applies, and where `--env` lands
+
+| How the target was named | Policy comes from | `--env` persists to |
+|---|---|---|
+| implicit (cwd) | `.github/ruleset-config.json` in the working tree, else the plugin default | that same file |
+| `--repo owner/name` | `.github/ruleset-config.json` **committed in the target repo** (fetched via the API), else the plugin default | the plugin default; refused if the target commits its own override |
+
+The caller's working directory never influences a `--repo` run — standing in one repo while
+targeting another used to silently apply the wrong policy. A committed override that is not valid
+JSON fails the run outright rather than silently falling back to a policy the repository
+explicitly replaced.
+
+If the plugin is installed as a marketplace clone, a persisted `--env` edit is lost on
+`claude plugin marketplace update`; the CLI warns when this is the case. Durable policy changes
+belong in the plugin repository itself.
 
 ## Adding an environment
 
