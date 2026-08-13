@@ -96,10 +96,33 @@ policy can only change by a pull request to that repository. Relay the instructi
 When the plan includes `.github/workflows/clickup-sync.yml`, applying commits that file to the
 repository — call that out, since every other change is a settings change.
 
-If it reports that `CLICKUP_TOKEN` is not set, relay the `gh secret set` command for the user to
-run themselves. **Never ask the user to paste the token into the chat, and never put a token
-value into a command, file, or environment variable on their behalf.** `gh secret set` reads it
-without echoing and encrypts it before it leaves the machine; that is the only route.
+If it reports that `CLICKUP_TOKEN` is not set — or the user asks to integrate the token, set the
+secret, or "connect ClickUp" — the CLI can drive it, but only from the user's own terminal.
+Relay this command **with both placeholders substituted** — expand `${CLAUDE_PLUGIN_ROOT}` to the
+actual absolute plugin path and `owner/name` to the real repository, since neither means anything
+in the user's shell:
+
+```
+node "<absolute plugin path>/src/cli.js" --repo owner/name --set-clickup-token
+```
+
+(When the CLI has already refused with its "needs a real terminal" message, relay the command
+from that message verbatim — it is already fully substituted.) `gh` prompts for the token with
+hidden input, encrypts it locally, and uploads it; the value goes keyboard → gh → GitHub and
+never enters the CLI process. Running it through this command's Bash tool will refuse by design —
+stdin is a pipe, and there is no terminal to hand to gh.
+
+**Never ask the user to paste the token into the chat. Never accept it if they paste it anyway —
+tell them to revoke that token in ClickUp (Settings → Apps → API Token) and generate a new one,
+since anything pasted into chat must be treated as exposed. Never put a token value into a
+command, file, or environment variable on their behalf.** The hidden prompt is the only route.
+The CLI enforces the same rule itself: anything token-shaped in its arguments is refused with
+the same revoke guidance.
+
+After the user says they have run it, re-run the plan; the token notice disappearing (or
+`"hasToken": true` in `--json`) confirms **a** secret exists — it cannot tell a fresh token from
+a revoked one. If a token was exposed and revoked after it had already been uploaded, the user
+must run `--set-clickup-token` again with the replacement, even though `hasToken` reads true.
 
 Notes:
 

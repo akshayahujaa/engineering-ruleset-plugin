@@ -106,3 +106,32 @@ export function parseEnvList(raw) {
     .map((v) => v.trim())
     .filter(Boolean);
 }
+
+/**
+ * Detects a token value that has already leaked into argv, so the CLI can say
+ * so instead of silently ignoring it. Anything on a command line is exposed —
+ * shell history, the process table — so the only honest response is to refuse
+ * and tell the user to revoke it. ClickUp personal tokens start with `pk_`.
+ *
+ * @returns {string|null} a refusal message, or null when argv looks clean
+ */
+export function detectTokenMisuse(args) {
+  const revoke =
+    "If that was a real token it is now in your shell history and the process table: " +
+    "revoke it in ClickUp (Settings → Apps → API Token) and generate a new one. " +
+    "The token is only ever accepted at gh's hidden prompt — re-run with --set-clickup-token and nothing after it.";
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg.startsWith("--set-clickup-token=")) {
+      return `--set-clickup-token takes no value — a token must never appear on the command line. ${revoke}`;
+    }
+    if (/(^|=)pk_[A-Za-z0-9]/.test(arg)) {
+      return `The argument '${arg.slice(0, 8)}…' looks like a ClickUp token. ${revoke}`;
+    }
+    if (arg === "--set-clickup-token" && args[i + 1] && !args[i + 1].startsWith("--")) {
+      return `--set-clickup-token takes no value, but '${args[i + 1].slice(0, 8)}…' followed it. ${revoke}`;
+    }
+  }
+  return null;
+}

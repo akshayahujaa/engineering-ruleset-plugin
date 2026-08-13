@@ -8,6 +8,7 @@
  *   enforce-rules --json                machine-readable plan
  *   enforce-rules --accept-invite       accept a pending invitation to the target repo
  *   enforce-rules --env staging         add an environment; persisted on --apply
+ *   enforce-rules --set-clickup-token   set the ClickUp secret via gh's hidden prompt
  */
 
 import { writeFileSync } from "node:fs";
@@ -16,6 +17,7 @@ import {
   isMarketplaceClone,
   isValidEnvName,
   parseEnvList,
+  detectTokenMisuse,
   OVERRIDE_PATH,
 } from "./config.js";
 import { compile, referencedTeams, addEnvironments } from "./compiler.js";
@@ -122,7 +124,12 @@ async function main() {
   const shouldApply = args.includes("--apply");
   const asJson = args.includes("--json");
   const acceptInvite = args.includes("--accept-invite");
+  const setToken = args.includes("--set-clickup-token");
   const cwd = process.cwd();
+
+  // A token that reaches argv is already exposed; refuse loudly, never silently.
+  const misuse = detectTokenMisuse(args);
+  if (misuse) throw new AccessDenied(misuse);
 
   // --env may repeat and may carry a comma-separated list.
   const requestedEnvs = args
@@ -141,12 +148,33 @@ async function main() {
     // silently skipped the apply while exiting 0.
     throw new Error("--json is a plan format; run --apply without it.");
   }
+  if (asJson && setToken) {
+    throw new Error("--set-clickup-token is interactive; it cannot combine with --json.");
+  }
 
   // --repo owner/name targets any repository without cloning or cd-ing into it.
   const repoFlag = args.find((a) => a.startsWith("--repo="))?.split("=")[1] ?? args[args.indexOf("--repo") + 1];
   const repo = args.includes("--repo") || args.some((a) => a.startsWith("--repo=")) ? repoFlag : undefined;
 
   const client = createClient({ cwd, repo });
+
+  // The hand-off constraints are knowable now — fail before any network work.
+  if (setToken) {
+    if (!isInteractive()) {
+      throw new AccessDenied(
+        "--set-clickup-token needs a real terminal: gh prompts for the token with hidden\n" +
+          "input, and it is never accepted as an argument or over a pipe. Run this yourself:\n\n" +
+          `    node "${process.argv[1]}" --repo ${client.owner}/${client.repo} --set-clickup-token`,
+      );
+    }
+    if (client.authMode !== "gh cli") {
+      throw new AccessDenied(
+        "--set-clickup-token hands the terminal to the gh CLI, which is not available here.\n" +
+          "Run `gh auth login` first — token-only auth cannot prompt with hidden input.",
+      );
+    }
+  }
+
   const context = await resolveContext(client, { acceptInvite });
 
   if (!context.isAdmin) {
@@ -175,8 +203,10 @@ async function main() {
   // First sync of a repository: offer to extend the default environments.
   // Only on a real terminal, only when --env did not already answer, and
   // never in --json mode, whose output must stay parseable.
+  // Skipped under --set-clickup-token: someone here to set a secret has not
+  // signed up for an environments interview.
   const preexisting = await client.listRulesets();
-  if (preexisting.length === 0 && requestedEnvs.length === 0 && isInteractive() && !asJson) {
+  if (preexisting.length === 0 && requestedEnvs.length === 0 && isInteractive() && !asJson && !setToken) {
     const extras = await askExtraEnvironments(Object.keys(config.environments ?? {}));
     const invalid = extras.filter((name) => !isValidEnvName(name));
     if (invalid.length > 0) throw new Error(`Not usable as branch names: ${invalid.join(", ")}`);
@@ -213,6 +243,33 @@ async function main() {
   const { steps, undeclared } = await plan(client, rulesets);
   const clickup = await planClickUp(client, config.clickup);
   const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch);
+
+  // The token itself never enters this process (or any chat): gh prompts for
+  // it with hidden input, encrypts it locally, and uploads it. This flag only
+  // decides WHEN to hand the terminal over; the TTY and gh-CLI requirements
+  // were enforced before any network work.
+  if (setToken) {
+    if (!clickup) {
+      throw new Error("--set-clickup-token: the policy has no ClickUp section enabled.");
+    }
+    console.log(
+      `\nHanding over to gh — paste your ClickUp token ONLY at its hidden prompt.` +
+        `\n(ClickUp → Settings → Apps → API Token. The value goes keyboard → gh → GitHub, nowhere else.)\n`,
+    );
+    try {
+      client.setSecretInteractive(clickup.secretName);
+    } catch {
+      // gh exits non-zero on blank input, Ctrl-D, or an API refusal; the
+      // re-check below turns that into the honest ✗ rather than a stack trace.
+    }
+    clickup.hasToken = await client.hasSecret(clickup.secretName);
+    console.log(
+      clickup.hasToken
+        ? `  ✓ ${clickup.secretName} is set on ${client.owner}/${client.repo}\n`
+        : `  ✗ ${clickup.secretName} still missing — gh did not confirm the write\n`,
+    );
+    if (!clickup.hasToken) process.exitCode = 1;
+  }
 
   if (asJson) {
     // Branches carry the relax-to-evaluate window — the plan's most dangerous
@@ -301,26 +358,52 @@ async function main() {
   }
 
   // The token is requested, never captured: passing it through this process
-  // would put it in shell history and the process table. `gh secret set` reads
-  // it silently and encrypts it before it leaves the machine.
+  // would put it in shell history and the process table. On a terminal the
+  // hand-off to gh's hidden prompt is offered right here; anywhere else the
+  // command to run is printed instead.
   if (clickup && !clickup.hasToken) {
-    console.log(
-      `\n  The ${clickup.secretName} secret is not set on this repository, so the workflow` +
-        `\n  will skip every task until it is. Set it yourself — it is never typed here:` +
-        `\n\n      gh secret set ${clickup.secretName} --repo ${client.owner}/${client.repo}` +
-        `\n\n  Paste your ClickUp personal API token at the prompt. Get one from ClickUp:` +
-        `\n  Settings → Apps → API Token.`,
-    );
+    if (shouldApply && isInteractive() && client.authMode === "gh cli") {
+      if (
+        await askYesNo(
+          `\n  ${clickup.secretName} is not set. Set it now via gh's hidden prompt?` +
+            `\n  (Answer y or n here — paste the token ONLY at gh's hidden prompt.) [y/N] `,
+        )
+      ) {
+        // The secret is an optional add-on: a gh failure here must not abort
+        // the apply the user just confirmed.
+        try {
+          client.setSecretInteractive(clickup.secretName);
+        } catch {
+          /* the re-check below reports it */
+        }
+        clickup.hasToken = await client.hasSecret(clickup.secretName);
+        console.log(clickup.hasToken ? `  ✓ ${clickup.secretName} set` : `  ✗ still not set`);
+      }
+    }
+    if (!clickup.hasToken) {
+      console.log(
+        `\n  The ${clickup.secretName} secret is not set on this repository, so the workflow` +
+          `\n  will skip every task until it is. Set it yourself, in your own terminal —` +
+          `\n  it prompts with hidden input there, and the value is never typed here:` +
+          `\n\n      gh secret set ${clickup.secretName} --repo ${client.owner}/${client.repo}` +
+          `\n\n  (or re-run with --set-clickup-token). Never pipe or paste the token into the` +
+          `\n  command line. Get one from ClickUp: Settings → Apps → API Token.`,
+      );
+    }
   }
 
   const pending =
     writes.length + (clickup && clickup.action !== "unchanged" ? 1 : 0) + branches.missing.length;
 
   if (!shouldApply) {
+    // The secret write under --set-clickup-token is real even in plan mode;
+    // claiming "nothing written" right after "✓ CLICKUP_TOKEN is set" would lie.
+    const wroteSecret = setToken && clickup?.hasToken ? " (the secret write above did happen)" : "";
     console.log(
       pending === 0
-        ? "\nAlready in sync. Nothing to apply.\n"
-        : `\nPlan only — nothing written. Re-run with --apply to make these ${pending} change(s).\n`,
+        ? `\nAlready in sync. Nothing to apply${wroteSecret}.\n`
+        : `\nPlan only — no rulesets, branches, or files written${wroteSecret}. ` +
+            `Re-run with --apply to make these ${pending} change(s).\n`,
     );
     return;
   }

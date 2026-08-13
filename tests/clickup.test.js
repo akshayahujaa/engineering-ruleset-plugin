@@ -130,3 +130,9 @@ test("a status containing a quote cannot break out of the shell literal", () => 
 test("the task id prefix is carried into the extraction step", () => {
   assert.match(renderWorkflow({ taskIdPrefix: "TASK-" }), /-v p='TASK-'/);
 });
+
+test("a custom secret name is what the workflow reads, matching what the CLI sets", () => {
+  const yaml = renderWorkflow({ secretName: "CU_API_TOKEN" });
+  assert.match(yaml, /CLICKUP_TOKEN: \$\{\{ secrets\.CU_API_TOKEN \}\}/);
+  assert.doesNotMatch(yaml, /secrets\.CLICKUP_TOKEN/);
+});

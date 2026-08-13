@@ -72,6 +72,9 @@ export function renderWorkflow(clickup = {}) {
   const idPrefix = clickup.taskIdPrefix ?? "CU-";
   const target = clickup.targetStatus ?? "in progress";
   const todo = clickup.todoStatuses ?? DEFAULT_TODO_STATUSES;
+  // Must match what planClickUp checks and --set-clickup-token sets, or the
+  // committed workflow would read a secret nobody ever wrote.
+  const secretName = clickup.secretName ?? "CLICKUP_TOKEN";
 
   const cases = todo.map((s) => shellQuote(String(s).toLowerCase())).join("|");
 
@@ -95,7 +98,7 @@ jobs:
     steps:
       - name: Advance the linked ClickUp task
         env:
-          CLICKUP_TOKEN: \${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_TOKEN: \${{ secrets.${secretName} }}
           # Only needed when the workspace uses ClickUp Custom Task IDs.
           CLICKUP_TEAM_ID: \${{ secrets.CLICKUP_TEAM_ID }}
           HEAD_REF: \${{ github.event.pull_request.head.ref }}

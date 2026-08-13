@@ -206,6 +206,34 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
     },
 
     /**
+     * Sets a repository Actions secret by handing the terminal to `gh`, which
+     * prompts with hidden input, encrypts the value locally against the
+     * repository's public key, and uploads it.
+     *
+     * The value never enters this process: not argv, not env, not a pipe.
+     * There is deliberately no variant accepting the token as an argument —
+     * that would put it in shell history and the process table.
+     */
+    setSecretInteractive(name) {
+      if (!useGh) {
+        throw new GitHubError(
+          "Setting a secret interactively needs the gh CLI. Run `gh auth login` first.",
+        );
+      }
+      // Enforced here, not only in callers: with a piped stdin gh does not
+      // prompt — it silently reads the secret VALUE from the pipe, which is
+      // exactly the hidden-input guarantee this method exists to provide.
+      if (!process.stdin.isTTY) {
+        throw new GitHubError(
+          "Refusing to set a secret without a terminal: gh would read the value from stdin instead of prompting.",
+        );
+      }
+      execFileSync("gh", ["secret", "set", name, "--repo", `${owner}/${repo}`], {
+        stdio: "inherit",
+      });
+    },
+
+    /**
      * Whether a secret exists. The API never returns a secret's value, so this
      * can confirm the token is configured without ever reading it.
      */

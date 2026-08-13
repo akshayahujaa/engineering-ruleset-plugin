@@ -8,6 +8,7 @@ import {
   isMarketplaceClone,
   isValidEnvName,
   parseEnvList,
+  detectTokenMisuse,
   OVERRIDE_PATH,
 } from "../src/config.js";
 
@@ -159,4 +160,35 @@ test("a comma-separated answer parses into clean names", () => {
   assert.deepEqual(parseEnvList(" staging , uat ,,"), ["staging", "uat"]);
   assert.deepEqual(parseEnvList(""), []);
   assert.deepEqual(parseEnvList(null), []);
+});
+
+// --- token-in-argv tripwire -----------------------------------------------------
+
+test("a token passed as a flag value is refused with revoke guidance", () => {
+  const msg = detectTokenMisuse(["--set-clickup-token=pk_abc123"]);
+  assert.match(msg, /never appear on the command line/);
+  assert.match(msg, /revoke it in ClickUp/);
+});
+
+test("a stray value after the flag is refused rather than silently ignored", () => {
+  const msg = detectTokenMisuse(["--set-clickup-token", "pk_abc123"]);
+  assert.match(msg, /revoke/);
+  assert.match(msg, /pk_abc12…/);
+});
+
+test("anything token-shaped anywhere in argv trips the wire", () => {
+  assert.match(detectTokenMisuse(["--repo", "o/r", "pk_12345xyz"]), /looks like a ClickUp token/);
+  assert.match(detectTokenMisuse(["--env=pk_9abcdef"]), /looks like a ClickUp token/);
+});
+
+test("the tripwire never echoes the full suspected token back", () => {
+  const msg = detectTokenMisuse(["pk_SECRETSECRETSECRET"]);
+  assert.ok(!msg.includes("SECRETSECRETSECRET"), "the value must not be repeated in output");
+});
+
+test("clean invocations pass the tripwire", () => {
+  assert.equal(detectTokenMisuse(["--repo", "o/r", "--set-clickup-token"]), null);
+  assert.equal(detectTokenMisuse(["--set-clickup-token", "--apply"]), null);
+  assert.equal(detectTokenMisuse(["--env", "staging", "--json"]), null);
+  assert.equal(detectTokenMisuse([]), null);
 });

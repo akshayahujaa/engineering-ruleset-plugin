@@ -25,7 +25,9 @@ node /path/to/engineering-ruleset-plugin/src/cli.js --repo tehvault/website
 node /path/to/engineering-ruleset-plugin/src/cli.js --repo tehvault/website --apply
 ```
 
-The plan is always safe to run. Nothing is written until `--apply`. Always read the plan before
+The plan is always safe to run. Nothing is written until `--apply` — with one deliberate
+exception: `--set-clickup-token` writes that secret the moment you confirm it at gh's hidden
+prompt, in plan mode too, and the output says so. Always read the plan before
 applying to a repo that already has rulesets — matching is by name, so an existing ruleset with a
 managed name is overwritten.
 
@@ -107,9 +109,18 @@ Existing branches are untouched, but the next one your team makes must carry a t
 
 ### The token
 
-The plugin never handles it. The sync only *checks whether* the secret exists and prints the
-command to set it — the value is read straight into GitHub's encrypted store, never through this
-tool, your shell history, or the process table:
+The plugin never sees it — but it can drive setting it. On a real terminal:
+
+```bash
+node src/cli.js --repo owner/name --set-clickup-token
+```
+
+hands your terminal to `gh secret set`, which prompts with **hidden input**, encrypts the value
+locally against the repository's public key, and uploads it. The token goes keyboard → gh →
+GitHub; it never enters the plugin process, your shell history, or the process table. There is
+deliberately no way to pass it as an argument. An interactive `--apply` offers the same hand-off
+when the secret is missing; anywhere without a terminal (the slash command included) the CLI
+refuses and prints the command for you to run yourself. Setting it directly works too:
 
 ```bash
 gh secret set CLICKUP_TOKEN --repo owner/name
@@ -119,7 +130,8 @@ Get the token from ClickUp: **Settings → Apps → API Token**. If your workspa
 Custom Task IDs, also set `CLICKUP_TEAM_ID`; the workflow switches to the custom-id endpoint when
 it is present.
 
-Without the secret the workflow still runs, logs a warning, and changes nothing.
+Without the secret the workflow still runs, logs a warning, and changes nothing. The sync only
+ever *checks whether* the secret exists — the API cannot return its value.
 
 ## Environment branches
 
