@@ -11,7 +11,7 @@
 
   "environments": {
     "dev": {
-      "statusChecks": ["pr-scope/check"],
+      "statusChecks": ["scope-check"],
       "statusCheckRuleset": "PR-SCOPE-CHECK"
     },
     "test": {},

@@ -136,3 +136,10 @@ test("a custom secret name is what the workflow reads, matching what the CLI set
   assert.match(yaml, /CLICKUP_TOKEN: \$\{\{ secrets\.CU_API_TOKEN \}\}/);
   assert.doesNotMatch(yaml, /secrets\.CLICKUP_TOKEN/);
 });
+
+test("the dispatch test path simulates a merge but a closed-unmerged PR still cannot", () => {
+  const yaml = renderWorkflow({});
+  assert.match(yaml, /workflow_dispatch:/);
+  assert.match(yaml, /github\.event_name == 'workflow_dispatch' \|\| github\.event\.pull_request\.merged == true/);
+  assert.match(yaml, /github\.event\.pull_request\.head\.ref \|\| inputs\.head_ref/);
+});

@@ -24,7 +24,7 @@ import { compile, referencedTeams, addEnvironments } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
 import { planClickUp, applyClickUp } from "./clickup.js";
-import { planBranches, applyBranches } from "./branches.js";
+import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
   probeAccess,
   acceptAndReprobe,
@@ -242,7 +242,12 @@ async function main() {
   const { rulesets, degradations } = compile(config, { ...context, teamIds });
   const { steps, undeclared } = await plan(client, rulesets);
   const clickup = await planClickUp(client, config.clickup);
-  const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch);
+  const clickupPending = Boolean(clickup && clickup.action !== "unchanged");
+  // A pending workflow write shares the branch-creation relax window: the same
+  // pull_request rule refuses both, so it must not earn a second window.
+  const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch, {
+    guardDefaultBranchWrite: clickupPending,
+  });
 
   // The token itself never enters this process (or any chat): gh prompts for
   // it with hidden input, encrypts it locally, and uploads it. This flag only
@@ -329,13 +334,17 @@ async function main() {
     console.log(
       `\n  CREATE   ${branches.missing.join(", ").padEnd(30)} → environment branch(es), from ${context.defaultBranch}`,
     );
-    if (branches.blocked.length > 0) {
-      console.log(
-        `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
-          `\n              each is dropped to 'evaluate' only while the branches are created,` +
-          `\n              then restored to 'active']`,
-      );
-    }
+  }
+  if (branches.blocked.length > 0) {
+    const writes = [
+      ...(branches.missing.length > 0 ? ["the branches are created"] : []),
+      ...(clickupPending ? ["the workflow file is committed"] : []),
+    ].join(" and ");
+    console.log(
+      `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
+        `\n              each is dropped to 'evaluate' only while ${writes},` +
+        `\n              then restored to 'active']`,
+    );
   }
 
   if (clickup) {
@@ -417,48 +426,49 @@ async function main() {
     console.log(`  ✓ added ${addedEnvs.join(", ")} to ${policyLabel}`);
   }
 
-  // Branches first: a ruleset requiring a PR for dev makes creating dev
-  // impossible, so the guard has to go up after the branch exists.
-  const { results: branchResults, restoreFailures } = await applyBranches(
-    client,
-    branches,
-    context.defaultBranch,
-  );
-  for (const result of branchResults) {
-    console.log(
-      result.status === "created"
-        ? `  ✓ created branch ${result.name}`
-        : `  ✗ branch ${result.name}: ${result.error}`,
-    );
-    if (result.status === "failed") process.exitCode = 1;
-  }
-  for (const failure of restoreFailures) {
-    console.log(
-      `  ✗ RULESET '${failure.name}' IS STILL IN 'evaluate' — its restore failed: ${failure.error}` +
-        `\n    The repository is unprotected by it until a re-run or a manual fix succeeds.`,
-    );
-    process.exitCode = 1;
-  }
-
-  // The ClickUp workflow file goes in BEFORE the rulesets: once Pull Request
-  // Compulsion is active on the default branch (with no bypass actors), the
-  // Contents-API write of this very file would be refused.
+  // One relax window covers every write the active rulesets would refuse:
+  // creating the environment branches AND committing the workflow file to the
+  // default branch. Both precede the ruleset writes — the guards go up only
+  // after everything they would block is already in place.
   let workflowNote = "";
-  if (clickup && clickup.action !== "unchanged") {
-    try {
-      await applyClickUp(client, clickup);
-      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
-    } catch (error) {
-      // A token without the 'workflow' scope cannot write under .github/workflows;
-      // on a repo whose rulesets are already active, the write needs a PR instead.
-      const scope = error.status === 403 ? " (the credential lacks the 'workflow' scope)" : "";
-      console.log(`  ✗ ${clickup.path}: ${error.message}${scope}`);
-      if (steps.every((s) => s.action === "unchanged")) {
-        console.log(
-          `      The rulesets are already active, so this file now needs a pull request:` +
-            `\n      commit it to a feature branch and merge it into ${context.defaultBranch}.`,
-        );
+  if (branches.missing.length > 0 || clickupPending) {
+    let branchResults = [];
+    let clickupError;
+    let clickupDone = false;
+
+    const { restoreFailures } = await withRelaxedEnforcement(client, branches.blocked, async () => {
+      branchResults = await createMissingBranches(client, branches.missing, context.defaultBranch);
+      if (clickupPending) {
+        try {
+          await applyClickUp(client, clickup);
+          clickupDone = true;
+        } catch (error) {
+          clickupError = error;
+        }
       }
+    });
+
+    for (const result of branchResults) {
+      console.log(
+        result.status === "created"
+          ? `  ✓ created branch ${result.name}`
+          : `  ✗ branch ${result.name}: ${result.error}`,
+      );
+      if (result.status === "failed") process.exitCode = 1;
+    }
+    for (const failure of restoreFailures) {
+      console.log(
+        `  ✗ RULESET '${failure.name}' IS STILL IN 'evaluate' — its restore failed: ${failure.error}` +
+          `\n    The repository is unprotected by it until a re-run or a manual fix succeeds.`,
+      );
+      process.exitCode = 1;
+    }
+    if (clickupDone) {
+      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
+    } else if (clickupError) {
+      // A token without the 'workflow' scope cannot write under .github/workflows.
+      const scope = clickupError.status === 403 ? " (the credential may lack the 'workflow' scope)" : "";
+      console.log(`  ✗ ${clickup.path}: ${clickupError.message}${scope}`);
       workflowNote = " 1 workflow failed";
       process.exitCode = 1;
     }

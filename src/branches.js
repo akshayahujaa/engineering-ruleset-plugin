@@ -77,33 +77,67 @@ export function missingEnvironments(environments, existingBranches) {
 }
 
 /**
- * Works out which environment branches need creating. Read-only.
+ * Works out which environment branches need creating, and which rulesets
+ * stand in the way. Read-only.
+ *
+ * `guardDefaultBranchWrite` widens the probe to the default branch: a pending
+ * file write there (the ClickUp workflow) is refused by the same pull_request
+ * rule that refuses branch creation, so it shares the one relax window rather
+ * than earning a second.
  */
-export async function planBranches(client, environments, defaultBranch) {
+export async function planBranches(client, environments, defaultBranch, { guardDefaultBranchWrite = false } = {}) {
   const branches = await client.listBranches();
   const missing = missingEnvironments(environments, branches);
-  if (missing.length === 0) return { missing: [], blocked: [] };
+  if (missing.length === 0 && !guardDefaultBranchWrite) return { missing: [], blocked: [] };
 
   const refs = missing.map((name) => `refs/heads/${name}`);
+  if (guardDefaultBranchWrite) refs.push(`refs/heads/${defaultBranch}`);
   const existing = await client.fullRulesets();
 
   return { missing, blocked: blockingRulesets(existing, refs, defaultBranch) };
 }
 
 /**
- * Creates the missing branches from the default branch head.
+ * Relaxes the given rulesets to `evaluate`, runs `fn`, and restores them.
  *
- * Any ruleset that would refuse the creation is dropped to `evaluate` first
- * and restored in a `finally`, so a failure part-way cannot leave the
- * repository unprotected — that is the whole risk of this operation. The
- * restore handles each ruleset independently: one failed restore must not
+ * The restore is per-ruleset in a `finally`: one failed restore must not
  * abandon the others at `evaluate`, and every failure is reported by name so
  * the caller can say exactly which guard is still down.
  *
- * @returns {Promise<{results: Array<{name, status, error?}>, restoreFailures: Array<{name, error}>}>}
+ * @returns {Promise<{value: any, restoreFailures: Array<{name, error}>}>}
  */
-export async function applyBranches(client, { missing, blocked }, defaultBranch) {
-  if (missing.length === 0) return { results: [], restoreFailures: [] };
+export async function withRelaxedEnforcement(client, blocked, fn) {
+  const restoreFailures = [];
+  let value;
+
+  try {
+    for (const ruleset of blocked) {
+      await client.setEnforcement(ruleset, "evaluate");
+    }
+    value = await fn();
+  } finally {
+    for (const ruleset of blocked) {
+      try {
+        await client.setEnforcement(ruleset, "active");
+      } catch (error) {
+        restoreFailures.push({ name: ruleset.name, error: error.message });
+      }
+    }
+  }
+
+  return { value, restoreFailures };
+}
+
+/**
+ * Creates the missing branches from the default branch head. Runs inside an
+ * already-open relax window — the caller owns relax/restore via
+ * `withRelaxedEnforcement`, so one window can cover the workflow-file write
+ * to the default branch as well.
+ *
+ * @returns {Promise<Array<{name, status, error?}>>}
+ */
+export async function createMissingBranches(client, missing, defaultBranch) {
+  if (missing.length === 0) return [];
 
   let head;
   try {
@@ -119,30 +153,13 @@ export async function applyBranches(client, { missing, blocked }, defaultBranch)
   }
 
   const results = [];
-  const restoreFailures = [];
-
-  try {
-    for (const ruleset of blocked) {
-      await client.setEnforcement(ruleset, "evaluate");
-    }
-
-    for (const name of missing) {
-      try {
-        await client.createRef(`refs/heads/${name}`, head);
-        results.push({ name, status: "created" });
-      } catch (error) {
-        results.push({ name, status: "failed", error: error.message });
-      }
-    }
-  } finally {
-    for (const ruleset of blocked) {
-      try {
-        await client.setEnforcement(ruleset, "active");
-      } catch (error) {
-        restoreFailures.push({ name: ruleset.name, error: error.message });
-      }
+  for (const name of missing) {
+    try {
+      await client.createRef(`refs/heads/${name}`, head);
+      results.push({ name, status: "created" });
+    } catch (error) {
+      results.push({ name, status: "failed", error: error.message });
     }
   }
-
-  return { results, restoreFailures };
+  return results;
 }

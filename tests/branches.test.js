@@ -7,7 +7,8 @@ import {
   blockingRulesets,
   missingEnvironments,
   planBranches,
-  applyBranches,
+  createMissingBranches,
+  withRelaxedEnforcement,
 } from "../src/branches.js";
 
 const BASELINE = {
@@ -156,32 +157,59 @@ test("nothing missing means the rulesets are never even listed", async () => {
 
 test("branches are created from the default branch head", async () => {
   const client = stubClient();
-  const { results, restoreFailures } = await applyBranches(
-    client,
-    { missing: ["dev", "test"], blocked: [] },
-    "main",
-  );
+  const results = await createMissingBranches(client, ["dev", "test"], "main");
 
   assert.deepEqual(client.calls.created, [
     { ref: "refs/heads/dev", sha: "abc123" },
     { ref: "refs/heads/test", sha: "abc123" },
   ]);
   assert.deepEqual(results.map((r) => r.status), ["created", "created"]);
+});
+
+test("one branch failing to create does not stop the others", async () => {
+  const client = stubClient({ failOn: ["dev"] });
+  const results = await createMissingBranches(client, ["dev", "test"], "main");
+  assert.deepEqual(results.map((r) => r.status), ["failed", "created"]);
+});
+
+test("an empty repository fails with instructions rather than a bare 404", async () => {
+  const client = stubClient();
+  client.refSha = async () => {
+    throw Object.assign(new Error("Not Found"), { status: 404 });
+  };
+  await assert.rejects(() => createMissingBranches(client, ["dev"], "main"), /no commits/);
+});
+
+test("no missing branches means no writes at all", async () => {
+  const client = stubClient();
+  assert.deepEqual(await createMissingBranches(client, [], "main"), []);
+  assert.deepEqual(client.calls.created, []);
+});
+
+// --- the relax window ----------------------------------------------------------
+
+test("the window relaxes before the work and restores after it", async () => {
+  const client = stubClient();
+  const order = [];
+  const { restoreFailures } = await withRelaxedEnforcement(client, [BASELINE], async () => {
+    order.push(...client.calls.enforcement, "work");
+  });
+
+  assert.deepEqual(order, ["1:evaluate", "work"]);
+  assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
   assert.deepEqual(restoreFailures, []);
 });
 
-test("a blocking ruleset is relaxed before creation and restored after", async () => {
-  const client = stubClient();
-  await applyBranches(client, { missing: ["dev"], blocked: [BASELINE] }, "main");
-  assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
-});
-
 /** The property that matters most: a failure must not leave the repo open. */
-test("enforcement is restored even when a branch fails to create", async () => {
-  const client = stubClient({ failOn: ["dev"] });
-  const { results } = await applyBranches(client, { missing: ["dev"], blocked: [BASELINE] }, "main");
-
-  assert.equal(results[0].status, "failed");
+test("enforcement is restored even when the work throws", async () => {
+  const client = stubClient();
+  await assert.rejects(
+    () =>
+      withRelaxedEnforcement(client, [BASELINE], async () => {
+        throw new Error("boom");
+      }),
+    /boom/,
+  );
   assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
 });
 
@@ -194,47 +222,35 @@ test("a restore failure on one ruleset does not stop the other restores", async 
     if (mode === "active" && rs.id === 1) throw new Error("restore refused");
   };
 
-  const { restoreFailures } = await applyBranches(
-    client,
-    { missing: ["dev"], blocked: [BASELINE, other] },
-    "main",
-  );
+  const { restoreFailures } = await withRelaxedEnforcement(client, [BASELINE, other], async () => {});
 
   assert.deepEqual(restoreFailures, [{ name: "Pull Request Compulsion", error: "restore refused" }]);
   assert.ok(client.calls.enforcement.includes("9:active"), "the second ruleset must still be restored");
 });
 
-test("an empty repository fails with instructions rather than a bare 404", async () => {
+test("an empty blocked list opens no window and still runs the work", async () => {
   const client = stubClient();
-  client.refSha = async () => {
-    throw Object.assign(new Error("Not Found"), { status: 404 });
-  };
-  await assert.rejects(
-    () => applyBranches(client, { missing: ["dev"], blocked: [] }, "main"),
-    /no commits/,
-  );
-});
-
-test("enforcement is restored even when the ref lookup throws", async () => {
-  const client = stubClient();
-  client.createRef = async () => {
-    throw Object.assign(new Error("boom"), { fatal: true });
-  };
-  // createRef failures are caught per-branch, so force the throw at the loop level.
-  client.setEnforcement = async (rs, mode) => {
-    client.calls.enforcement.push(`${rs.id}:${mode}`);
-    if (mode === "evaluate") throw new Error("cannot relax");
-  };
-
-  await assert.rejects(() => applyBranches(client, { missing: ["dev"], blocked: [BASELINE] }, "main"));
-  assert.ok(client.calls.enforcement.includes("1:active"), "restore must still run");
-});
-
-test("no missing branches means no writes at all", async () => {
-  const client = stubClient();
-  assert.deepEqual(await applyBranches(client, { missing: [], blocked: [BASELINE] }, "main"), {
-    results: [],
-    restoreFailures: [],
+  let ran = false;
+  await withRelaxedEnforcement(client, [], async () => {
+    ran = true;
   });
+  assert.equal(ran, true);
   assert.deepEqual(client.calls.enforcement, []);
+});
+
+// --- guarding the default-branch write ------------------------------------------
+
+test("a pending workflow write pulls the default-branch guards into the window", async () => {
+  // Nothing missing, but the write to main is pending — the baseline guards main.
+  const client = stubClient({ branches: ["main", "dev", "prod"], rulesets: [BASELINE, NOMENCLATURE] });
+  const result = await planBranches(client, ["dev", "prod"], "main", { guardDefaultBranchWrite: true });
+
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.blocked.map((r) => r.name), ["Pull Request Compulsion"]);
+});
+
+test("without a pending write, nothing missing still means no ruleset listing", async () => {
+  const client = stubClient({ branches: ["main", "dev"] });
+  client.fullRulesets = async () => assert.fail("must not list rulesets when nothing needs the window");
+  assert.deepEqual(await planBranches(client, ["dev"], "main"), { missing: [], blocked: [] });
 });

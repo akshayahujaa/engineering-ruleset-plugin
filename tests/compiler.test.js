@@ -55,9 +55,12 @@ test("dev's status check becomes its own ruleset scoped to dev", () => {
   const scope = byName(rulesets, "PR-SCOPE-CHECK");
 
   assert.deepEqual(scope.conditions.ref_name.include, ["refs/heads/dev"]);
+  // "scope-check" is the check-run name the pr-guardrails workflow actually
+  // reports (its job id). The original "pr-scope/check" matched nothing, so
+  // merges into dev would have blocked forever waiting for it.
   assert.deepEqual(
     scope.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
-    [{ context: "pr-scope/check" }],
+    [{ context: "scope-check" }],
   );
 });
 

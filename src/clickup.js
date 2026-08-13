@@ -86,6 +86,14 @@ on:
   pull_request:
     types: [closed]
     branches: [${branch}]
+  # Manual test entry: simulates a merged branch without needing a real PR,
+  # so the wiring (secret, id extraction, ClickUp auth) can be verified alone.
+  workflow_dispatch:
+    inputs:
+      head_ref:
+        description: "Branch name to simulate, e.g. feature/${idPrefix}123/thing"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -93,7 +101,7 @@ permissions:
 jobs:
   advance-task:
     # Closing a PR without merging must not touch the task.
-    if: github.event.pull_request.merged == true
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Advance the linked ClickUp task
@@ -101,7 +109,7 @@ jobs:
           CLICKUP_TOKEN: \${{ secrets.${secretName} }}
           # Only needed when the workspace uses ClickUp Custom Task IDs.
           CLICKUP_TEAM_ID: \${{ secrets.CLICKUP_TEAM_ID }}
-          HEAD_REF: \${{ github.event.pull_request.head.ref }}
+          HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref }}
         run: |
           set -euo pipefail
 
