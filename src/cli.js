@@ -437,7 +437,9 @@ async function main() {
     let clickupDone = false;
 
     const { restoreFailures } = await withRelaxedEnforcement(client, branches.blocked, async () => {
-      branchResults = await createMissingBranches(client, branches.missing, context.defaultBranch);
+      // Workflow file BEFORE branches: the branches are cut from the default
+      // branch head, and a dev without clickup-sync.yml never fires the sync —
+      // pull_request workflows run from the PR's merge commit.
       if (clickupPending) {
         try {
           await applyClickUp(client, clickup);
@@ -446,6 +448,7 @@ async function main() {
           clickupError = error;
         }
       }
+      branchResults = await createMissingBranches(client, branches.missing, context.defaultBranch);
     });
 
     for (const result of branchResults) {
