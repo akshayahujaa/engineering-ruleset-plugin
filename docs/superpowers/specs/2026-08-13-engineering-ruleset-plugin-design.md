@@ -1,229 +1,197 @@
 # Engineering Ruleset Plugin — Design
 
 **Date:** 2026-08-13
-**Status:** Approved, pending implementation plan
+**Status:** Approved (revised — supersedes the local-enforcement design)
 
 ## Purpose
 
-A Claude Code plugin that carries a bundled set of GitHub branch rulesets and enforces them
-locally, in any repository it is loaded into. It answers two questions:
+A Claude Code plugin that pushes a maintained set of branch rulesets into whatever GitHub
+repository it is run in. You connect a repo, type `/enforce-rules`, and the repo's GitHub
+rulesets are brought in line with the declared policy through the REST API.
 
-1. *Advisory* — "what constraints apply to the branch I am on?"
-2. *Blocking* — "is this specific git command allowed?"
-
-The plugin is the only enforcement layer. The rulesets are not pushed to GitHub, so nothing
-server-side backstops it. That is a deliberate choice for this step and is revisited in
-Out of Scope.
+Enforcement is therefore **server-side**: GitHub rejects violating pushes for every actor, with
+no dependency on Claude behaving. An earlier revision of this design enforced rules locally via
+a blocking `PreToolUse` hook; that is dropped, because server-side rules are strictly stronger
+and the hook would only duplicate them.
 
 ## Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Plugin location | Separate repo at `~/Desktop/engineering-ruleset-plugin` | Keeps it generic and reusable; `shop-ui` stays a clean test target |
-| Ruleset source | Bundled `rulesets.json` | Deterministic, offline, no `gh` dependency |
-| Enforcement | Blocking `PreToolUse` hook + advisory MCP tool | Rules that only advise are rules Claude can talk itself out of |
-| Test target | `akshayahujaa/shop-ui` | Already cloned at `~/Desktop/devOps-agent` |
+| Enforcement point | GitHub Rulesets REST API | Binds every actor, survives a machine without the plugin |
+| Trigger | `/enforce-rules` slash command | Explicit and on-demand, not a background surprise |
+| Policy source | `ruleset-config.json`, compiled to rulesets | New environment = one line, no code change |
+| Sync strategy | Match by name, create or update | Idempotent; re-running never duplicates |
+| Safety | Plan printed, confirmation required | Writes to a live repo; `--apply` skips the prompt |
+| Team reviewer rule | Degrade automatically | Personal repos can't require another org's team |
+| Bypass actors | None | Rules bind everyone, repo admin included |
+
+## Environment flexibility
+
+The four source rulesets hardcode `dev`, `test`, and `prod` across three separate places, and
+the branch-nomenclature exclude list has to repeat them. Adding `staging` means four correct
+edits with no feedback if one is missed.
+
+The plugin inverts this. A single config declares environments, and a compiler generates the
+ruleset payloads:
+
+```json
+{
+  "environments": {
+    "dev":  { "statusChecks": ["pr-scope/check"] },
+    "test": {},
+    "prod": { "requiredApprovals": 1, "reviewerTeams": ["tehvault/reviewers"] }
+  },
+  "baseline": {
+    "requirePullRequest": true,
+    "requiredApprovals": 0,
+    "preventDeletion": true,
+    "preventForcePush": true,
+    "includeDefaultBranch": true
+  },
+  "branchNaming": {
+    "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],
+    "requiredApprovals": 1,
+    "reviewerTeams": ["tehvault/reviewers"]
+  }
+}
+```
+
+Adding `"staging": {}` puts `staging` into the PR-required ruleset's includes and into the
+nomenclature ruleset's excludes, in one edit. Nothing else changes.
+
+### Generated ruleset names
+
+For the config above the compiler emits exactly the four original rulesets, under their
+original names, so an existing repo is updated rather than duplicated:
+
+| Generated ruleset | Source |
+|---|---|
+| `Pull Request Compulsion` | `baseline`, applied to the default branch and every environment |
+| `PR-SCOPE-CHECK` | the `dev` environment's `statusChecks` |
+| `team-only-reviewer` | the `prod` environment's `requiredApprovals` / `reviewerTeams` |
+| `Enforce Branch Nomenclature` | `branchNaming`, excluding every environment and prefix |
+
+A new environment that declares its own `statusChecks` or `reviewerTeams` gets a derived name —
+`PR-SCOPE-CHECK-staging`, `team-only-reviewer-staging` — so the canonical four keep their
+identity while the set extends predictably. Environments that declare nothing extra add
+themselves to the baseline ruleset only and generate no new ruleset.
 
 ## Architecture
 
 ```
 engineering-ruleset-plugin/
-├── .claude-plugin/plugin.json    manifest
-├── .mcp.json                     registers the MCP server
-├── hooks/hooks.json              registers the PreToolUse guard
-├── rulesets.json                 the 4 bundled GitHub rulesets
-├── skills/ingest-rules/SKILL.md  /ingest-rules slash command + auto-trigger
+├── .claude-plugin/plugin.json     manifest
+├── commands/enforce-rules.md      the /enforce-rules slash command
+├── ruleset-config.json            policy source of truth
 ├── src/
-│   ├── ruleset-evaluator.ts      pattern matching + aggregation
-│   ├── git-intent.ts             parses a shell command into git intents
-│   ├── index.ts                  MCP server
-│   └── guard.ts                  PreToolUse hook entry point
+│   ├── compiler.ts                config → GitHub ruleset payloads
+│   ├── github.ts                  REST client + repo/auth resolution
+│   ├── sync.ts                    diff, plan, apply
+│   └── cli.ts                     entry point, output formatting
 └── tests/
 ```
 
-### Module boundaries
+**`compiler.ts`** is pure: config in, payload array out. No network, no filesystem. Every
+generation rule is tested here without touching GitHub.
 
-**`ruleset-evaluator.ts`** — pure. Takes `(branchName, rulesets, context)` and returns a
-constraint matrix. No filesystem, no network, no `git`. Every branch-matching edge case is
-tested here.
+**`github.ts`** owns all I/O: resolving `owner/repo`, listing, creating, and updating rulesets.
 
-**`git-intent.ts`** — pure. Takes a shell command string, returns zero or more structured
-intents (`create-branch`, `push`, `force-push`, `delete-branch`). No evaluation logic.
+**`sync.ts`** compares desired against actual and produces a plan; applying is a separate call,
+so planning is always safe to run.
 
-**`index.ts`** — MCP server. Reads `rulesets.json`, resolves branch context, calls the
-evaluator, returns JSON.
+No MCP server. The slash command runs the CLI and reads its output — one process, one code
+path, straightforward to debug.
 
-**`guard.ts`** — hook. Reads stdin, calls `git-intent`, calls the evaluator, emits an
-allow/deny decision.
+## REST contract
 
-The two consumers share the two pure modules and know nothing about each other.
-
-## Bundled rulesets
-
-Four rulesets, verbatim from the source GitHub config, stored as a JSON array.
-
-| Ruleset | Applies to | Effect |
-|---|---|---|
-| `team-only-reviewer` | `prod` | PR + 1 approval + team `18199891`; no delete, no force-push |
-| `Pull Request Compulsion` | default branch, `dev`, `test`, `prod` | PR required (0 approvals); no delete, no force-push |
-| `PR-SCOPE-CHECK` | `dev` | status check `pr-scope/check`; no delete, no force-push |
-| `Enforce Branch Nomenclature` | `~ALL` except `dev`, `test`, `prod`, `main`, and `feature/**`, `bugfix/**`, `hotfix/**`, `docs/**`, `chore/**` | restricts creation; PR + 1 approval |
-
-The `source` field on each ruleset names `tehvault/frontend-app`, but rules are applied to
-whatever repository the plugin is loaded into. The `required_reviewers` team id is org-scoped
-and is reported as informational when the current repo is outside that org — it cannot be
-verified locally.
-
-## Ref pattern matching
-
-Patterns are GitHub ref patterns, not shell globs. Semantics:
-
-| Pattern | Matches |
+| Operation | Call |
 |---|---|
-| `~ALL` | every ref |
-| `~DEFAULT_BRANCH` | the repo's default branch only |
-| `refs/heads/dev` | exactly `dev` |
-| `refs/heads/feature/**/*` | `feature/x`, `feature/x/y`, and deeper |
-| `refs/heads/feature/**` | same as above |
-| `*` | one path segment; does not cross `/` |
-| `**` | any number of segments; crosses `/` |
+| List | `GET /repos/{owner}/{repo}/rulesets` |
+| Create | `POST /repos/{owner}/{repo}/rulesets` |
+| Update | `PUT /repos/{owner}/{repo}/rulesets/{id}` |
 
-Two bugs in the reference implementation this design corrects:
+The stored ruleset JSON carries `id`, `source`, `source_type`, and timestamps, which are
+response-only. Sending them back produces a 422, so the compiler emits only `name`, `target`,
+`enforcement`, `conditions`, `rules`, and `bypass_actors`.
 
-**Chained-replace corruption.** Converting the pattern with successive `String.replace` calls
-lets a later step rewrite an earlier step's output. `refs/heads/feature/**/*` becomes
-`refs/heads/feature(?:/.*)?` after the `**` pass, and the subsequent `*` → `[^/]*` pass then
-rewrites the `.*` inside it, yielding `refs/heads/feature(?:/.[^/]*)?`. Nested branches such as
-`feature/CU-123/api` stop matching. Fix: scan the pattern once, emitting regex per token, and
-escape regex metacharacters (notably `.`) as literals.
+`GET` returns rulesets without their `rules` array; fetching a single ruleset by id is required
+to diff rule contents. The plan step therefore fetches each existing ruleset individually.
 
-**Unnormalized default-branch check.** `~DEFAULT_BRANCH` is compared against the raw input, so
-it misses when the input is already `refs/heads/main`. Fix: normalize to a full ref before any
-comparison.
+**Auth** prefers the `gh` CLI, which is already authenticated with the `repo` scope, and falls
+back to `GITHUB_TOKEN` or `GH_TOKEN` with `fetch`. Creating rulesets requires admin on the repo.
 
-The default branch name is resolved by the caller and passed in as context, so the evaluator
-stays pure. Resolution order: `git symbolic-ref --short refs/remotes/origin/HEAD` with the
-`origin/` prefix stripped, then `main`, then `master`.
+**Repo resolution** parses `git remote get-url origin`, accepting both
+`https://github.com/owner/repo.git` and `git@github.com:owner/repo.git`.
 
-## Evaluation algorithm
+## Degradation
 
-1. Normalize `branchName` to `refs/heads/<name>`.
-2. Discard rulesets whose `enforcement` is not `active`.
-3. For each remaining ruleset: if any `exclude` pattern matches, skip it; otherwise keep it if
-   any `include` pattern matches. Excludes are evaluated first and win.
-4. Aggregate the `rules` of all surviving rulesets.
+`required_reviewers` binds a GitHub team and is only meaningful when the repo's owner shares the
+team's organization. On a repo owned by a user account, or an org that does not contain the
+named team, the compiler drops `required_reviewers` and keeps `required_approving_review_count`.
+Each degradation is named in the plan output rather than applied silently.
 
-Aggregation is a union, taking the strictest value where rules overlap:
+For the current target, `akshayahujaa/shop-ui` is owned by a user account while
+`tehvault/reviewers` belongs to the `tehvault` org, so `team-only-reviewer` will be created with
+its approval count intact and its team requirement dropped.
 
-```ts
-{
-  targetBranch: string
-  normalizedRef: string
-  matchedRulesets: string[]
-  requiresPullRequest: boolean      // any pull_request rule
-  minApprovals: number              // max across matched rulesets
-  requiredStatusChecks: string[]    // union, deduped
-  requiredReviewerTeams: number[]   // union, deduped
-  preventDeletion: boolean          // any deletion rule
-  preventNonFastForward: boolean    // any non_fast_forward rule
-  restrictsCreation: boolean        // any creation rule
-  unrecognizedRules: string[]       // rule types present but not understood
-}
+## Plan and apply
+
+`/enforce-rules` prints a plan and stops:
+
+```
+Repository: akshayahujaa/shop-ui (public, user-owned)
+
+  CREATE  Pull Request Compulsion       → main, dev, test, prod
+  CREATE  PR-SCOPE-CHECK                → dev
+  CREATE  team-only-reviewer            → prod   [degraded: team requirement dropped]
+  CREATE  Enforce Branch Nomenclature   → all except main, dev, test, prod, feature/**, …
+
+  No bypass actors. After apply, direct pushes to main require a pull request.
 ```
 
-`minApprovals` takes the maximum, so `prod` matching both `team-only-reviewer` (1) and
-`Pull Request Compulsion` (0) yields 1.
+Applying happens only after confirmation, or immediately with `/enforce-rules --apply`. Existing
+rulesets whose contents already match are reported as unchanged and are not written.
 
-### Nomenclature detection
+## Consequences of no bypass actors
 
-A branch name is invalid when a matched ruleset carries a `creation` rule — that is precisely
-what the `creation` rule type means, and `Enforce Branch Nomenclature` is the ruleset that
-carries it. Detection keys off `restrictsCreation`, never off the ruleset's display name, so
-renaming a ruleset cannot silently disable the check.
-
-## Blocking behaviour
-
-The hook fires on `PreToolUse` for `Bash`. If the command contains no `git` token it exits
-immediately without loading rulesets.
-
-| Intent | Condition | Decision |
-|---|---|---|
-| `create-branch` | `restrictsCreation` on the new name | deny; message names the allowed prefixes |
-| `push --force` / `--force-with-lease` | `preventNonFastForward` on the target | deny |
-| `push` (direct) | `requiresPullRequest` on the target | deny; message says open a PR |
-| `delete-branch` | `preventDeletion` on the target | deny |
-| anything else | — | allow |
-
-Commands are split on `&&`, `||`, and `;` and each segment is evaluated independently, so
-`git checkout -b bad && git push` is caught.
-
-Push refspecs are resolved to a target branch across all their forms: bare `branch`,
-`local:remote`, `HEAD:branch`, and `:branch` (delete). A `git push` with no refspec targets the
-current branch.
-
-**Parse failures fail open.** A command the parser cannot confidently classify is allowed, and
-the reason is surfaced in the hook's output rather than swallowed. Blocking on ambiguity would
-make the plugin unusable; the cost is that a sufficiently exotic git invocation slips through.
-
-## Hook contract
-
-Input on stdin:
-
-```json
-{ "tool_name": "Bash", "tool_input": { "command": "..." }, "cwd": "/path/to/repo" }
-```
-
-Output on stdout for a denial:
-
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "Branch 'my-branch' violates nomenclature..."
-  }
-}
-```
-
-Allowed commands exit 0 with no output. The hook resolves branch context by running `git` in
-the `cwd` supplied by the harness, not in the plugin directory.
-
-## Advisory path
-
-`skills/ingest-rules/SKILL.md` exposes `/ingest-rules` and triggers when the user asks about
-branch rules or is about to commit or open a PR. It resolves the current branch, calls the MCP
-tool `evaluate_branch_rules`, and reports the constraint matrix.
-
-The MCP tool accepts an optional `targetBranch`; without it, the current branch is used.
+With `bypass_actors` empty, `Pull Request Compulsion` covers the default branch, so on
+`shop-ui` every change to `main` — including the repo owner's — must go through a pull request,
+and force-pushing or deleting `main`, `dev`, `test`, or `prod` is refused. This is intended, and
+is restated in the plan output before any write.
 
 ## Error handling
 
 | Failure | Behaviour |
 |---|---|
-| `rulesets.json` missing or malformed | Hook fails open and allows; MCP tool returns `isError` with the parse message |
-| Not a git repository | Hook allows; MCP tool reports "not a git repository" |
-| Branch cannot be resolved (detached HEAD) | Hook evaluates only intents carrying an explicit branch name; others allowed |
-| Unknown rule `type` in a ruleset | Ignored, and named in `unrecognizedRules` on the matrix |
+| Not a git repository, or no `origin` | Abort with the reason; nothing is written |
+| No `gh` auth and no token | Abort naming both remediation paths |
+| Caller lacks admin on the repo | Abort on the 403, naming the required permission |
+| API rejects a ruleset (422) | Report the ruleset, the field, and the message; continue with the rest, then exit non-zero |
+| Config malformed | Abort with the failing key before any network call |
+| Partial apply | Each ruleset is applied independently; the summary lists applied, skipped, and failed |
 
 ## Testing
 
-Test-driven, evaluator first.
+Test-driven, compiler first.
 
-**Evaluator** — a branch-to-expected-constraints table covering `dev`, `test`, `prod`, `main`,
-`feature/CU-123`, `feature/CU-123/api` (the nested case the reference implementation fails),
-`chore/deps`, and `random-branch`. Plus pattern-level tests for `~ALL`, `~DEFAULT_BRANCH`,
-exclude-beats-include, and metacharacter escaping.
+**Compiler** — the four canonical rulesets are generated from the canonical config, asserted
+field by field. Then: adding a bare environment extends the baseline includes and the
+nomenclature excludes and creates no new ruleset; adding an environment with status checks
+creates a derived ruleset; response-only fields never appear; degradation drops
+`required_reviewers` and preserves approvals.
 
-**Intent parser** — one test per git form in the blocking table, plus compound commands,
-refspec variants, and a deliberately unparseable command asserting fail-open.
+**Sync** — against a stubbed client: empty repo plans all creates; identical state plans no
+writes; drifted state plans an update carrying the existing id; a 422 on one ruleset does not
+prevent the others.
 
-**Hook** — stdin-to-stdout tests asserting the exact decision JSON for one allow and one deny.
+**Repo and auth resolution** — https and ssh remote forms, missing remote, missing auth.
 
-**End-to-end** — load the plugin against the cloned `shop-ui` and confirm a bad branch name is
-blocked and `feature/CU-1` is not.
+**End-to-end** — plan against the real `akshayahujaa/shop-ui`, confirming it reports four
+creates and flags the team degradation, without applying.
 
 ## Out of scope
 
-Steps 2–4 of the roadmap: ClickUp task lifecycle, PR scope checks in CI, and Kubernetes/Argo
-access. Also excluded: pushing these rulesets to GitHub so they are enforced server-side, and
-any `gh` API dependency.
+Roadmap steps 2–4: ClickUp task lifecycle, PR scope checks in CI, Kubernetes and Argo access.
+Also excluded: deleting rulesets the config no longer declares (reported as drift, never
+removed automatically), tag and push rulesets, and org-level rulesets.
