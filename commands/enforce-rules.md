@@ -58,8 +58,8 @@ The config carries `dev`, `test`, and `prod`. The sync creates any that are miss
 default branch, **before** writing rulesets — a ruleset requiring a pull request for `dev` also
 refuses the push that creates `dev`, so the order is not optional.
 
-On a repo already synced, the blocking rulesets are dropped to `evaluate` for the moment it takes
-to create the branches, then restored to `active`. Say so before applying: it is a brief window
+On a repo already synced, the blocking rulesets are disabled for the moment it takes
+to create the branches (and to commit the workflow file), then restored to `active`. Say so before applying: it is a brief window
 where the default branch is unprotected.
 
 **On a repo's first sync only** — recognisable because every ruleset shows `CREATE` and the repo

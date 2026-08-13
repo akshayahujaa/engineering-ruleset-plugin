@@ -195,8 +195,8 @@ test("the window relaxes before the work and restores after it", async () => {
     order.push(...client.calls.enforcement, "work");
   });
 
-  assert.deepEqual(order, ["1:evaluate", "work"]);
-  assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
+  assert.deepEqual(order, ["1:disabled", "work"]);
+  assert.deepEqual(client.calls.enforcement, ["1:disabled", "1:active"]);
   assert.deepEqual(restoreFailures, []);
 });
 
@@ -210,7 +210,7 @@ test("enforcement is restored even when the work throws", async () => {
       }),
     /boom/,
   );
-  assert.deepEqual(client.calls.enforcement, ["1:evaluate", "1:active"]);
+  assert.deepEqual(client.calls.enforcement, ["1:disabled", "1:active"]);
 });
 
 /** One failed restore must not abandon the other rulesets at 'evaluate'. */
@@ -253,4 +253,26 @@ test("without a pending write, nothing missing still means no ruleset listing", 
   const client = stubClient({ branches: ["main", "dev"] });
   client.fullRulesets = async () => assert.fail("must not list rulesets when nothing needs the window");
   assert.deepEqual(await planBranches(client, ["dev"], "main"), { missing: [], blocked: [] });
+});
+
+test("restore failures ride along when the work throws, instead of vanishing", async () => {
+  const client = stubClient();
+  client.setEnforcement = async (rs, mode) => {
+    client.calls.enforcement.push(`${rs.id}:${mode}`);
+    if (mode === "active") throw new Error("restore refused");
+  };
+
+  await assert.rejects(
+    () =>
+      withRelaxedEnforcement(client, [BASELINE], async () => {
+        throw new Error("boom");
+      }),
+    (error) => {
+      assert.match(error.message, /boom/);
+      assert.deepEqual(error.restoreFailures, [
+        { name: "Pull Request Compulsion", error: "restore refused" },
+      ]);
+      return true;
+    },
+  );
 });

@@ -98,11 +98,18 @@ export async function planBranches(client, environments, defaultBranch, { guardD
 }
 
 /**
- * Relaxes the given rulesets to `evaluate`, runs `fn`, and restores them.
+ * Relaxes the given rulesets, runs `fn`, and restores them.
+ *
+ * The relaxed mode is `disabled`, not `evaluate`: evaluate is an
+ * Enterprise-plan feature — GitHub answers 422 "not supported on this plan"
+ * everywhere else, which is how the first live run of this window failed.
+ * `disabled` is honoured on every plan and the window lasts seconds.
  *
  * The restore is per-ruleset in a `finally`: one failed restore must not
- * abandon the others at `evaluate`, and every failure is reported by name so
- * the caller can say exactly which guard is still down.
+ * abandon the others while disabled, and every failure is reported by name so
+ * the caller can say exactly which guard is still down. When the work itself
+ * throws, the failures ride along on the error as `error.restoreFailures` —
+ * they must not vanish just because the window died early.
  *
  * @returns {Promise<{value: any, restoreFailures: Array<{name, error}>}>}
  */
@@ -112,9 +119,12 @@ export async function withRelaxedEnforcement(client, blocked, fn) {
 
   try {
     for (const ruleset of blocked) {
-      await client.setEnforcement(ruleset, "evaluate");
+      await client.setEnforcement(ruleset, "disabled");
     }
     value = await fn();
+  } catch (error) {
+    if (typeof error === "object" && error !== null) error.restoreFailures = restoreFailures;
+    throw error;
   } finally {
     for (const ruleset of blocked) {
       try {

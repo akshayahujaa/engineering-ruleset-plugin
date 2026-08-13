@@ -142,14 +142,15 @@ a ruleset naming `refs/heads/dev` protects nothing while that branch does not ex
 a branch counts as a direct push, so once that ruleset is active GitHub refuses the creation with
 a 422. Branches are therefore created *before* rulesets are written.
 
-On a repo that has already been synced, the rulesets that would refuse the creation are dropped to
-`evaluate`, the branches are created, and enforcement is restored — reported in the plan before
-anything happens:
+On a repo that has already been synced, the rulesets that would refuse the creation are disabled,
+the branches are created (and the workflow file committed), and enforcement is restored — reported
+in the plan before anything happens. (`evaluate` would be gentler, but it is an Enterprise-plan
+feature; on every other plan GitHub refuses it with a 422.)
 
 ```
   CREATE   dev, test, prod                → environment branch(es), from main
              [PR-SCOPE-CHECK, Pull Request Compulsion, team-only-reviewer would refuse this;
-              each is dropped to 'evaluate' only while the branches are created,
+              each is disabled only while the branches are created,
               then restored to 'active']
 ```
 

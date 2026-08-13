@@ -342,7 +342,7 @@ async function main() {
     ].join(" and ");
     console.log(
       `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
-        `\n              each is dropped to 'evaluate' only while ${writes},` +
+        `\n              each is disabled only while ${writes},` +
         `\n              then restored to 'active']`,
     );
   }
@@ -458,7 +458,7 @@ async function main() {
     }
     for (const failure of restoreFailures) {
       console.log(
-        `  ✗ RULESET '${failure.name}' IS STILL IN 'evaluate' — its restore failed: ${failure.error}` +
+        `  ✗ RULESET '${failure.name}' IS STILL DISABLED — its restore failed: ${failure.error}` +
           `\n    The repository is unprotected by it until a re-run or a manual fix succeeds.`,
       );
       process.exitCode = 1;
@@ -492,6 +492,11 @@ async function main() {
 
 /** Turns the API's terser refusals into something actionable. */
 function explain(error) {
+  // A 422 without its errors array is undebuggable ("Validation Failed" and
+  // nothing else); GitHub puts the real reason one level down.
+  const detail = (error.body?.errors ?? [])
+    .map((e) => `\n  ${typeof e === "string" ? e : e.message ?? JSON.stringify(e)}`)
+    .join("");
   if (/Upgrade to GitHub Pro/i.test(error.message)) {
     return (
       "This repository is private and owned by a personal account, where rulesets are a paid " +
@@ -501,10 +506,18 @@ function explain(error) {
   if (error.status === 404) {
     return `${error.message}\n  Check the repository exists and your token can see it.`;
   }
-  return error.message;
+  return `${error.message}${detail}`;
 }
 
 main().catch((error) => {
+  // Restore failures riding on the error mean a guard is still down — that
+  // outranks whatever else went wrong, so it prints first and loudest.
+  for (const failure of error?.restoreFailures ?? []) {
+    console.error(
+      `\n  ✗ RULESET '${failure.name}' IS STILL DISABLED — its restore failed: ${failure.error}` +
+        `\n    The repository is unprotected by it until a re-run or a manual fix succeeds.`,
+    );
+  }
   // An access refusal is already written for a human; printing it verbatim
   // keeps its layout and avoids dressing it up as an API failure.
   if (error instanceof AccessDenied) {
