@@ -63,20 +63,27 @@ to create the branches (and to commit the workflow file), then restored to `acti
 where the default branch is unprotected.
 
 **On a repo's first sync only** — recognisable because every ruleset shows `CREATE` and the repo
-has no rulesets yet — ask the user, using AskUserQuestion, whether they want any environment
-beyond `dev`, `test`, and `prod`. Offer the three defaults as the recommended answer. If they name
-others, pass them through:
+has no rulesets yet — ask the user two things, using AskUserQuestion:
+
+1. **Which task tracker to sync on merges.** Offer **ClickUp as the recommended default**, then
+   **Jira**, then **None**. Pass the answer through as `--provider clickup|jira|none`.
+2. **Extra environments** beyond `dev`, `test`, and `prod`, defaults recommended. Pass extras
+   through as `--env`.
 
 ```
-node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --env staging --env uat
+node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --provider jira --env staging
 ```
 
-**Carry the same `--env` flags onto the apply run.** The plan does not persist them — an apply
-without them silently drops the user's answer:
+**Carry the same `--provider` and `--env` flags onto the apply run.** The plan does not persist
+them — an apply without them silently drops the user's answers:
 
 ```
-node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --env staging --env uat --apply
+node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --provider jira --env staging --apply
 ```
+
+Changing provider on an already-synced repo also plans a `DELETE` of the other provider's sync
+workflow — without it both trackers would move tasks on every merge. Show that line; it is part
+of the plan for a reason.
 
 Do not ask on a repo that already has rulesets — a re-sync should be quiet. (On a real terminal
 the CLI asks this question itself; under this command stdin is a pipe, so it stays silent by
@@ -88,23 +95,29 @@ repo, that is a per-repo `.github/ruleset-config.json` instead. If the CLI warns
 marketplace clone, relay that warning: the persisted edit is lost on
 `claude plugin marketplace update`, so it should also be committed to the plugin repo.
 
-If the target repository commits its own `.github/ruleset-config.json`, `--env` is refused — that
-policy can only change by a pull request to that repository. Relay the instruction as printed.
+If the target repository commits its own `.github/ruleset-config.json`, `--env` and `--provider`
+are refused alike — that policy can only change by a pull request to that repository. Relay the
+instruction as printed, and do not carry the refused flag onto further runs against that repo.
 
-## ClickUp
+## Task tracker credentials (ClickUp or Jira)
 
-When the plan includes `.github/workflows/clickup-sync.yml`, applying commits that file to the
-repository — call that out, since every other change is a settings change.
+When the plan includes a sync workflow (`clickup-sync.yml` or `jira-sync.yml`), applying commits
+that file to the repository — call that out, since every other change is a settings change.
 
-If it reports that `CLICKUP_TOKEN` is not set — or the user asks to integrate the token, set the
-secret, or "connect ClickUp" — the CLI can drive it, but only from the user's own terminal.
+If the plan reports missing credentials — or the user asks to integrate the token, set the
+secret, or "connect ClickUp/Jira" — the CLI can drive it, but only from the user's own terminal.
 Relay this command **with both placeholders substituted** — expand `${CLAUDE_PLUGIN_ROOT}` to the
 actual absolute plugin path and `owner/name` to the real repository, since neither means anything
 in the user's shell:
 
 ```
-node "<absolute plugin path>/src/cli.js" --repo owner/name --set-clickup-token
+node "<absolute plugin path>/src/cli.js" --repo owner/name --set-token
 ```
+
+For **ClickUp** that sets one secret (`CLICKUP_TOKEN`). For **Jira** it first asks for
+`JIRA_BASE_URL` and `JIRA_EMAIL` — ordinary repository variables, not sensitive, answered in the
+clear — then takes `JIRA_API_TOKEN` at gh's hidden prompt. (`--set-clickup-token` still works as
+an alias of `--set-token`.)
 
 (When the CLI has already refused with its "needs a real terminal" message, relay the command
 from that message verbatim — it is already fully substituted.) `gh` prompts for the token with
@@ -113,8 +126,8 @@ never enters the CLI process. Running it through this command's Bash tool will r
 stdin is a pipe, and there is no terminal to hand to gh.
 
 **Never ask the user to paste the token into the chat. Never accept it if they paste it anyway —
-tell them to revoke that token in ClickUp (Settings → Apps → API Token) and generate a new one,
-since anything pasted into chat must be treated as exposed. Never put a token value into a
+tell them to revoke it (ClickUp: Settings → Apps → API Token; Jira: id.atlassian.com → Security →
+API tokens) and generate a new one, since anything pasted into chat must be treated as exposed. Never put a token value into a
 command, file, or environment variable on their behalf.** The hidden prompt is the only route.
 The CLI enforces the same rule itself: anything token-shaped in its arguments is refused with
 the same revoke guidance.
@@ -122,7 +135,7 @@ the same revoke guidance.
 After the user says they have run it, re-run the plan; the token notice disappearing (or
 `"hasToken": true` in `--json`) confirms **a** secret exists — it cannot tell a fresh token from
 a revoked one. If a token was exposed and revoked after it had already been uploaded, the user
-must run `--set-clickup-token` again with the replacement, even though `hasToken` reads true.
+must run `--set-token` again with the replacement, even though `hasToken` reads true.
 
 Notes:
 

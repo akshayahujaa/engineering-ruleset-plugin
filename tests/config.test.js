@@ -165,9 +165,11 @@ test("a comma-separated answer parses into clean names", () => {
 // --- token-in-argv tripwire -----------------------------------------------------
 
 test("a token passed as a flag value is refused with revoke guidance", () => {
-  const msg = detectTokenMisuse(["--set-clickup-token=pk_abc123"]);
-  assert.match(msg, /never appear on the command line/);
-  assert.match(msg, /revoke it in ClickUp/);
+  for (const flag of ["--set-clickup-token", "--set-token"]) {
+    const msg = detectTokenMisuse([`${flag}=pk_abc123`]);
+    assert.match(msg, /never appear on the command line/);
+    assert.match(msg, /revoke it/);
+  }
 });
 
 test("a stray value after the flag is refused rather than silently ignored", () => {
@@ -177,8 +179,11 @@ test("a stray value after the flag is refused rather than silently ignored", () 
 });
 
 test("anything token-shaped anywhere in argv trips the wire", () => {
-  assert.match(detectTokenMisuse(["--repo", "o/r", "pk_12345xyz"]), /looks like a ClickUp token/);
-  assert.match(detectTokenMisuse(["--env=pk_9abcdef"]), /looks like a ClickUp token/);
+  assert.match(detectTokenMisuse(["--repo", "o/r", "pk_12345xyz"]), /looks like an API token/);
+  assert.match(detectTokenMisuse(["--env=pk_9abcdef"]), /looks like an API token/);
+  // Atlassian (Jira) API tokens have their own shape.
+  assert.match(detectTokenMisuse(["ATATT3xFfGF0abc"]), /looks like an API token/);
+  assert.match(detectTokenMisuse(["--set-token", "ATATT3xFfGF0abc"]), /revoke/);
 });
 
 test("the tripwire never echoes the full suspected token back", () => {
@@ -189,6 +194,7 @@ test("the tripwire never echoes the full suspected token back", () => {
 test("clean invocations pass the tripwire", () => {
   assert.equal(detectTokenMisuse(["--repo", "o/r", "--set-clickup-token"]), null);
   assert.equal(detectTokenMisuse(["--set-clickup-token", "--apply"]), null);
+  assert.equal(detectTokenMisuse(["--set-token", "--provider", "jira"]), null);
   assert.equal(detectTokenMisuse(["--env", "staging", "--json"]), null);
   assert.equal(detectTokenMisuse([]), null);
 });

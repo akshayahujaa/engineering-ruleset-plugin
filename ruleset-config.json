@@ -22,8 +22,9 @@
     }
   },
 
-  "clickup": {
+  "taskSync": {
     "enabled": true,
+    "provider": "clickup",
     "targetBranch": "dev",
     "taskIdPrefix": "CU-",
     "todoStatuses": ["to do", "todo", "open", "backlog", "pending"],

@@ -8,7 +8,8 @@
  *   enforce-rules --json                machine-readable plan
  *   enforce-rules --accept-invite       accept a pending invitation to the target repo
  *   enforce-rules --env staging         add an environment; persisted on --apply
- *   enforce-rules --set-clickup-token   set the ClickUp secret via gh's hidden prompt
+ *   enforce-rules --provider jira       choose the task tracker (clickup | jira | none)
+ *   enforce-rules --set-token           set the tracker's credentials (token via gh's hidden prompt)
  */
 
 import { writeFileSync } from "node:fs";
@@ -23,7 +24,7 @@ import {
 import { compile, referencedTeams, addEnvironments } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply } from "./sync.js";
-import { planClickUp, applyClickUp } from "./clickup.js";
+import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan } from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
   probeAccess,
@@ -67,6 +68,79 @@ async function askExtraEnvironments(defaults) {
   } finally {
     rl.close();
   }
+}
+
+/**
+ * On a repository's very first sync, asks which task tracker the merge sync
+ * should talk to. Same TTY-only rule as the environments question: under the
+ * slash command the widget answers and `--provider` carries it in.
+ */
+async function askProvider() {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (
+      await rl.question("Task tracker to sync on merges — clickup (default), jira, or none: ")
+    )
+      .trim()
+      .toLowerCase();
+    if (answer === "" || answer === "clickup") return "clickup";
+    if (answer === "jira" || answer === "none") return answer;
+    throw new Error(`Unknown tracker '${answer}' — expected clickup, jira, or none.`);
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Interactive, gh-only credential setup for the active provider. The token
+ * goes through gh's hidden prompt and never enters this process. Jira's base
+ * URL and account email are ordinary repository variables — not sensitive —
+ * so they are prompted for in the clear and set directly.
+ */
+async function setupCredentials(client, sync) {
+  let wroteAnything = false;
+  if (sync.missingVariables.length > 0) {
+    const { createInterface } = await import("node:readline/promises");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      for (const name of [...sync.missingVariables]) {
+        const hint =
+          name === "JIRA_BASE_URL" ? "e.g. https://your-org.atlassian.net" : "your Atlassian account email";
+        const value = (await rl.question(`  ${name} (${hint}): `)).trim();
+        if (name === "JIRA_BASE_URL" && !/^https:\/\/.+/.test(value)) {
+          throw new Error(`${name} must be an https:// URL.`);
+        }
+        if (name === "JIRA_EMAIL" && !value.includes("@")) {
+          throw new Error(`${name} does not look like an email address.`);
+        }
+        await client.setVariable(name, value);
+        wroteAnything = true;
+        sync.missingVariables = sync.missingVariables.filter((v) => v !== name);
+        console.log(`  ✓ ${name} set`);
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  console.log(
+    `\nHanding over to gh — paste your ${sync.providerLabel} token ONLY at its hidden prompt.` +
+      `\n(${sync.tokenHint}. The value goes keyboard → gh → GitHub, nowhere else.)\n`,
+  );
+  try {
+    client.setSecretInteractive(sync.secretName);
+  } catch {
+    // gh exits non-zero on blank input, Ctrl-D, or an API refusal; the
+    // re-check below turns that into the honest ✗ rather than a stack trace.
+  }
+  sync.hasToken = await client.hasSecret(sync.secretName);
+  console.log(
+    sync.hasToken
+      ? `  ✓ ${sync.secretName} is set on ${client.owner}/${client.repo}\n`
+      : `  ✗ ${sync.secretName} still missing — gh did not confirm the write\n`,
+  );
+  return wroteAnything || sync.hasToken;
 }
 
 /**
@@ -124,8 +198,19 @@ async function main() {
   const shouldApply = args.includes("--apply");
   const asJson = args.includes("--json");
   const acceptInvite = args.includes("--accept-invite");
-  const setToken = args.includes("--set-clickup-token");
+  // --set-clickup-token is the pre-provider spelling, kept as an alias.
+  const setToken = args.includes("--set-token") || args.includes("--set-clickup-token");
   const cwd = process.cwd();
+
+  const providerFlagGiven = args.includes("--provider") || args.some((a) => a.startsWith("--provider="));
+  const providerFlag =
+    args.find((a) => a.startsWith("--provider="))?.split("=")[1] ??
+    (args.includes("--provider") ? args[args.indexOf("--provider") + 1] : undefined);
+  if (providerFlagGiven && !["clickup", "jira", "none"].includes(providerFlag)) {
+    throw new Error(
+      `--provider must be one of: clickup, jira, none — got '${providerFlag ?? ""}'.`,
+    );
+  }
 
   // A token that reaches argv is already exposed; refuse loudly, never silently.
   const misuse = detectTokenMisuse(args);
@@ -149,7 +234,7 @@ async function main() {
     throw new Error("--json is a plan format; run --apply without it.");
   }
   if (asJson && setToken) {
-    throw new Error("--set-clickup-token is interactive; it cannot combine with --json.");
+    throw new Error("--set-token is interactive; it cannot combine with --json.");
   }
 
   // --repo owner/name targets any repository without cloning or cd-ing into it.
@@ -162,14 +247,14 @@ async function main() {
   if (setToken) {
     if (!isInteractive()) {
       throw new AccessDenied(
-        "--set-clickup-token needs a real terminal: gh prompts for the token with hidden\n" +
+        "--set-token needs a real terminal: gh prompts for the token with hidden\n" +
           "input, and it is never accepted as an argument or over a pipe. Run this yourself:\n\n" +
-          `    node "${process.argv[1]}" --repo ${client.owner}/${client.repo} --set-clickup-token`,
+          `    node "${process.argv[1]}" --repo ${client.owner}/${client.repo} --set-token`,
       );
     }
     if (client.authMode !== "gh cli") {
       throw new AccessDenied(
-        "--set-clickup-token hands the terminal to the gh CLI, which is not available here.\n" +
+        "--set-token hands the terminal to the gh CLI, which is not available here.\n" +
           "Run `gh auth login` first — token-only auth cannot prompt with hidden input.",
       );
     }
@@ -203,8 +288,8 @@ async function main() {
   // First sync of a repository: offer to extend the default environments.
   // Only on a real terminal, only when --env did not already answer, and
   // never in --json mode, whose output must stay parseable.
-  // Skipped under --set-clickup-token: someone here to set a secret has not
-  // signed up for an environments interview.
+  // Skipped under --set-token: someone here to set credentials has not
+  // signed up for an interview.
   const preexisting = await client.listRulesets();
   if (preexisting.length === 0 && requestedEnvs.length === 0 && isInteractive() && !asJson && !setToken) {
     const extras = await askExtraEnvironments(Object.keys(config.environments ?? {}));
@@ -215,14 +300,58 @@ async function main() {
 
   const addedEnvs = addEnvironments(config, requestedEnvs);
 
+  // Provider: --provider wins; a first sync on a real terminal is asked
+  // (ClickUp default, then Jira, then none); otherwise the policy stands.
+  const syncSection = config.taskSync ?? config.clickup;
+  const configuredProvider = syncSection?.enabled ? (syncSection.provider ?? "clickup") : "none";
+  let chosenProvider = providerFlag;
+  if (
+    chosenProvider === undefined &&
+    preexisting.length === 0 &&
+    isInteractive() &&
+    !asJson &&
+    !setToken
+  ) {
+    chosenProvider = await askProvider();
+  }
+  const providerChanged = chosenProvider !== undefined && chosenProvider !== configuredProvider;
+  if (providerChanged) {
+    if (chosenProvider === "none") {
+      if (syncSection) syncSection.enabled = false;
+    } else if (syncSection) {
+      // Provider-specific fields must not leak across providers: a Jira
+      // workflow reading CLICKUP_TOKEN would be wrong twice. But merely
+      // re-enabling the SAME provider keeps its customizations — deleting a
+      // custom secretName on re-enable would silently kill a working sync.
+      if (chosenProvider !== (syncSection.provider ?? "clickup")) {
+        delete syncSection.taskIdPrefix;
+        delete syncSection.secretName;
+      }
+      syncSection.enabled = true;
+      syncSection.provider = chosenProvider;
+    } else {
+      config.taskSync = { enabled: true, provider: chosenProvider, targetBranch: "dev" };
+    }
+    // The documented shape is `taskSync`; a legacy `clickup` section being
+    // rewritten anyway is renamed rather than persisted with, say, a Jira
+    // provider inside a section named after ClickUp.
+    if (config.taskSync === undefined && config.clickup !== undefined) {
+      config.taskSync = config.clickup;
+      delete config.clickup;
+    }
+  }
+
   // A committed override can only be changed by a pull request to that repo —
-  // the plugin must not try to write it, and pretending the env was added
+  // the plugin must not try to write it, and pretending the edit happened
   // while persisting nothing would plan a policy the next run forgets.
-  if (addedEnvs.length > 0 && writablePath == null) {
+  const policyEdits = [
+    ...addedEnvs.map((e) => `environment '${e}'`),
+    ...(providerChanged ? [`task-sync provider '${chosenProvider}'`] : []),
+  ];
+  if (policyEdits.length > 0 && writablePath == null) {
     throw new AccessDenied(
       `This repository's policy comes from its committed ${OVERRIDE_PATH}, which cannot be ` +
-        `edited from here.\nAdd ${addedEnvs.map((e) => `'${e}'`).join(", ")} to "environments" in ` +
-        `that file via a pull request, then re-run.`,
+        `edited from here.\nApply ${policyEdits.join(", ")} in that file via a pull request, then re-run.`,
     );
   }
 
@@ -241,43 +370,31 @@ async function main() {
 
   const { rulesets, degradations } = compile(config, { ...context, teamIds });
   const { steps, undeclared } = await plan(client, rulesets);
-  const clickup = await planClickUp(client, config.clickup);
-  const clickupPending = Boolean(clickup && clickup.action !== "unchanged");
-  // A pending workflow write shares the branch-creation relax window: the same
-  // pull_request rule refuses both, so it must not earn a second window.
+  const sync = await planTaskSync(client, config);
+  const orphans = await planSyncOrphans(client, sync?.provider ?? null);
+  const syncPending = Boolean(sync && sync.action !== "unchanged") || orphans.length > 0;
+  // Pending workflow writes (and orphan removals) share the branch-creation
+  // relax window: the same pull_request rule refuses all of them, so they
+  // must not earn a second window.
   const branches = await planBranches(client, Object.keys(config.environments ?? {}), context.defaultBranch, {
-    guardDefaultBranchWrite: clickupPending,
+    guardDefaultBranchWrite: syncPending,
   });
 
   // The token itself never enters this process (or any chat): gh prompts for
   // it with hidden input, encrypts it locally, and uploads it. This flag only
   // decides WHEN to hand the terminal over; the TTY and gh-CLI requirements
   // were enforced before any network work.
+  let credentialWrites = false;
   if (setToken) {
-    if (!clickup) {
-      throw new Error("--set-clickup-token: the policy has no ClickUp section enabled.");
+    if (!sync) {
+      throw new Error("--set-token: task sync is not enabled in the policy (provider 'none').");
     }
-    console.log(
-      `\nHanding over to gh — paste your ClickUp token ONLY at its hidden prompt.` +
-        `\n(ClickUp → Settings → Apps → API Token. The value goes keyboard → gh → GitHub, nowhere else.)\n`,
-    );
-    try {
-      client.setSecretInteractive(clickup.secretName);
-    } catch {
-      // gh exits non-zero on blank input, Ctrl-D, or an API refusal; the
-      // re-check below turns that into the honest ✗ rather than a stack trace.
-    }
-    clickup.hasToken = await client.hasSecret(clickup.secretName);
-    console.log(
-      clickup.hasToken
-        ? `  ✓ ${clickup.secretName} is set on ${client.owner}/${client.repo}\n`
-        : `  ✗ ${clickup.secretName} still missing — gh did not confirm the write\n`,
-    );
-    if (!clickup.hasToken) process.exitCode = 1;
+    credentialWrites = await setupCredentials(client, sync);
+    if (!sync.hasToken) process.exitCode = 1;
   }
 
   if (asJson) {
-    // Branches carry the relax-to-evaluate window — the plan's most dangerous
+    // Branches carry the relax window — the plan's most dangerous
     // step — so machine consumers must see it too, not only humans.
     console.log(
       JSON.stringify(
@@ -291,7 +408,14 @@ async function main() {
             missing: branches.missing,
             relaxDuringCreation: branches.blocked.map((r) => r.name),
           },
-          clickup: clickup && { path: clickup.path, action: clickup.action, hasToken: clickup.hasToken },
+          taskSync: sync && {
+            provider: sync.provider,
+            path: sync.path,
+            action: sync.action,
+            hasToken: sync.hasToken,
+            missingVariables: sync.missingVariables,
+          },
+          removedSyncWorkflows: orphans.map((o) => o.path),
           addedEnvironments: addedEnvs,
         },
         null,
@@ -322,12 +446,6 @@ async function main() {
       `\n  NEW ENV  ${addedEnvs.join(", ").padEnd(30)} → will be added to ${policyLabel}` +
         (origin === "bundled" ? ", affecting every repo synced with it" : ""),
     );
-    if (isMarketplaceClone(writablePath)) {
-      console.log(
-        `             [this plugin install is a marketplace clone: the edit is lost on` +
-          `\n              'claude plugin marketplace update' — also commit it to the plugin repo]`,
-      );
-    }
   }
 
   if (branches.missing.length > 0) {
@@ -338,7 +456,7 @@ async function main() {
   if (branches.blocked.length > 0) {
     const writes = [
       ...(branches.missing.length > 0 ? ["the branches are created"] : []),
-      ...(clickupPending ? ["the workflow file is committed"] : []),
+      ...(syncPending ? ["the workflow file is committed"] : []),
     ].join(" and ");
     console.log(
       `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
@@ -347,10 +465,37 @@ async function main() {
     );
   }
 
-  if (clickup) {
+  if (providerChanged) {
     console.log(
-      `\n  ${ICON[clickup.action]}  ${clickup.path.padEnd(30)} → on merge into ` +
-        `${config.clickup.targetBranch ?? "dev"}, move the task to '${config.clickup.targetStatus ?? "in progress"}'`,
+      `\n  PROVIDER ${String(chosenProvider).padEnd(30)} → will be recorded in ${policyLabel}` +
+        (origin === "bundled" ? ", affecting every repo synced with it" : ""),
+    );
+  }
+
+  if (policyEdits.length > 0 && isMarketplaceClone(writablePath)) {
+    console.log(
+      `             [this plugin install is a marketplace clone: the edit is lost on` +
+        `\n              'claude plugin marketplace update' — also commit it to the plugin repo]`,
+    );
+  }
+
+  if (sync) {
+    console.log(
+      `\n  ${ICON[sync.action]}  ${sync.path.padEnd(30)} → on merge into ` +
+        `${sync.targetBranch}, move the ${sync.providerLabel} task to '${sync.targetStatus}'`,
+    );
+    if (sync.provider === "jira" && config.branchNaming && (config.branchNaming.taskIdPrefix ?? "CU-") === "CU-") {
+      console.log(
+        `             [branchNaming.taskIdPrefix is 'CU-' (ClickUp-flavoured); for Jira, set it to` +
+          `\n              your project key prefix (e.g. 'PROJ-') or new branches will be refused]`,
+      );
+    }
+  }
+
+  for (const orphan of orphans) {
+    console.log(
+      `\n  DELETE   ${orphan.path.padEnd(30)} → ${orphan.providerLabel} sync left behind by a provider` +
+        `\n             change; it would keep moving tasks on every merge`,
     );
   }
 
@@ -370,44 +515,51 @@ async function main() {
   // would put it in shell history and the process table. On a terminal the
   // hand-off to gh's hidden prompt is offered right here; anywhere else the
   // command to run is printed instead.
-  if (clickup && !clickup.hasToken) {
+  if (sync && (!sync.hasToken || sync.missingVariables.length > 0)) {
     if (shouldApply && isInteractive() && client.authMode === "gh cli") {
       if (
         await askYesNo(
-          `\n  ${clickup.secretName} is not set. Set it now via gh's hidden prompt?` +
+          `\n  ${sync.providerLabel} credentials are incomplete. Set them now?` +
             `\n  (Answer y or n here — paste the token ONLY at gh's hidden prompt.) [y/N] `,
         )
       ) {
-        // The secret is an optional add-on: a gh failure here must not abort
+        // Credentials are an optional add-on: a failure here must not abort
         // the apply the user just confirmed.
         try {
-          client.setSecretInteractive(clickup.secretName);
-        } catch {
-          /* the re-check below reports it */
+          await setupCredentials(client, sync);
+        } catch (error) {
+          console.log(`  ✗ ${error.message}`);
         }
-        clickup.hasToken = await client.hasSecret(clickup.secretName);
-        console.log(clickup.hasToken ? `  ✓ ${clickup.secretName} set` : `  ✗ still not set`);
       }
     }
-    if (!clickup.hasToken) {
+    if (!sync.hasToken || sync.missingVariables.length > 0) {
+      const varsNote =
+        sync.missingVariables.length > 0
+          ? `\n  Also missing repository variable(s): ${sync.missingVariables.join(", ")} —` +
+            `\n  these are not secrets; set them with: gh variable set NAME --repo ${client.owner}/${client.repo}\n`
+          : "";
       console.log(
-        `\n  The ${clickup.secretName} secret is not set on this repository, so the workflow` +
+        `\n  The ${sync.secretName} secret is not set on this repository, so the workflow` +
           `\n  will skip every task until it is. Set it yourself, in your own terminal —` +
           `\n  it prompts with hidden input there, and the value is never typed here:` +
-          `\n\n      gh secret set ${clickup.secretName} --repo ${client.owner}/${client.repo}` +
-          `\n\n  (or re-run with --set-clickup-token). Never pipe or paste the token into the` +
-          `\n  command line. Get one from ClickUp: Settings → Apps → API Token.`,
+          `\n\n      gh secret set ${sync.secretName} --repo ${client.owner}/${client.repo}` +
+          `\n\n  (or re-run with --set-token). Never pipe or paste the token into the` +
+          `\n  command line. Get one from ${sync.tokenHint}.\n${varsNote}`,
       );
     }
   }
 
   const pending =
-    writes.length + (clickup && clickup.action !== "unchanged" ? 1 : 0) + branches.missing.length;
+    writes.length +
+    (sync && sync.action !== "unchanged" ? 1 : 0) +
+    orphans.length +
+    branches.missing.length +
+    policyEdits.length;
 
   if (!shouldApply) {
-    // The secret write under --set-clickup-token is real even in plan mode;
-    // claiming "nothing written" right after "✓ CLICKUP_TOKEN is set" would lie.
-    const wroteSecret = setToken && clickup?.hasToken ? " (the secret write above did happen)" : "";
+    // The credential writes under --set-token are real even in plan mode;
+    // claiming "nothing written" right after "✓ ... is set" would lie.
+    const wroteSecret = credentialWrites ? " (the credential writes above did happen)" : "";
     console.log(
       pending === 0
         ? `\nAlready in sync. Nothing to apply${wroteSecret}.\n`
@@ -419,11 +571,11 @@ async function main() {
 
   console.log("");
 
-  // Persisting the new environment is what makes it survive the next run;
-  // without it the next sync would plan the environment away again.
-  if (addedEnvs.length > 0) {
+  // Persisting the policy edits is what makes them survive the next run;
+  // without it the next sync would plan them away again.
+  if (policyEdits.length > 0) {
     writeFileSync(writablePath, `${JSON.stringify(config, null, 2)}\n`);
-    console.log(`  ✓ added ${addedEnvs.join(", ")} to ${policyLabel}`);
+    console.log(`  ✓ recorded ${policyEdits.join(", ")} in ${policyLabel}`);
   }
 
   // One relax window covers every write the active rulesets would refuse:
@@ -431,21 +583,31 @@ async function main() {
   // default branch. Both precede the ruleset writes — the guards go up only
   // after everything they would block is already in place.
   let workflowNote = "";
-  if (branches.missing.length > 0 || clickupPending) {
+  if (branches.missing.length > 0 || syncPending) {
     let branchResults = [];
-    let clickupError;
-    let clickupDone = false;
+    let syncError;
+    let syncDone = false;
+    const orphansRemoved = [];
+    const orphanErrors = [];
 
     const { restoreFailures } = await withRelaxedEnforcement(client, branches.blocked, async () => {
       // Workflow file BEFORE branches: the branches are cut from the default
-      // branch head, and a dev without clickup-sync.yml never fires the sync —
+      // branch head, and a dev without the sync workflow never fires it —
       // pull_request workflows run from the PR's merge commit.
-      if (clickupPending) {
+      if (sync && sync.action !== "unchanged") {
         try {
-          await applyClickUp(client, clickup);
-          clickupDone = true;
+          await applyTaskSync(client, sync);
+          syncDone = true;
         } catch (error) {
-          clickupError = error;
+          syncError = error;
+        }
+      }
+      for (const orphan of orphans) {
+        try {
+          await removeSyncOrphan(client, orphan);
+          orphansRemoved.push(orphan.path);
+        } catch (error) {
+          orphanErrors.push({ path: orphan.path, error });
         }
       }
       branchResults = await createMissingBranches(client, branches.missing, context.defaultBranch);
@@ -466,12 +628,17 @@ async function main() {
       );
       process.exitCode = 1;
     }
-    if (clickupDone) {
-      console.log(`  ✓ ${clickup.action === "create" ? "created" : "updated"} ${clickup.path}`);
-    } else if (clickupError) {
+    for (const path of orphansRemoved) console.log(`  ✓ removed ${path}`);
+    for (const failure of orphanErrors) {
+      console.log(`  ✗ ${failure.path}: ${failure.error.message}`);
+      process.exitCode = 1;
+    }
+    if (syncDone) {
+      console.log(`  ✓ ${sync.action === "create" ? "created" : "updated"} ${sync.path}`);
+    } else if (syncError) {
       // A token without the 'workflow' scope cannot write under .github/workflows.
-      const scope = clickupError.status === 403 ? " (the credential may lack the 'workflow' scope)" : "";
-      console.log(`  ✗ ${clickup.path}: ${clickupError.message}${scope}`);
+      const scope = syncError.status === 403 ? " (the credential may lack the 'workflow' scope)" : "";
+      console.log(`  ✗ ${sync.path}: ${syncError.message}${scope}`);
       workflowNote = " 1 workflow failed";
       process.exitCode = 1;
     }

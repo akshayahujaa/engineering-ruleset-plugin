@@ -233,6 +233,40 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       });
     },
 
+    /** Deletes a file via the Contents API; needs the current blob sha. */
+    deleteFile(filePath, message, sha) {
+      return request("DELETE", `${base}/contents/${filePath}`, { message, sha });
+    },
+
+    /** Whether a repository Actions variable exists. */
+    async hasVariable(name) {
+      try {
+        await request("GET", `${base}/actions/variables/${name}`);
+        return true;
+      } catch (error) {
+        if (error.status === 404) return false;
+        throw error;
+      }
+    },
+
+    /**
+     * Sets a repository Actions variable. Variables are for NON-sensitive
+     * values only (a base URL, an email) — anything secret goes through
+     * setSecretInteractive, never here.
+     */
+    async setVariable(name, value) {
+      try {
+        await request("POST", `${base}/actions/variables`, { name, value });
+      } catch (error) {
+        // 409: the variable already exists — update it instead.
+        if (error.status === 409) {
+          await request("PATCH", `${base}/actions/variables/${name}`, { name, value });
+        } else {
+          throw error;
+        }
+      }
+    },
+
     /**
      * Whether a secret exists. The API never returns a secret's value, so this
      * can confirm the token is configured without ever reading it.

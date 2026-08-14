@@ -26,8 +26,8 @@ node /path/to/engineering-ruleset-plugin/src/cli.js --repo tehvault/website --ap
 ```
 
 The plan is always safe to run. Nothing is written until `--apply` — with one deliberate
-exception: `--set-clickup-token` writes that secret the moment you confirm it at gh's hidden
-prompt, in plan mode too, and the output says so. Always read the plan before
+exception: `--set-token` writes the tracker credentials the moment you confirm them at gh's
+hidden prompt, in plan mode too, and the output says so. Always read the plan before
 applying to a repo that already has rulesets — matching is by name, so an existing ruleset with a
 managed name is overwritten.
 
@@ -82,13 +82,24 @@ have to be applied by the owner, or the repo moved into an organisation.
 Because the plugin authenticates through `gh`, running `gh auth switch` to an account that does
 have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
-## ClickUp task sync
+## Task sync — ClickUp or Jira
 
-When `clickup.enabled` is set, the sync also installs
-`.github/workflows/clickup-sync.yml` in the target repo. On a merged PR into `dev` it reads the
-task id from the branch name and moves the task to **in progress** — but only if it is still in a
-to-do status. A task already in progress, in review, or done is left alone, so a later merge can
-never drag it backwards.
+When `taskSync.enabled` is set (a legacy `clickup` section still works), the sync also installs a
+tracker workflow in the target repo — `.github/workflows/clickup-sync.yml` or `jira-sync.yml`,
+by `taskSync.provider`. On a merged PR into `dev` it reads the task id from the branch name and
+moves the task to **in progress** — but only if it is still in a to-do status. A task already in
+progress, in review, or done is left alone, so a later merge can never drag it backwards.
+
+On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, or
+none — on a terminal by the CLI itself, under the slash command via a widget, and `--provider`
+answers it non-interactively. Switching provider later plans a `DELETE` of the other provider's
+workflow: leaving it behind would have both trackers moving tasks on every merge. Only the two
+managed workflow paths are ever considered for that.
+
+Jira credentials follow the same conventions as the pr-guardrails scope-check suite, so one
+repository setup feeds both: `JIRA_BASE_URL` and `JIRA_EMAIL` as repository **variables** (not
+sensitive), `JIRA_API_TOKEN` as a **secret**. The Jira workflow finds the transition to the
+target status by name at run time — transition ids are per-project and cannot be baked in.
 
 This runs on GitHub rather than locally because a merge is a GitHub event: nothing on a
 developer's machine can react to someone else merging a PR.
@@ -112,7 +123,7 @@ Existing branches are untouched, but the next one your team makes must carry a t
 The plugin never sees it — but it can drive setting it. On a real terminal:
 
 ```bash
-node src/cli.js --repo owner/name --set-clickup-token
+node src/cli.js --repo owner/name --set-token
 ```
 
 hands your terminal to `gh secret set`, which prompts with **hidden input**, encrypts the value
