@@ -136,7 +136,13 @@ rule that binds and one that silently does not.
   that is already making a branch unmergeable. The sync will not touch it. Relay the warning and
   the settings URL; this is usually the answer to "why can't I merge into prod".
 - `[no longer covers X, Y]` means an update removes those refs from that ruleset's scope, so they
-  lose its protection. Always surface it before applying.
+  lose its protection. Always surface it before applying. When task sync is enabled, the same line
+  also says `it also means <provider> sync will not fire for X` whenever the dropped environment
+  was one of the pipeline's stages — this is the sign that a repo's live branch protection has
+  drifted ahead of (or away from) its `environments` config, usually because someone hand-edited a
+  ruleset or an environment was removed from the config without removing the branch. Relay it
+  plainly and ask whether the environment should be re-added to `environments`, rather than
+  applying past it.
 
 Then re-run the plan **with the chosen flags** and show that output before applying — the answers
 change which rulesets and branches the plan contains, so the first plan is no longer the one being

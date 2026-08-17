@@ -1,6 +1,6 @@
 {
   "name": "engineering-ruleset-plugin",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Syncs branch rulesets into any GitHub repository from a single environment-driven config.",
   "type": "module",
   "private": true,

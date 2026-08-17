@@ -129,6 +129,71 @@ const MINIMAL = {
   taskSync: { enabled: false },
 };
 
+// --- a live ruleset already covers more than the task-sync pipeline does -------------
+
+const WITH_SYNC = { ...MINIMAL, taskSync: { enabled: true, provider: "clickup" } };
+
+/**
+ * Reproduces the pr-guardrails situation directly: `Pull Request Compulsion`
+ * is already live on GitHub covering `dev` AND `test`, but the config this run
+ * is using only declares `dev`. Nothing here writes the extra secret/variable
+ * lookups task-sync also makes — they 404 by default, which hasSecret/getFile
+ * already treat as "absent" rather than an error.
+ */
+const EXISTING_BASELINE = {
+  id: 1,
+  name: "Pull Request Compulsion",
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: [],
+  conditions: {
+    ref_name: { include: ["~DEFAULT_BRANCH", "refs/heads/dev", "refs/heads/test"], exclude: [] },
+  },
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    {
+      type: "pull_request",
+      parameters: {
+        required_approving_review_count: 0,
+        dismiss_stale_reviews_on_push: false,
+        require_code_owner_review: false,
+        require_last_push_approval: false,
+        required_review_thread_resolution: false,
+      },
+    },
+  ],
+};
+
+function driftFixture(config) {
+  return {
+    ...baseFixture({ rulesets: [{ id: 1, name: "Pull Request Compulsion" }] }),
+    ...override(config),
+    [`GET repos/${REPO}/rulesets/1`]: EXISTING_BASELINE,
+  };
+}
+
+test("a ruleset that already covers more than the config declares also warns about task sync", () => {
+  const { stdout } = run(driftFixture(WITH_SYNC), []);
+
+  assert.match(stdout, /no longer covers test — those refs lose this ruleset's protection;/);
+  assert.match(stdout, /it also means ClickUp sync will not fire for test/);
+  assert.match(stdout, /add it back to "environments" if that is not intended/);
+});
+
+test("the same drift with task sync disabled gets the scope warning but not the sync one", () => {
+  const { stdout } = run(driftFixture(MINIMAL), []);
+
+  assert.match(stdout, /no longer covers test — those refs lose this ruleset's protection\]/);
+  assert.doesNotMatch(stdout, /it also means/, "task sync is off, so there is no sync line to lose");
+});
+
+test("no false positive: a scope this config already matches prints no drift warning", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_SYNC) }, []);
+  assert.doesNotMatch(stdout, /no longer covers/);
+  assert.doesNotMatch(stdout, /it also means/);
+});
+
 // --- no GitHub credentials at all ----------------------------------------------------
 
 /**

@@ -389,6 +389,23 @@ that ruleset's protection from it:
            [no longer covers test, prod — those refs lose this ruleset's protection]
 ```
 
+When task sync is enabled, the same line also flags it if the dropped environment was a pipeline
+stage — a repo's live branch protection and its `environments` config are meant to be driven from
+the same source, so this only fires when they have actually drifted apart (a ruleset edited by
+hand, or an environment removed from the config after its branch was already protected):
+
+```
+  UPDATE   Pull Request Compulsion  → ~DEFAULT_BRANCH, dev
+           [no longer covers test — those refs lose this ruleset's protection;
+            it also means ClickUp sync will not fire for test — add it back to "environments"
+            if that is not intended]
+```
+
+This is the exact signal that would have caught, on the very first plan, a repo whose branch
+protection already spans an environment its ClickUp workflow was never generated for — rather than
+that going unnoticed while the workflow file gets deleted and silently regenerated dev-only, over
+and over, run after run.
+
 ## Environment branches
 
 A first sync sets every rule up for **`dev` only**. `test` and `prod` are *profiles*: known names

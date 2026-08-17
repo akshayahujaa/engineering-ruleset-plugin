@@ -689,9 +689,21 @@ async function main() {
     // A full PUT replaces the conditions, so refs leaving the scope lose this
     // ruleset's protection entirely — never visible from the new scope alone.
     if (step.dropped?.length > 0) {
+      const droppedEnvs = step.dropped.map((r) => r.replace("refs/heads/", ""));
+      // The exact drift that made pr-guardrails' clickup-sync.yml look "stuck":
+      // GitHub already protects a branch that this config no longer declares,
+      // so it also has no task-sync stage — and nothing said so until this
+      // check existed, which is why it went unnoticed for hours there.
+      const unsynced = sync ? droppedEnvs.filter((e) => !sync.pipeline.some((st) => st.env === e)) : [];
       console.log(
-        `${" ".repeat(13)}[no longer covers ${step.dropped.map((r) => r.replace("refs/heads/", "")).join(", ")}` +
-          ` — those refs lose this ruleset's protection]`,
+        `${" ".repeat(13)}[no longer covers ${droppedEnvs.join(", ")}` +
+          ` — those refs lose this ruleset's protection` +
+          (unsynced.length > 0
+            ? `;\n${" ".repeat(14)}it also means ${sync.providerLabel} sync will not fire for ` +
+              `${unsynced.join(", ")} — add ${unsynced.length > 1 ? "them" : "it"} back to` +
+              ` "environments" if that is not intended`
+            : "") +
+          "]",
       );
     }
     // Every drop, not just the first: a ruleset can lose its team AND its
