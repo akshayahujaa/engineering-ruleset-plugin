@@ -102,10 +102,20 @@ of the plan for a reason.
 Report **every** `[degraded: ...]` and `SKIPPED` line verbatim — they are the difference between a
 rule that binds and one that silently does not.
 
-- `CREATE team <org>/<slug>` means the plan will **create a GitHub team and add the user to it**.
-  That changes org membership, so call it out explicitly before applying.
+- `CREATE team <org>/<slug>` means the plan will **create a GitHub team and put people in it** —
+  the repository's code owners, or the user themselves when there are none. `MEMBERS team ...`
+  means the team already exists but is empty and those people will be **added to it**. Both change
+  organisation membership, so read the names out and call it out explicitly before applying; the
+  `[not added: ...]` block under them says who was considered and rejected, and why.
+- `NOTE team <org>/<slug> → does not exist` means nobody could be found to seed it, so it is left
+  alone and the reviewer requirement degrades. Relay the `To fix it:` line — the answer is almost
+  always adding owners to `.github/CODEOWNERS` who have write access and are in the org.
 - On a personal repo the team requirement is always dropped — GitHub has no teams outside an
-  organisation. Do not suggest workarounds; suggest moving the repo into the org if they want it.
+  organisation — but `[substituted: require_code_owner_review on ...]` means CODEOWNERS took the
+  review over, so the rule still binds. Say that rather than reporting only the drop.
+- `[require_code_owner_review not substituted — ...]` is the opposite: the team went and nothing
+  replaced it, so that rule now enforces only an approval count. Relay the reason and the
+  `to enable it:` line verbatim; it names the exact CODEOWNERS pattern to fix.
 - On a **solo** repo the team requirement and the approval count are both dropped, and the
   reviewer ruleset is skipped. This is deliberate: GitHub forbids approving your own pull request,
   so N accounts with write access supply at most N−1 approvals, and a rule demanding more could

@@ -31,6 +31,7 @@ import {
   assertEnvironmentNames,
 } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
+import { inspectCodeowners, planTeamSeed, describeSeed, assessCodeownerReview } from "./codeowners.js";
 import { plan, apply, isBlockingMerges } from "./sync.js";
 import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan } from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
@@ -197,6 +198,41 @@ async function resolveContext(client, { acceptInvite }) {
     throw new AccessDenied(`Invitation left pending. No repo access to ${target}; nothing was changed.`);
   }
   return acceptAndReprobe(client, probe.invitation);
+}
+
+/**
+ * Puts the planned members into a team, one at a time so a single refusal
+ * costs one person rather than the whole team.
+ *
+ * @returns {Promise<number>} how many members the team actually ended up with,
+ *   which is what decides whether its review is satisfiable. Reporting the
+ *   planned count instead would bind a reviewer rule to a team nobody is in.
+ */
+async function addTeamMembers(client, org, slug, team, members) {
+  let added = 0;
+
+  for (const login of members) {
+    try {
+      await client.addTeamMember(org, slug, login);
+      console.log(`  ✓ added @${login} to ${team}`);
+      added += 1;
+    } catch (error) {
+      console.log(
+        `  ✗ @${login} → ${team}: ${error.message}` +
+          (error.status === 403 ? "\n      (managing team membership needs org-admin rights)" : ""),
+      );
+      process.exitCode = 1;
+    }
+  }
+
+  if (added === 0) {
+    console.log(
+      `      ${team} has no members, so it cannot supply the review it gates —` +
+        `\n      the reviewer requirement is dropped rather than left blocking every merge`,
+    );
+    process.exitCode = 1;
+  }
+  return added;
 }
 
 function describeScope(ruleset) {
@@ -382,21 +418,24 @@ async function main() {
   // "assume satisfiable" rather than silently stripping the policy.
   // viewer() returns null rather than throwing, so there is nothing to catch.
   const viewerLogin = await client.viewer();
-  let reviewCapacity;
+  let pushCapable;
   try {
-    reviewCapacity = (await client.pushCapableCollaborators()).length;
+    pushCapable = await client.pushCapableCollaborators();
   } catch {
-    /* undefined: unknown, not zero */
+    /* undefined: unknown, not empty */
   }
+  const reviewCapacity = pushCapable?.length;
 
   // Team ids are only resolvable when the repo's owner is the team's org. A
   // team that does not exist yet is planned for creation rather than silently
-  // dropping the reviewer rule — creating it also adds whoever is running this,
-  // so the team can actually satisfy the reviews it gates.
+  // dropping the reviewer rule, and a team that exists with nobody in it is
+  // planned for members — an empty team can never supply the review it gates,
+  // so binding one blocks every merge just as hard as no team at all.
   const teamIds = {};
   const teamSlugs = {};
   const teamSizes = {};
-  const teamsToCreate = [];
+  const missingTeams = [];
+  const emptyTeams = [];
   assertEnvironmentNames(config);
   assertTeamSlugs(referencedTeams(config));
   if (context.ownerType === "Organization") {
@@ -407,24 +446,66 @@ async function main() {
         teamIds[team] = info.id;
         teamSlugs[team] = info.slug;
         teamSizes[team] = info.membersCount;
+        if (info.membersCount === 0) emptyTeams.push(team);
       } catch (error) {
         // Only a 404 means "absent, so create it". Anything else (403 on a
         // secret team, a transient failure) must not trigger a create that
         // would then fail with "name already taken".
-        if (error.status === 404) {
-          // A team can only be seeded with a member the API can name. Without
-          // a viewer login the team would be created empty, and an empty team
-          // as required reviewer blocks every merge.
-          if (viewerLogin) teamsToCreate.push(team);
-          else
-            console.log(
-              `\n  NOTE     team ${team} is missing, but the authenticated login could not be read,` +
-                `\n           so it will not be created — an empty reviewer team blocks every merge.`,
-            );
-        }
+        if (error.status === 404) missingTeams.push(team);
       }
     }
   }
+
+  // CODEOWNERS answers both team questions at once, off one read: who to put
+  // in a team that has nobody, and — where no team can be bound at all, which
+  // is every personal repo — whether it can gate the review by itself.
+  //
+  // Read only when the policy actually asks for a reviewer team; with none
+  // named there is nothing to seed and nothing that could be dropped.
+  const seeding = config.teamSeeding ?? {};
+  const populateEmptyTeams = seeding.populateEmptyTeams ?? true;
+  const teamsToPopulate = populateEmptyTeams ? emptyTeams : [];
+
+  // Every team the policy names that will not bind as things stand: it is
+  // missing, empty, another org's, or this repo has no organisation at all.
+  // With none of those, CODEOWNERS has no question to answer and is not read.
+  const unbindableTeams = referencedTeams(config).filter(
+    (team) => teamIds[team] === undefined || teamSizes[team] === 0,
+  );
+
+  const codeowners =
+    unbindableTeams.length > 0
+      ? await inspectCodeowners(client, {
+          org: context.ownerLogin,
+          exclude: [...missingTeams, ...teamsToPopulate],
+        })
+      : null;
+
+  // Substituted for a dropped team by the compiler, so it is worked out for
+  // every repo — not only the org repos where a team was ever an option.
+  const codeownerReview =
+    unbindableTeams.length > 0 ? assessCodeownerReview(codeowners, { pushCapable }) : undefined;
+
+  let seed = { path: null, members: [], skipped: [], runnerAdded: false, fromCodeowners: 0 };
+
+  if (missingTeams.length > 0 || teamsToPopulate.length > 0) {
+    seed = await planTeamSeed(client, {
+      inspection: codeowners,
+      org: context.ownerLogin,
+      repoLabel: `${client.owner}/${client.repo}`,
+      runner: viewerLogin,
+      includeRunner: seeding.includeRunner ?? "fallback",
+      fromCodeowners: seeding.fromCodeowners ?? true,
+      pushCapable,
+    });
+  }
+
+  // A team with nobody in it blocks every merge, so an empty seed means the
+  // team is left alone and the reviewer requirement degrades — loudly — rather
+  // than being bound to a team that cannot approve.
+  const teamsToCreate = seed.members.length > 0 ? missingTeams : [];
+  const teamsToFill = seed.members.length > 0 ? teamsToPopulate : [];
+  const unseedable = seed.members.length > 0 ? [] : [...missingTeams, ...teamsToPopulate];
 
   const compileContext = {
     ...context,
@@ -432,16 +513,17 @@ async function main() {
     teamSizes,
     viewerLogin,
     reviewCapacity,
+    codeownerReview,
     pendingTeams: teamsToCreate,
     // Names already on the repo: a reviewer ruleset that cannot survive here
     // must still be emitted (neutered) if it already exists, or the live one
     // keeps blocking merges while the plan calls it merely "unmanaged".
     existingRulesetNames: preexisting.map((r) => r.name),
   };
-  // A team created by this run starts with exactly one member — the person
-  // running it — which is enough for a team review only when somebody else
-  // authors the pull request.
-  for (const team of teamsToCreate) teamSizes[team] = 1;
+  // A team this run creates or fills is as big as the seed it gets, which is
+  // what makes its review satisfiable — a team review needs one approver who
+  // is not the author, so the size matters, not merely the team's existence.
+  for (const team of [...teamsToCreate, ...teamsToFill]) teamSizes[team] = seed.members.length;
 
   let { rulesets, degradations } = compile(config, compileContext);
   let { steps, undeclared } = await plan(client, rulesets);
@@ -505,6 +587,18 @@ async function main() {
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
           teamsToCreate,
+          teamsToFill,
+          teamSeed: {
+            // Who joins an org team is a membership change, so a machine
+            // consumer approving this plan must see the names, not a count.
+            codeowners: seed.path,
+            members: seed.members,
+            runnerAdded: seed.runnerAdded,
+            skipped: seed.skipped,
+            unseedableTeams: unseedable,
+          },
+          // What carries the review where no team could be bound at all.
+          codeownerReview: codeownerReview ?? null,
           reviewCapacity,
           addedEnvironments: addedEnvs,
         },
@@ -538,11 +632,25 @@ async function main() {
     );
   }
 
-  const describeDrop = (note) =>
-    `${" ".repeat(13)}[degraded: ${note.dropped}` +
-    (note.reducedTo !== undefined ? ` reduced to ${note.reducedTo}` : " dropped") +
-    ` — ${note.reason}]` +
-    (note.remedy ? `\n${" ".repeat(13)} to restore it: ${note.remedy}` : "");
+  // A degradation is not always a loss: where a dropped team is replaced by
+  // code-owner review the rule still binds, and reading that out as "degraded"
+  // would understate what the repository ends up with.
+  const describeDrop = (note) => {
+    const pad = " ".repeat(13);
+    if (note.substituted) return `${pad}[substituted: ${note.substituted} on — ${note.reason}]`;
+    if (note.unsubstituted) {
+      return (
+        `${pad}[${note.unsubstituted} not substituted — ${note.reason}]` +
+        (note.remedy ? `\n${pad} to enable it: ${note.remedy}` : "")
+      );
+    }
+    return (
+      `${pad}[degraded: ${note.dropped}` +
+      (note.reducedTo !== undefined ? ` reduced to ${note.reducedTo}` : " dropped") +
+      ` — ${note.reason}]` +
+      (note.remedy ? `\n${pad} to restore it: ${note.remedy}` : "")
+    );
+  };
 
   for (const step of steps) {
     console.log(`  ${ICON[step.action]}  ${step.name.padEnd(30)} → ${describeScope(step.payload)}`);
@@ -617,9 +725,45 @@ async function main() {
 
   for (const team of teamsToCreate) {
     console.log(
-      `\n  CREATE   ${`team ${team}`.padEnd(30)} → does not exist in '${context.ownerLogin}';` +
-        `\n             it will be created and @${viewerLogin ?? "you"} added as a member,` +
+      `\n  CREATE   ${`team ${team}`.padEnd(30)} → does not exist in '${context.ownerLogin}'; it will be` +
+        `\n             created with ${describeSeed(seed)},` +
         `\n             so the reviews it gates can actually be satisfied`,
+    );
+  }
+
+  // An existing team with nobody in it fails exactly like a missing one: the
+  // rule binds, and no merge can ever satisfy it. Filling it is what turns the
+  // degradation into a working reviewer requirement.
+  for (const team of teamsToFill) {
+    console.log(
+      `\n  MEMBERS  ${`team ${team}`.padEnd(30)} → exists in '${context.ownerLogin}' but is empty, so its` +
+        `\n             review could never be supplied; it will be given ${describeSeed(seed)}`,
+    );
+  }
+
+  // Joining someone to a team is an org membership change, so who was left out
+  // is as much a part of the plan as who is in.
+  if ((teamsToCreate.length > 0 || teamsToFill.length > 0) && seed.skipped.length > 0) {
+    console.log(
+      `${" ".repeat(13)}[not added:\n${" ".repeat(15)}` +
+        seed.skipped.map((note) => `${note.who} — ${note.reason}`).join(`\n${" ".repeat(15)}`) +
+        "]",
+    );
+  }
+
+  for (const team of unseedable) {
+    console.log(
+      `\n  NOTE     ${`team ${team}`.padEnd(30)} → ${missingTeams.includes(team) ? "does not exist" : "is empty"},` +
+        `\n             and nobody could be found to put in it — ${describeSeed(seed)}.` +
+        `\n             It is left alone, because a reviewer team with no members blocks every` +
+        `\n             merge; the reviewer requirement is degraded instead.` +
+        (seed.skipped.length > 0
+          ? `\n${" ".repeat(13)}[considered:\n${" ".repeat(15)}` +
+            seed.skipped.map((note) => `${note.who} — ${note.reason}`).join(`\n${" ".repeat(15)}`) +
+            "]"
+          : "") +
+        `\n             To fix it: name owners in ${seed.path ?? ".github/CODEOWNERS"} who have write` +
+        `\n             access to this repository and are members of '${context.ownerLogin}', then re-run.`,
     );
   }
 
@@ -714,7 +858,8 @@ async function main() {
     orphans.length +
     branches.missing.length +
     policyEdits.length +
-    teamsToCreate.length;
+    teamsToCreate.length +
+    teamsToFill.length;
 
   if (!shouldApply) {
     // The credential writes under --set-token are real even in plan mode;
@@ -732,22 +877,19 @@ async function main() {
   console.log("");
 
   // Teams first: the ruleset payload needs a real team id, so the rulesets are
-  // recompiled once the team exists. Creating a team and adding a member
+  // recompiled once the team exists. Creating a team and adding members
   // changes org membership, which is why it is never done during a plan.
-  if (teamsToCreate.length > 0) {
+  if (teamsToCreate.length > 0 || teamsToFill.length > 0) {
     for (const team of teamsToCreate) {
       const [org, slug] = team.split("/");
       try {
         const made = await client.createTeam(org, slug);
         console.log(`  ✓ created team ${team}`);
-        // The membership is not decoration: a team with no members can never
-        // supply the review it gates, so the team only counts as usable once
-        // the member is really in it. Recording the id before this succeeded
-        // is what would bind an empty team into the ruleset.
-        await client.addTeamMember(org, made.slug ?? slug, viewerLogin);
         teamIds[team] = made.id;
-        teamSizes[team] = 1;
-        console.log(`  ✓ added @${viewerLogin} to ${team}`);
+        // The membership is not decoration: a team with no members can never
+        // supply the review it gates, so the size recorded here is how many
+        // members really landed — not how many were planned.
+        teamSizes[team] = await addTeamMembers(client, org, made.slug ?? slug, team, seed.members);
       } catch (error) {
         console.log(
           `  ✗ team ${team}: ${error.message}` +
@@ -756,13 +898,22 @@ async function main() {
               : "") +
             `\n      the reviewer requirement is dropped rather than bound to a team that cannot approve`,
         );
+        teamSizes[team] = 0;
         process.exitCode = 1;
       }
     }
 
-    // Always recompile, not only on success. Every team here was treated as
-    // usable purely because it was pending, so a failed creation would
-    // otherwise ship `reviewer: {id: undefined}` and be rejected wholesale.
+    // An existing team that is empty: same failure, same fix. Only its
+    // membership changes — the team itself is left exactly as it was.
+    for (const team of teamsToFill) {
+      const [org] = team.split("/");
+      teamSizes[team] = await addTeamMembers(client, org, teamSlugs[team], team, seed.members);
+    }
+
+    // Always recompile, not only on success. Every team here was sized by the
+    // seed it was planned to get, so a failed creation would otherwise ship
+    // `reviewer: {id: undefined}` and be rejected wholesale — and a team whose
+    // members all bounced would be bound while nobody can approve through it.
     const before = degradations;
     ({ rulesets, degradations } = compile(config, { ...compileContext, teamIds, teamSizes, pendingTeams: [] }));
     ({ steps, undeclared } = await plan(client, rulesets));

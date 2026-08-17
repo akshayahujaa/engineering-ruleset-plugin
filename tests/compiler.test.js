@@ -262,7 +262,20 @@ test("the owning org keeps the team requirement with a resolved id", () => {
 
 test("an org repo naming another org's team degrades", () => {
   const { degradations } = withProd({ ...ORG, ownerLogin: "someone-else", teamIds: {} });
-  assert.ok(degradations.some((d) => /is not in org/.test(d.reason)));
+  assert.ok(degradations.some((d) => /belongs to 'tehvault'/.test(d.reason)));
+});
+
+/**
+ * "another org's team" and "a team that is not there" have different fixes —
+ * one is a config mistake, the other is something the sync can offer to create
+ * — so they must not share a message.
+ */
+test("a team missing from the owning org says so, rather than blaming the org name", () => {
+  const { degradations } = withProd({ ...ORG, teamIds: {} });
+  const dropped = degradations.find((d) => d.dropped === "required_reviewers");
+
+  assert.match(dropped.reason, /could not be resolved in 'tehvault'/);
+  assert.doesNotMatch(dropped.reason, /belongs to/);
 });
 
 /**
@@ -281,6 +294,106 @@ test("a team pending creation counts as usable", () => {
 test("an org team that is neither resolved nor pending degrades", () => {
   const { degradations } = withProd({ ...ORG, teamIds: {} });
   assert.ok(degradations.some((d) => d.dropped === "required_reviewers"));
+});
+
+// --- CODEOWNERS carrying a review no team could -----------------------------------
+
+/** What the CLI hands the compiler once CODEOWNERS has been assessed. */
+const USABLE = { usable: true, path: ".github/CODEOWNERS", owners: ["alice", "bob"], patterns: 2 };
+const UNUSABLE = {
+  usable: false,
+  path: ".github/CODEOWNERS",
+  reason: "/api/ has a single owner who can push",
+  remedy: "give /api/ a second owner with write access",
+};
+
+const prodRule = (rulesets) =>
+  byName(rulesets, "team-only-reviewer")?.rules.find((r) => r.type === "pull_request");
+
+/**
+ * A personal repo can never bind a team, so before this the reviewer rule fell
+ * back to a bare approval count — anybody's approval would do. CODEOWNERS
+ * needs no team, so it takes the gate over.
+ */
+test("a dropped team is replaced by code-owner review where CODEOWNERS can supply it", () => {
+  const { rulesets, degradations } = withProd({ ...PERSONAL, codeownerReview: USABLE });
+
+  assert.equal(prodRule(rulesets).parameters.require_code_owner_review, true);
+  const note = degradations.find((d) => d.substituted === "require_code_owner_review");
+  assert.match(note.reason, /\.github\/CODEOWNERS gates the review instead/);
+  assert.match(note.reason, /2 owner\(s\) with write access/);
+});
+
+test("a team that did bind is left to do its job, with no code-owner review added", () => {
+  const { rulesets, degradations } = withProd({ ...ORG, codeownerReview: USABLE });
+
+  assert.equal(prodRule(rulesets).parameters.require_code_owner_review, false);
+  assert.equal(degradations.length, 0);
+});
+
+test("CODEOWNERS that cannot supply the review says what is missing, and enables nothing", () => {
+  const { rulesets, degradations } = withProd({ ...PERSONAL, codeownerReview: UNUSABLE });
+
+  assert.equal(prodRule(rulesets).parameters.require_code_owner_review, false);
+  const note = degradations.find((d) => d.unsubstituted === "require_code_owner_review");
+  assert.match(note.reason, /single owner who can push/);
+  assert.match(note.remedy, /second owner/);
+});
+
+/**
+ * On a solo repo the approval count is already reduced to zero because nobody
+ * but the author could approve — and nobody but the author could supply a code
+ * owner review either. Substituting there would brick every merge.
+ */
+test("a solo repo gets no code-owner review, however good its CODEOWNERS is", () => {
+  const { rulesets, degradations } = withProd({ ...SOLO, codeownerReview: USABLE });
+
+  assert.equal(byName(rulesets, "team-only-reviewer"), undefined, "the ruleset is still not created");
+  assert.equal(
+    degradations.filter((d) => d.substituted || d.unsubstituted).length,
+    0,
+    "the count degradation already explains it; a second note would just be noise",
+  );
+});
+
+test("a rule naming no team is never given code-owner review", () => {
+  const config = clone(CANONICAL);
+  config.environments.staging = { requiredApprovals: 2 };
+  const { rulesets } = compile(config, { ...PERSONAL, reviewCapacity: 5, codeownerReview: USABLE });
+
+  assert.equal(
+    byName(rulesets, "reviewers-staging").rules.find((r) => r.type === "pull_request").parameters
+      .require_code_owner_review,
+    false,
+  );
+});
+
+test("an explicitly configured code-owner review is left alone, not re-reported", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  config.environments.prod.review = { requireCodeOwnerReview: true };
+  const { rulesets, degradations } = compile(config, { ...PERSONAL, codeownerReview: UNUSABLE });
+
+  assert.equal(prodRule(rulesets).parameters.require_code_owner_review, true, "the config wins");
+  assert.equal(
+    degradations.filter((d) => d.ruleset === "team-only-reviewer" && d.unsubstituted).length,
+    0,
+  );
+});
+
+/**
+ * With no approvals and no team, code-owner review is the only thing left
+ * holding the ruleset up — so it has to count as survival, or the ruleset it
+ * belongs to would not be created at all.
+ */
+test("code-owner review alone keeps a reviewer ruleset alive", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  config.environments.prod.requiredApprovals = 0;
+  config.environments.prod.review = { requireCodeOwnerReview: true };
+
+  const { rulesets } = compile(config, PERSONAL);
+  assert.ok(byName(rulesets, "team-only-reviewer"), "the ruleset still has a reason to exist");
 });
 
 // --- payload hygiene -----------------------------------------------------------
