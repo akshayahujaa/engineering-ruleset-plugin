@@ -250,7 +250,9 @@ is why the plan says so up front.
 ### First sync of a repository
 
 On a repo with no rulesets yet, the CLI (on a real terminal) asks once whether you want any
-environment beyond the defaults:
+environment beyond the defaults. Where it cannot ask — under `/enforce-rules`, stdin is a pipe —
+it prints a `━━ FIRST SYNC ━━` banner naming both defaults instead, so the choice is never made
+silently and the caller has something explicit to act on:
 
 ```
 First sync of this repository. Default environments: dev, test, prod.

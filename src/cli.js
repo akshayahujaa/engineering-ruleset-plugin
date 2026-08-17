@@ -42,6 +42,7 @@ import {
 } from "./access.js";
 
 const ICON = { create: "CREATE ", update: "UPDATE ", unchanged: "UNCHANGED" };
+const PROVIDER_CHOICES = ["clickup", "jira", "none"];
 
 /** True only on a real terminal; under the slash command stdin is a pipe. */
 const isInteractive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -311,6 +312,12 @@ async function main() {
     requestedEnvs.push(...extras);
   }
 
+  // A first sync with nothing chosen explicitly, on a stdin that cannot be
+  // asked. Computed before addEnvironments so the defaults reported are the
+  // ones actually in play.
+  const firstSyncNeedsAnswers =
+    preexisting.length === 0 && !providerFlagGiven && requestedEnvs.length === 0 && !isInteractive() && !setToken;
+
   const addedEnvs = addEnvironments(config, requestedEnvs);
 
   // Provider: --provider wins; a first sync on a real terminal is asked
@@ -327,6 +334,7 @@ async function main() {
   ) {
     chosenProvider = await askProvider();
   }
+  const defaultProvider = chosenProvider ?? configuredProvider;
   const providerChanged = chosenProvider !== undefined && chosenProvider !== configuredProvider;
   if (providerChanged) {
     if (chosenProvider === "none") {
@@ -466,6 +474,16 @@ async function main() {
         {
           repo: `${client.owner}/${client.repo}`,
           policy: { origin, label: policyLabel },
+          firstSync: firstSyncNeedsAnswers
+            ? {
+                needsAnswers: true,
+                provider: { default: defaultProvider, choices: PROVIDER_CHOICES },
+                environments: {
+                  default: Object.keys(config.environments ?? {}),
+                  canAdd: knownEnvironments(config),
+                },
+              }
+            : { needsAnswers: false },
           steps,
           degradations,
           undeclared,
@@ -495,6 +513,25 @@ async function main() {
   console.log(`\nRepository: ${client.owner}/${client.repo} (${context.visibility}, ${context.ownerType.toLowerCase()}-owned)`);
   console.log(`Policy:     ${policyLabel}`);
   console.log(`Auth:       ${client.authMode}\n`);
+
+  // On a first sync the CLI cannot ask (stdin is a pipe under the slash
+  // command), so it says so here instead. Leaving this implicit meant the
+  // caller saw an ordinary plan, reported it, and the user was never asked —
+  // the choices below were made silently by default.
+  if (firstSyncNeedsAnswers) {
+    console.log(
+      `  ━━ FIRST SYNC — ${client.owner}/${client.repo} HAS NO RULESETS YET ━━\n` +
+        `  Two choices are about to be made for it, both currently at their default.\n` +
+        `  ASK THE USER before applying, then re-run with the flags:\n\n` +
+        `    1. Task tracker   default: ${defaultProvider}` +
+        `${" ".repeat(Math.max(1, 12 - defaultProvider.length))}alternatives: ${PROVIDER_CHOICES.filter((p) => p !== defaultProvider).join(", ")}\n` +
+        `                      → --provider <choice>\n\n` +
+        `    2. Environments   default: ${Object.keys(config.environments ?? {}).join(", ")}` +
+        `${knownEnvironments(config).length > 0 ? `           can add: ${knownEnvironments(config).join(", ")}, or any name` : ""}\n` +
+        `                      → --env <name>  (repeatable)\n\n` +
+        `  Applying without those flags accepts the defaults shown above.\n`,
+    );
+  }
 
   const describeDrop = (note) =>
     `${" ".repeat(13)}[degraded: ${note.dropped}` +

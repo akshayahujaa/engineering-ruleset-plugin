@@ -15,6 +15,10 @@ Show the user the full plan output verbatim. It lists every ruleset that would b
 updated, any rule that had to be degraded for this repository, and any existing ruleset the
 config does not manage.
 
+**If the output starts with a `━━ FIRST SYNC ━━` banner, do not go straight to "apply?".** The
+repository has no rulesets yet and the banner names two choices — task tracker and environments —
+that would otherwise be defaulted silently. Ask them first; see *Environments* below.
+
 Then stop and ask whether to apply. Applying changes branch protection on a live repository:
 once the baseline ruleset is active with no bypass actors, **every** actor including the repo
 owner needs a pull request to change the default branch. Call that out explicitly if the plan
@@ -63,8 +67,13 @@ On a repo already synced, the blocking rulesets are disabled for the moment it t
 to create the branches (and to commit the workflow file), then restored to `active`. Say so before applying: it is a brief window
 where the default branch is unprotected.
 
-**On a repo's first sync only** — recognisable because every ruleset shows `CREATE` and the repo
-has no rulesets yet — ask the user two things, using AskUserQuestion:
+**If the plan output contains `━━ FIRST SYNC — … HAS NO RULESETS YET ━━`, you MUST stop and ask
+the user before applying.** That banner is the trigger — do not infer it from `CREATE` lines, and
+do not skip it because the plan looks complete. It appears only when the repository has no
+rulesets and neither `--provider` nor `--env` was supplied, and it names the defaults that will
+otherwise be chosen silently.
+
+Ask both questions in a single AskUserQuestion call:
 
 1. **Which task tracker to sync on merges.** Offer **ClickUp as the recommended default**, then
    **Jira**, then **None**. Pass the answer through as `--provider clickup|jira|none`.
@@ -108,9 +117,13 @@ rule that binds and one that silently does not.
 - `[no longer covers X, Y]` means an update removes those refs from that ruleset's scope, so they
   lose its protection. Always surface it before applying.
 
-Do not ask on a repo that already has rulesets — a re-sync should be quiet. (On a real terminal
-the CLI asks this question itself; under this command stdin is a pipe, so it stays silent by
-design and the widget answer is the only route.)
+Then re-run the plan **with the chosen flags** and show that output before applying — the answers
+change which rulesets and branches the plan contains, so the first plan is no longer the one being
+approved.
+
+When the banner is absent, ask nothing: the repo is already synced, or the flags were supplied.
+(On a real terminal the CLI asks these questions itself; under this command stdin is a pipe, so it
+prints the banner instead and the widget answer is the only route.)
 
 An added environment is written into the plugin's own `ruleset-config.json` on `--apply`, so it
 applies to **every** repo synced from then on. Tell the user that; if they only want it for one
