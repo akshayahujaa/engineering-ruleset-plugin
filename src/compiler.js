@@ -440,6 +440,21 @@ export function referencedTeams(config) {
 }
 
 /**
+ * Secrets a configured status check needs in order to actually run — e.g.
+ * dev's `scope-check` calls an AI provider and needs `OPENROUTER_API_KEY`.
+ *
+ * This plugin does not generate that workflow (contrast tasksync.js, which
+ * DOES generate the ClickUp/Jira sync workflow it depends on) — the check
+ * itself is supplied separately, by the pr-guardrails scope-check suite — but
+ * it still names the ingredient the check needs, so the sync can make sure
+ * that secret exists before a merge ever depends on it.
+ */
+export function requiredStatusCheckSecrets(config) {
+  const names = Object.values(config?.environments ?? {}).flatMap((env) => env.statusCheckSecrets ?? []);
+  return dedupe(names);
+}
+
+/**
  * Adds environments to a config, returning the names that were genuinely new.
  *
  * A bare `{}` is deliberate: an environment with no settings still picks up

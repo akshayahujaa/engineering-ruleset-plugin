@@ -243,6 +243,45 @@ it is present.
 Without the secret the workflow still runs, logs a warning, and changes nothing. The sync only
 ever *checks whether* the secret exists — the API cannot return its value.
 
+### Secrets other status checks need
+
+`PR-SCOPE-CHECK` requires a status check named `scope-check` to pass before merging into `dev` —
+but the sync only **requires** it; it does not generate the workflow that produces it (unlike
+ClickUp/Jira sync, which it generates end to end). That check comes from a separate suite (the
+pr-guardrails scope-check workflow), and it needs `OPENROUTER_API_KEY` to call its AI provider.
+
+`environments.<env>.statusCheckSecrets` names any secrets a status check needs:
+
+```jsonc
+"environments": {
+  "dev": {
+    "statusChecks": ["scope-check"],
+    "statusCheckSecrets": ["OPENROUTER_API_KEY"]
+  }
+}
+```
+
+Missing ones get the **exact same treatment** as the tracker token: on a real terminal, checked on
+every interactive run (not just first sync, since this isn't a "you just picked something" moment
+— it's a standing requirement of the config),
+
+```
+The 'OPENROUTER_API_KEY' secret is required for a configured status check and is not set.
+Set it up now, via gh's hidden prompt? [y/N]
+```
+
+hands off to `gh secret set` on yes, in plan mode too. Anywhere without a terminal, the plan prints
+the manual command instead:
+
+```
+The 'OPENROUTER_API_KEY' secret is required for a configured status check and is not set —
+merges may block on it until it is. Set it yourself, in your own terminal:
+
+    gh secret set OPENROUTER_API_KEY --repo owner/name
+```
+
+`--json` carries the same list as `missingStatusCheckSecrets`.
+
 ## Reviewers and teams
 
 `required_reviewers` binds a GitHub **team**, and teams exist only inside organisations. What the

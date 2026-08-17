@@ -29,6 +29,7 @@ import {
   approvalsAvailable,
   assertTeamSlugs,
   assertEnvironmentNames,
+  requiredStatusCheckSecrets,
 } from "./compiler.js";
 import {
   createClient,
@@ -52,6 +53,16 @@ import {
 
 const ICON = { create: "CREATE ", update: "UPDATE ", unchanged: "UNCHANGED" };
 const PROVIDER_CHOICES = ["clickup", "jira", "none"];
+
+/**
+ * Where to get, and what to call, a status-check secret this plugin does not
+ * itself generate the workflow for. Keyed by secret name rather than by
+ * status-check name, since that is what setupCredentials needs and what a
+ * repeat check name would collide on.
+ */
+const STATUS_CHECK_SECRETS = {
+  OPENROUTER_API_KEY: { label: "OpenRouter", tokenHint: "openrouter.ai → Keys → Create Key" },
+};
 
 /** True only on a real terminal; under the slash command stdin is a pipe. */
 const isInteractive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -484,6 +495,43 @@ async function main() {
     }
   }
 
+  // Any secret a configured status check needs to actually run — currently
+  // dev's scope-check, which needs OPENROUTER_API_KEY. This plugin never
+  // generates that workflow (it is the separate pr-guardrails scope-check
+  // suite), but a merge can depend on the check regardless, so it is worth
+  // making sure the ingredient exists before that happens. Checked once, up
+  // front, so the same list drives the interactive offer below AND the later
+  // --json / plan-fallback reporting without re-querying GitHub for it twice.
+  const missingStatusCheckSecrets = [];
+  for (const name of requiredStatusCheckSecrets(config)) {
+    if (!(await client.hasSecret(name))) missingStatusCheckSecrets.push(name);
+  }
+
+  // Same offer as the tracker's, above — but unlike that one, this is not
+  // tied to a "just chosen" moment: it is a standing requirement of the
+  // config, so it is checked on every interactive run, not only a first sync.
+  if (isInteractive() && !asJson && !setToken && client.authMode === "gh cli") {
+    for (const name of [...missingStatusCheckSecrets]) {
+      const known = STATUS_CHECK_SECRETS[name];
+      if (
+        await askYesNo(
+          `\nThe '${name}' secret is required for a configured status check and is not set. ` +
+            `Set it up now, via gh's hidden prompt? [y/N] `,
+        )
+      ) {
+        const stub = {
+          secretName: name,
+          providerLabel: known?.label ?? name,
+          tokenHint: known?.tokenHint ?? "check the workflow that reports this status for where to get it",
+          missingVariables: [],
+        };
+        const wrote = await setupCredentials(client, stub);
+        credentialWrites = wrote || credentialWrites;
+        if (wrote) missingStatusCheckSecrets.splice(missingStatusCheckSecrets.indexOf(name), 1);
+      }
+    }
+  }
+
   // A committed override can only be changed by a pull request to that repo —
   // the plugin must not try to write it, and pretending the edit happened
   // while persisting nothing would plan a policy the next run forgets.
@@ -674,6 +722,10 @@ async function main() {
             pipeline: sync.pipeline,
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
+          // Secrets a configured status check needs (e.g. OPENROUTER_API_KEY
+          // for dev's scope-check) that are not set on the repository. This
+          // plugin does not generate that workflow, only names what it needs.
+          missingStatusCheckSecrets,
           teamsToCreate,
           teamsToFill,
           teamSeed: {
@@ -950,6 +1002,20 @@ async function main() {
           `\n  command line. Get one from ${sync.tokenHint}.\n${varsNote}`,
       );
     }
+  }
+
+  // The interactive offer above already had its chance this run; anywhere
+  // that offer could not fire (non-interactive, declined, no gh cli) gets the
+  // manual command instead, exactly like the tracker's own fallback.
+  for (const name of missingStatusCheckSecrets) {
+    const known = STATUS_CHECK_SECRETS[name];
+    console.log(
+      `\n  The '${name}' secret is required for a configured status check and is not set —` +
+        `\n  merges may block on it until it is. Set it yourself, in your own terminal:` +
+        `\n\n      gh secret set ${name} --repo ${client.owner}/${client.repo}` +
+        `\n\n  (or re-run this on a real terminal, which offers to set it up for you).` +
+        (known ? ` Get one from ${known.tokenHint}.` : ""),
+    );
   }
 
   const pending =

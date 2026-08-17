@@ -129,6 +129,50 @@ const MINIMAL = {
   taskSync: { enabled: false },
 };
 
+// --- a status check needs a secret this plugin does not generate the workflow for ----
+
+const WITH_SCOPE_CHECK_SECRET = {
+  ...MINIMAL,
+  environments: { dev: { statusChecks: ["scope-check"], statusCheckSecrets: ["OPENROUTER_API_KEY"] } },
+};
+
+test("a missing status-check secret is reported in --json, non-interactively", () => {
+  const { plan } = run({ ...baseFixture(), ...override(WITH_SCOPE_CHECK_SECRET) });
+  assert.deepEqual(plan.missingStatusCheckSecrets, ["OPENROUTER_API_KEY"]);
+});
+
+test("an already-set status-check secret is not reported as missing", () => {
+  const { plan } = run({
+    ...baseFixture(),
+    ...override(WITH_SCOPE_CHECK_SECRET),
+    [`GET repos/${REPO}/actions/secrets/OPENROUTER_API_KEY`]: { name: "OPENROUTER_API_KEY" },
+  });
+  assert.deepEqual(plan.missingStatusCheckSecrets, []);
+});
+
+test("with no statusCheckSecrets configured, nothing is reported and no extra call is made", () => {
+  const { plan, calls } = run({ ...baseFixture(), ...override(MINIMAL) });
+  assert.deepEqual(plan.missingStatusCheckSecrets, []);
+  assert.ok(!calls.some((c) => c.path?.includes("actions/secrets/")), "no secret lookup without a name to check");
+});
+
+test("the human-readable plan tells you exactly how to set it yourself", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_SCOPE_CHECK_SECRET) }, []);
+  assert.match(stdout, /The 'OPENROUTER_API_KEY' secret is required for a configured status check/);
+  assert.match(stdout, new RegExp(`gh secret set OPENROUTER_API_KEY --repo ${REPO}`));
+  assert.match(stdout, /openrouter\.ai/);
+});
+
+// This harness never provides a real TTY, so the interactive offer (which
+// only fires under isInteractive()) must never engage here — proving the
+// non-interactive path stays inert is as important as proving the fallback
+// message appears, since a hang on a piped stdin is the failure mode the
+// whole isInteractive() guard exists to prevent.
+test("no interactive attempt is made, and no secret is written, over a pipe", () => {
+  const { calls } = run({ ...baseFixture(), ...override(WITH_SCOPE_CHECK_SECRET) }, ["--apply"]);
+  assert.ok(!calls.some((c) => c.secretSet), "gh secret set is never invoked without a terminal");
+});
+
 // --- a live ruleset already covers more than the task-sync pipeline does -------------
 
 const WITH_SYNC = { ...MINIMAL, taskSync: { enabled: true, provider: "clickup" } };

@@ -222,6 +222,20 @@ After the user says they have run it, re-run the plan; the token notice disappea
 a revoked one. If a token was exposed and revoked after it had already been uploaded, the user
 must run `--set-token` again with the replacement, even though `hasToken` reads true.
 
+## Other status-check secrets (e.g. OPENROUTER_API_KEY)
+
+If the plan reports `The '<NAME>' secret is required for a configured status check and is not
+set`, this is a **different** secret from the tracker's — `PR-SCOPE-CHECK` requires a status check
+named `scope-check`, but this plugin does not generate the workflow that produces it (that is the
+separate pr-guardrails scope-check suite); it only knows the check needs `OPENROUTER_API_KEY` to
+run. On the user's own real terminal the CLI already asks about this itself, on every interactive
+run (not just first sync) — nothing for Claude to do there beyond showing the output verbatim.
+
+Under `/enforce-rules`, relay the exact `gh secret set NAME --repo owner/name` command the plan
+prints, with the same never-collect-it-in-chat rule as any other secret. There is no `--set-token`
+equivalent for this one — it is not a tracker credential, so only the manual command or the user's
+own terminal can set it.
+
 Notes:
 
 - If `$ARGUMENTS` contains `--apply`, the user has pre-authorised the write; run the plan, show

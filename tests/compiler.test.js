@@ -10,6 +10,7 @@ import {
   approvalsAvailable,
   assertTeamSlugs,
   assertEnvironmentNames,
+  requiredStatusCheckSecrets,
 } from "../src/compiler.js";
 
 const CANONICAL = JSON.parse(
@@ -602,4 +603,29 @@ test("a numeric environment name is refused, since it would reorder the pipeline
   assert.throws(() => assertEnvironmentNames({ environments: { dev: {}, 2: {} } }), /must not be numbers/);
   assert.doesNotThrow(() => assertEnvironmentNames({ environments: { dev: {}, "qa2": {} } }));
   assert.doesNotThrow(() => assertEnvironmentNames({}));
+});
+
+// --- secrets a status check needs, but this plugin does not generate the workflow for ---------
+
+test("the canonical config names OPENROUTER_API_KEY for dev's scope-check", () => {
+  assert.deepEqual(requiredStatusCheckSecrets(CANONICAL), ["OPENROUTER_API_KEY"]);
+});
+
+test("an environment with no statusCheckSecrets contributes nothing", () => {
+  assert.deepEqual(requiredStatusCheckSecrets({ environments: { dev: { statusChecks: ["x"] } } }), []);
+});
+
+test("secrets from multiple environments are collected and deduped", () => {
+  const config = {
+    environments: {
+      dev: { statusCheckSecrets: ["OPENROUTER_API_KEY"] },
+      staging: { statusCheckSecrets: ["OPENROUTER_API_KEY", "SNYK_TOKEN"] },
+    },
+  };
+  assert.deepEqual(requiredStatusCheckSecrets(config), ["OPENROUTER_API_KEY", "SNYK_TOKEN"]);
+});
+
+test("no environments at all is not an error", () => {
+  assert.deepEqual(requiredStatusCheckSecrets({}), []);
+  assert.deepEqual(requiredStatusCheckSecrets(undefined), []);
 });

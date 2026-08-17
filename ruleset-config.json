@@ -12,7 +12,8 @@
   "environments": {
     "dev": {
       "statusChecks": ["scope-check"],
-      "statusCheckRuleset": "PR-SCOPE-CHECK"
+      "statusCheckRuleset": "PR-SCOPE-CHECK",
+      "statusCheckSecrets": ["OPENROUTER_API_KEY"]
     }
   },
 
