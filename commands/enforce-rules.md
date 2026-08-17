@@ -179,7 +179,17 @@ do not suggest editing the generated workflow directly.
 When the plan includes a sync workflow (`clickup-sync.yml` or `jira-sync.yml`), applying commits
 that file to the repository — call that out, since every other change is a settings change.
 
-If the plan reports missing credentials — or the user asks to integrate the token, set the
+**On the user's own real terminal, the CLI already asks about this itself** — the moment a tracker
+is chosen (accepting the ClickUp default at the first-sync question, or `--provider clickup`
+either time), it prompts `Set up <tracker> credentials now, via gh's hidden prompt? [y/N]` and, on
+yes, writes the secret straight into that repository's Actions secrets right then — even in plan
+mode, the same deliberate exception `--set-token` makes to "the plan never writes." Nothing for
+Claude to do there beyond showing that output verbatim; do not re-ask the question yourself, and do
+not treat the write as something still pending just because the run was plan-only.
+
+Under `/enforce-rules`, stdin is a pipe, so this offer never fires — the CLI silently skips it and
+the plan simply shows the missing-credentials fallback instead. That is where Claude's own role
+starts: if the plan reports missing credentials — or the user asks to integrate the token, set the
 secret, or "connect ClickUp/Jira" — the CLI can drive it, but only from the user's own terminal.
 Relay this command **with both placeholders substituted** — expand `${CLAUDE_PLUGIN_ROOT}` to the
 actual absolute plugin path and `owner/name` to the real repository, since neither means anything

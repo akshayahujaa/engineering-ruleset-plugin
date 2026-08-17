@@ -200,18 +200,37 @@ Existing branches are untouched, but the next one your team makes must carry a t
 
 ### The token
 
-The plugin never sees it — but it can drive setting it. On a real terminal:
+The plugin never sees it — but it can drive setting it, and on a real terminal it offers to, at
+the moment it matters most: right after a tracker is picked. Choosing (or simply accepting the
+default) **ClickUp** as the provider — whether at the first-sync question or via `--provider
+clickup` — immediately asks:
+
+```
+Set up ClickUp credentials now, via gh's hidden prompt? [y/N]
+```
+
+Say yes and your terminal is handed to `gh secret set`, exactly like the `gh auth login` hand-off:
+it prompts with **hidden input**, encrypts the value locally against the repository's public key,
+and writes it straight into that repository's Actions secrets. The token goes keyboard → gh →
+GitHub; it never enters the plugin process, your shell history, or the process table, and there is
+deliberately no way to pass it as an argument. This happens even in **plan mode** — the same
+deliberate exception `--set-token` already makes to "the plan never writes," so you are not asked
+the identical question twice, once now and once again at `--apply`. Decline and nothing is
+written; the plan falls back to printing the manual command instead.
+
+For **Jira**, the same moment first asks for `JIRA_BASE_URL` and `JIRA_EMAIL` — ordinary repository
+variables, not sensitive, answered in the clear — then takes `JIRA_API_TOKEN` at gh's hidden
+prompt the same way.
+
+You can also trigger this later, standalone:
 
 ```bash
 node src/cli.js --repo owner/name --set-token
 ```
 
-hands your terminal to `gh secret set`, which prompts with **hidden input**, encrypts the value
-locally against the repository's public key, and uploads it. The token goes keyboard → gh →
-GitHub; it never enters the plugin process, your shell history, or the process table. There is
-deliberately no way to pass it as an argument. An interactive `--apply` offers the same hand-off
-when the secret is missing; anywhere without a terminal (the slash command included) the CLI
-refuses and prints the command for you to run yourself. Setting it directly works too:
+An interactive `--apply` offers the same hand-off again if the secret is still missing; anywhere
+without a terminal (the slash command included) the CLI refuses and prints the command for you to
+run yourself. Setting it directly works too:
 
 ```bash
 gh secret set CLICKUP_TOKEN --repo owner/name

@@ -12,9 +12,15 @@
  * that an apply really did create a team and add its members.
  */
 
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const args = process.argv.slice(2);
+
+// A directory next to the fixture file, used to remember a secret was "set"
+// across separate invocations of this script (each `gh` call is a fresh
+// process, so there is no in-memory state to carry it in).
+const stateDir = () => join(dirname(process.env.FAKE_GH_FIXTURE), "fake-secrets");
 
 // `gh --version` is only ever probed for its exit code, to detect that the
 // binary exists at all (independent of whether anyone is logged in). Not
@@ -35,6 +41,22 @@ if (args[0] === "auth" && args[1] === "status") {
 // future test somehow get past that guard.
 if (args[0] === "auth" && args[1] === "login") process.exit(0);
 
+// `gh secret set NAME --repo owner/repo` is likewise TTY-gated by the caller
+// (a piped stdin would otherwise be read as the secret VALUE, not a prompt).
+// Recording that it "happened" — via a marker file, since no in-memory state
+// survives between invocations of this script — lets a subsequent hasSecret()
+// check (a plain GET) answer true, so the whole round trip is provable
+// without a real GitHub call or a real secret ever existing anywhere.
+if (args[0] === "secret" && args[1] === "set") {
+  const name = args[2];
+  if (process.env.FAKE_GH_LOG) {
+    appendFileSync(process.env.FAKE_GH_LOG, `${JSON.stringify({ secretSet: name })}\n`);
+  }
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(join(stateDir(), name), "1");
+  process.exit(0);
+}
+
 if (args[0] !== "api") {
   process.stderr.write(`fake gh: unsupported command '${args.join(" ")}'\n`);
   process.exit(1);
@@ -52,7 +74,18 @@ if (process.env.FAKE_GH_LOG) {
   );
 }
 
-const response = fixture[`${method} ${path}`];
+let response = fixture[`${method} ${path}`];
+
+// A secret the fixture never mentioned might still exist because an earlier
+// invocation of THIS script wrote it (via `gh secret set`) — check the marker
+// before falling through to 404, so hasSecret() reflects a write that really
+// happened in this same run rather than a value baked in ahead of time.
+if (response === undefined && method === "GET") {
+  const secretMatch = path.match(/^repos\/[^/]+\/[^/]+\/actions\/secrets\/(.+)$/);
+  if (secretMatch && existsSync(join(stateDir(), secretMatch[1]))) {
+    response = { name: secretMatch[1] };
+  }
+}
 
 if (response === undefined) {
   process.stderr.write("gh: Not Found (HTTP 404)\n");

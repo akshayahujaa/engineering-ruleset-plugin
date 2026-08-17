@@ -40,7 +40,7 @@ import {
 } from "./github.js";
 import { inspectCodeowners, planTeamSeed, describeSeed, assessCodeownerReview } from "./codeowners.js";
 import { plan, apply, isBlockingMerges } from "./sync.js";
-import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan } from "./tasksync.js";
+import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan, PROVIDERS } from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
   probeAccess,
@@ -394,6 +394,12 @@ async function main() {
   const syncSection = config.taskSync ?? config.clickup;
   const configuredProvider = syncSection?.enabled ? (syncSection.provider ?? "clickup") : "none";
   let chosenProvider = providerFlag;
+  // Distinct from providerChanged below: accepting the bundled default
+  // (clickup) at this question is not a CHANGE from the config's own default,
+  // but the user still just went through "pick a tracker" and expects the
+  // very next thing to be "now give me its token" — the same way answering
+  // "yes" to gh-auth-login is followed immediately by gh's own prompt.
+  let providerJustAsked = false;
   if (
     chosenProvider === undefined &&
     preexisting.length === 0 &&
@@ -402,6 +408,7 @@ async function main() {
     !setToken
   ) {
     chosenProvider = await askProvider();
+    providerJustAsked = true;
   }
   const defaultProvider = chosenProvider ?? configuredProvider;
   const providerChanged = chosenProvider !== undefined && chosenProvider !== configuredProvider;
@@ -428,6 +435,52 @@ async function main() {
     if (config.taskSync === undefined && config.clickup !== undefined) {
       config.taskSync = config.clickup;
       delete config.clickup;
+    }
+  }
+
+  // Declared here (rather than beside --set-token below) because this is the
+  // FIRST place a credential write can happen — the plan-mode trailer needs
+  // this true the moment either path writes something, or it would print
+  // "nothing written" right under a "✓ ... is set" line, the exact lie an
+  // earlier review caught for --set-token alone.
+  let credentialWrites = false;
+
+  // The moment a real tracker is chosen — accepting the default at the first-
+  // sync question counts just as much as actually switching provider — offer
+  // to wire up its credentials right there, exactly like the gh-auth-login
+  // hand-off: ask once, then let gh's own hidden prompt take the token. This
+  // fires in plan mode too, the same deliberate exception --set-token already
+  // makes to "the plan never writes" — waiting for --apply would mean asking
+  // the identical question twice for no reason. `sync` (below) isn't built
+  // yet, so a small sync-shaped stub carries just what setupCredentials needs.
+  if (
+    (providerChanged || providerJustAsked) &&
+    chosenProvider !== "none" &&
+    isInteractive() &&
+    !asJson &&
+    !setToken &&
+    client.authMode === "gh cli"
+  ) {
+    const known = PROVIDERS[chosenProvider];
+    const credentialStub = {
+      secretName: syncSection?.secretName ?? known.secretName,
+      providerLabel: known.label,
+      tokenHint: known.tokenHint,
+      missingVariables: [],
+    };
+    for (const name of known.requiredVariables) {
+      if (!(await client.hasVariable(name))) credentialStub.missingVariables.push(name);
+    }
+    credentialStub.hasToken = await client.hasSecret(credentialStub.secretName);
+
+    if (!credentialStub.hasToken || credentialStub.missingVariables.length > 0) {
+      if (
+        await askYesNo(
+          `\nSet up ${credentialStub.providerLabel} credentials now, via gh's hidden prompt? [y/N] `,
+        )
+      ) {
+        credentialWrites = await setupCredentials(client, credentialStub);
+      }
     }
   }
 
@@ -573,12 +626,15 @@ async function main() {
   // it with hidden input, encrypts it locally, and uploads it. This flag only
   // decides WHEN to hand the terminal over; the TTY and gh-CLI requirements
   // were enforced before any network work.
-  let credentialWrites = false;
   if (setToken) {
     if (!sync) {
       throw new Error("--set-token: task sync is not enabled in the policy (provider 'none').");
     }
-    credentialWrites = await setupCredentials(client, sync);
+    // OR, not assign: the early provider-select prompt above may already have
+    // written something this same run, and that must not be forgotten just
+    // because this second write attempt (or a no-op if already satisfied)
+    // happens to report false.
+    credentialWrites = (await setupCredentials(client, sync)) || credentialWrites;
     if (!sync.hasToken) process.exitCode = 1;
   }
 
