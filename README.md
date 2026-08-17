@@ -31,6 +31,39 @@ hidden prompt, in plan mode too, and the output says so. Always read the plan be
 applying to a repo that already has rulesets — matching is by name, so an existing ruleset with a
 managed name is overwritten.
 
+## No GitHub credentials at all
+
+Before anything repo-specific is even attempted, the CLI needs some way to reach GitHub — an
+authenticated `gh` CLI, or `GITHUB_TOKEN`/`GH_TOKEN` with the `repo` scope. Without either, it does
+not just print an error and stop: on a real terminal, with `gh` installed, it offers to log you in
+right there:
+
+```
+No GitHub credentials found for the gh CLI.
+Log in now with 'gh auth login'? [y/N]
+```
+
+Say yes and the terminal is handed to `gh auth login` — the same hand-off pattern used for setting
+task-tracker secrets. It walks you through GitHub's own device-code or browser flow and stores the
+result itself; nothing here ever sees a token. Once it succeeds, the run continues exactly as if
+you had already been logged in.
+
+Anywhere without a terminal — including under `/enforce-rules`, where stdin is a pipe — this is
+never attempted: `gh auth login` asks interactive questions a pipe cannot answer, so trying it
+there would hang rather than help. Instead the CLI refuses immediately with the exact command to
+run yourself:
+
+```
+No GitHub credentials. Run this yourself, in your own terminal:
+
+    gh auth login
+
+or set GITHUB_TOKEN to a token with the 'repo' scope.
+```
+
+If `gh` itself is not installed, the message says that instead, with a link, since there is nothing
+to hand the terminal to.
+
 ## Repositories you don't have access to
 
 Targeting a repo you cannot reach stops before anything is written:

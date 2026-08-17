@@ -48,7 +48,7 @@ function baseFixture({ collaborators = ["alice", "bob", "runner"], rulesets = []
 }
 
 /** Runs the CLI with `gh` shimmed to the fake, and returns stdout plus the call log. */
-function run(fixture, args = ["--json"]) {
+function run(fixture, args = ["--json"], envOverrides = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "enforce-rules-"));
   const fixturePath = path.join(dir, "fixture.json");
   const logPath = path.join(dir, "calls.jsonl");
@@ -66,6 +66,10 @@ function run(fixture, args = ["--json"]) {
     stdout = execFileSync(process.execPath, [CLI, "--repo", REPO, ...args], {
       cwd: ROOT,
       encoding: "utf8",
+      // A run with no real terminal must never block waiting on a prompt —
+      // if the CLI mistakenly tried to ask something here, this timeout is
+      // what turns a hang into a failed test instead of a stuck test run.
+      timeout: 15_000,
       env: {
         ...process.env,
         PATH: `${dir}${path.delimiter}${process.env.PATH}`,
@@ -75,10 +79,15 @@ function run(fixture, args = ["--json"]) {
         // the client down the fetch path and out to the real API.
         GITHUB_TOKEN: "",
         GH_TOKEN: "",
+        ...envOverrides,
       },
     });
   } catch (error) {
-    stdout = error.stdout ?? "";
+    // A refusal thrown before any plan is built (no repo access, no GitHub
+    // credentials, ...) is reported via console.error, i.e. stderr — stdout
+    // alone would be empty for exactly the runs this harness most wants to
+    // assert messages against.
+    stdout = (error.stdout ?? "") + (error.stderr ?? "");
     status = error.status;
     if (status === null) throw error;
   }
@@ -87,7 +96,20 @@ function run(fixture, args = ["--json"]) {
     ? readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
     : [];
 
-  return { stdout, status, plan: args.includes("--json") ? JSON.parse(stdout) : null, calls };
+  // A run that never reached the JSON output (an early refusal, a thrown
+  // error) leaves `stdout` holding a plain-text message, not JSON — parsing
+  // that isn't a bug in the CLI, so it resolves to `plan: null` rather than
+  // throwing out of the test helper itself.
+  let plan = null;
+  if (args.includes("--json")) {
+    try {
+      plan = JSON.parse(stdout);
+    } catch {
+      plan = null;
+    }
+  }
+
+  return { stdout, status, plan, calls };
 }
 
 /** A committed override, so a test can set policy the bundled config does not. */
@@ -106,6 +128,44 @@ const MINIMAL = {
   },
   taskSync: { enabled: false },
 };
+
+// --- no GitHub credentials at all ----------------------------------------------------
+
+/**
+ * The stdin this harness gives the CLI is a pipe, never a real terminal — the
+ * same condition as running under the Claude Code slash command. With no gh
+ * auth and no token, the CLI must refuse immediately with the exact command
+ * to run, and must NEVER attempt the interactive `gh auth login` hand-off:
+ * that flow asks questions a pipe cannot answer, so trying it here would hang
+ * (caught by run()'s timeout) rather than exit cleanly.
+ */
+test("with no gh auth and no token, a non-interactive run refuses without hanging", () => {
+  const { stdout, status } = run({ ...baseFixture(), ...override(MINIMAL) }, [], {
+    FAKE_GH_UNAUTHENTICATED: "1",
+  });
+
+  assert.equal(status, 1);
+  assert.match(stdout, /No GitHub credentials\. Run this yourself, in your own terminal:/);
+  assert.match(stdout, /gh auth login/);
+  assert.match(stdout, /GITHUB_TOKEN/);
+});
+
+test("the same refusal applies to --json, rather than emitting unparseable output", () => {
+  const { stdout, status, plan } = run({ ...baseFixture(), ...override(MINIMAL) }, ["--json"], {
+    FAKE_GH_UNAUTHENTICATED: "1",
+  });
+
+  assert.equal(status, 1);
+  assert.equal(plan, null, "no JSON was printed to parse");
+  assert.match(stdout, /No GitHub credentials/);
+});
+
+// A GITHUB_TOKEN alone (no gh auth) is a real-network path — requestViaToken
+// hits api.github.com directly, which this offline suite deliberately never
+// does (see the `GITHUB_TOKEN: ""` comment in run()'s default env above) — so
+// that combination is exercised by the unit-level hasGitHubCredentials logic
+// and the noCredentialsMessage/loginInteractive tests in tests/secrets.test.js
+// instead of here.
 
 // --- a missing team is created from CODEOWNERS -------------------------------------
 

@@ -30,7 +30,14 @@ import {
   assertTeamSlugs,
   assertEnvironmentNames,
 } from "./compiler.js";
-import { createClient, GitHubError } from "./github.js";
+import {
+  createClient,
+  GitHubError,
+  ghInstalled,
+  hasGitHubCredentials,
+  loginInteractive,
+  noCredentialsMessage,
+} from "./github.js";
 import { inspectCodeowners, planTeamSeed, describeSeed, assessCodeownerReview } from "./codeowners.js";
 import { plan, apply, isBlockingMerges } from "./sync.js";
 import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan } from "./tasksync.js";
@@ -288,6 +295,31 @@ async function main() {
   // --repo owner/name targets any repository without cloning or cd-ing into it.
   const repoFlag = args.find((a) => a.startsWith("--repo="))?.split("=")[1] ?? args[args.indexOf("--repo") + 1];
   const repo = args.includes("--repo") || args.some((a) => a.startsWith("--repo=")) ? repoFlag : undefined;
+
+  // GitHub auth is a prerequisite for everything else. Rather than just
+  // pointing at the door, offer to run `gh auth login` right here — the same
+  // hand-off pattern as --set-token: gh owns the credential, this process
+  // never sees it. Under the slash command (stdin is a pipe, no real
+  // terminal) this is refused with the exact command to run instead, never
+  // attempted through a pipe — gh's login flow asks interactive questions a
+  // pipe cannot answer.
+  if (!hasGitHubCredentials()) {
+    const installed = ghInstalled();
+    if (isInteractive() && !asJson && installed) {
+      console.log("\nNo GitHub credentials found for the gh CLI.");
+      if (await askYesNo("Log in now with 'gh auth login'? [y/N] ")) {
+        try {
+          loginInteractive();
+        } catch {
+          // gh exits non-zero on a cancelled or failed login; the recheck
+          // below reports it either way, from a fresh auth-status check.
+        }
+      }
+    }
+    if (!hasGitHubCredentials()) {
+      throw new AccessDenied(noCredentialsMessage(installed));
+    }
+  }
 
   const client = createClient({ cwd, repo });
 

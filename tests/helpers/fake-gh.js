@@ -16,8 +16,24 @@ import { readFileSync, appendFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 
-// `gh auth status` is only ever probed for its exit code.
-if (args[0] === "auth" && args[1] === "status") process.exit(0);
+// `gh --version` is only ever probed for its exit code, to detect that the
+// binary exists at all (independent of whether anyone is logged in). Not
+// logged to FAKE_GH_LOG: that file's shape (`{method, path, body}`) is what
+// every existing test's `calls` assertions key off, and this call carries
+// none of those fields.
+if (args[0] === "--version") process.exit(0);
+
+// `gh auth status` is only ever probed for its exit code. FAKE_GH_UNAUTHENTICATED
+// simulates an installed-but-logged-out CLI, without touching the real one.
+if (args[0] === "auth" && args[1] === "status") {
+  process.exit(process.env.FAKE_GH_UNAUTHENTICATED ? 1 : 0);
+}
+
+// `gh auth login` is TTY-gated by the caller before this is ever reached in a
+// real run (this harness never provides a real TTY), so it should be
+// unreachable in practice; a fixed exit code is enough of a stand-in should a
+// future test somehow get past that guard.
+if (args[0] === "auth" && args[1] === "login") process.exit(0);
 
 if (args[0] !== "api") {
   process.stderr.write(`fake gh: unsupported command '${args.join(" ")}'\n`);

@@ -47,13 +47,67 @@ export function resolveRepo(cwd) {
 
 // --- transport ---------------------------------------------------------------
 
-function ghCliAvailable() {
+/** Whether the `gh` binary exists on PATH at all, independent of auth state. */
+export function ghInstalled() {
+  try {
+    execFileSync("gh", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `gh` is installed AND logged in to some account. */
+export function ghAuthenticated() {
   try {
     execFileSync("gh", ["auth", "status"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether we can reach GitHub at all right now — an authenticated gh CLI, or
+ * an explicit token. Checked before anything repo-specific, since every other
+ * failure this plugin reports (no repo access, no admin, ...) presumes
+ * credentials already exist.
+ */
+export function hasGitHubCredentials() {
+  return ghAuthenticated() || Boolean(process.env.GITHUB_TOKEN || process.env.GH_TOKEN);
+}
+
+/**
+ * The message shown when there are no GitHub credentials at all. Pure, so the
+ * "is gh installed" fact and the message built from it can be tested apart
+ * from actually shelling out to check.
+ */
+export function noCredentialsMessage(installed) {
+  return installed
+    ? "No GitHub credentials. Run this yourself, in your own terminal:\n\n" +
+        "    gh auth login\n\n" +
+        "or set GITHUB_TOKEN to a token with the 'repo' scope."
+    : "No GitHub credentials, and the gh CLI is not installed.\n" +
+        "Install it from https://cli.github.com, then run `gh auth login` —\n" +
+        "or set GITHUB_TOKEN to a token with the 'repo' scope.";
+}
+
+/**
+ * Hands the terminal to `gh auth login`, which walks the user through
+ * GitHub's own device-code or browser flow and stores the result itself.
+ * Nothing here ever sees a token — the same guarantee as setSecretInteractive.
+ *
+ * TTY-only: the interactive flow asks questions (which protocol, which
+ * account, how to authenticate) that a pipe cannot answer, and would
+ * otherwise hang or silently misbehave.
+ */
+export function loginInteractive() {
+  if (!process.stdin.isTTY) {
+    throw new GitHubError(
+      "Refusing to run 'gh auth login' without a terminal: it asks interactive questions a pipe cannot answer.",
+    );
+  }
+  execFileSync("gh", ["auth", "login"], { stdio: "inherit" });
 }
 
 function requestViaGh(method, path, body) {
@@ -127,12 +181,10 @@ export function parseSlug(slug) {
 
 export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  const useGh = ghCliAvailable();
+  const useGh = ghAuthenticated();
 
   if (!useGh && !token) {
-    throw new GitHubError(
-      "No GitHub credentials. Either run `gh auth login`, or set GITHUB_TOKEN to a token with the 'repo' scope.",
-    );
+    throw new GitHubError(noCredentialsMessage(ghInstalled()));
   }
 
   const request = (method, path, body) =>

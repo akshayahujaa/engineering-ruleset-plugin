@@ -33,6 +33,17 @@ node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --apply
 Report which rulesets were created, updated, or rejected. If any were rejected, quote the API
 message — a 422 usually names the exact field GitHub refused.
 
+## Before repository access: no GitHub credentials at all
+
+If the output is just `No GitHub credentials...`, this is not a repo-access problem — there is no
+authenticated `gh` CLI and no `GITHUB_TOKEN`/`GH_TOKEN` at all, so nothing repo-specific was even
+attempted. On the user's own real terminal the CLI already offers to run `gh auth login` itself;
+under this command stdin is a pipe, so that hand-off never happens here and the CLI refuses
+immediately instead. Relay the message and the exact `gh auth login` command it prints. **Never
+attempt to run `gh auth login` yourself through the Bash tool** — it needs a real terminal for its
+own interactive prompts (which account, which protocol, how to authenticate) and would hang rather
+than complete.
+
 ## When the repository is not reachable
 
 The CLI exits non-zero with `No repo access to owner/repo` when the target is private-and-unshared
