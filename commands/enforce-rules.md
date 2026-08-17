@@ -54,9 +54,10 @@ the owner has to run the command instead.
 
 ## Environments
 
-The config carries `dev`, `test`, and `prod`. The sync creates any that are missing, from the
-default branch, **before** writing rulesets — a ruleset requiring a pull request for `dev` also
-refuses the push that creates `dev`, so the order is not optional.
+A first sync sets every rule up for **`dev` only** — never test or prod unless the user asks. The
+sync creates any declared environment that is missing, from the default branch, **before** writing
+rulesets — a ruleset requiring a pull request for `dev` also refuses the push that creates `dev`,
+so the order is not optional.
 
 On a repo already synced, the blocking rulesets are disabled for the moment it takes
 to create the branches (and to commit the workflow file), then restored to `active`. Say so before applying: it is a brief window
@@ -67,8 +68,10 @@ has no rulesets yet — ask the user two things, using AskUserQuestion:
 
 1. **Which task tracker to sync on merges.** Offer **ClickUp as the recommended default**, then
    **Jira**, then **None**. Pass the answer through as `--provider clickup|jira|none`.
-2. **Extra environments** beyond `dev`, `test`, and `prod`, defaults recommended. Pass extras
-   through as `--env`.
+2. **Which environments beyond `dev`.** The repo starts at `dev` alone; offer **just dev
+   (recommended)**, and `test` / `prod` as additions. Pass any extras through as `--env`.
+   `test` and `prod` are known profiles — `prod` arrives with its approval and reviewer-team
+   policy already attached, so it never needs hand-editing afterwards.
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --provider jira --env staging
@@ -84,6 +87,26 @@ node "${CLAUDE_PLUGIN_ROOT}/src/cli.js" --provider jira --env staging --apply
 Changing provider on an already-synced repo also plans a `DELETE` of the other provider's sync
 workflow — without it both trackers would move tasks on every merge. Show that line; it is part
 of the plan for a reason.
+
+## Reviewers, teams, and degradations
+
+Report **every** `[degraded: ...]` and `SKIPPED` line verbatim — they are the difference between a
+rule that binds and one that silently does not.
+
+- `CREATE team <org>/<slug>` means the plan will **create a GitHub team and add the user to it**.
+  That changes org membership, so call it out explicitly before applying.
+- On a personal repo the team requirement is always dropped — GitHub has no teams outside an
+  organisation. Do not suggest workarounds; suggest moving the repo into the org if they want it.
+- On a **solo** repo the team requirement and the approval count are both dropped, and the
+  reviewer ruleset is skipped. This is deliberate: GitHub forbids approving your own pull request,
+  so N accounts with write access supply at most N−1 approvals, and a rule demanding more could
+  never be satisfied — every merge would block forever. The line carries a `to restore it:`
+  remedy — relay it.
+- `⚠ THIS RULESET IS BLOCKING MERGES` marks an **existing** ruleset the config no longer manages
+  that is already making a branch unmergeable. The sync will not touch it. Relay the warning and
+  the settings URL; this is usually the answer to "why can't I merge into prod".
+- `[no longer covers X, Y]` means an update removes those refs from that ruleset's scope, so they
+  lose its protection. Always surface it before applying.
 
 Do not ask on a repo that already has rulesets — a re-sync should be quiet. (On a real terminal
 the CLI asks this question itself; under this command stdin is a pipe, so it stays silent by

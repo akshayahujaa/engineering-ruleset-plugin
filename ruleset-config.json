@@ -13,7 +13,10 @@
     "dev": {
       "statusChecks": ["scope-check"],
       "statusCheckRuleset": "PR-SCOPE-CHECK"
-    },
+    }
+  },
+
+  "environmentProfiles": {
     "test": {},
     "prod": {
       "requiredApprovals": 1,

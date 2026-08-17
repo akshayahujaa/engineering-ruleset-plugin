@@ -144,9 +144,85 @@ it is present.
 Without the secret the workflow still runs, logs a warning, and changes nothing. The sync only
 ever *checks whether* the secret exists — the API cannot return its value.
 
+## Reviewers and teams
+
+`required_reviewers` binds a GitHub **team**, and teams exist only inside organisations. What the
+sync does depends on what the target repo can actually honour:
+
+| Target | Reviewer rule |
+|---|---|
+| org repo, team exists with members | bound to the team, by its resolved id |
+| org repo, team missing | the team is **created** and whoever ran the sync is **added to it**, then bound — shown in the plan first, because it changes org membership |
+| org repo, team exists but empty | team requirement dropped: an empty team can never approve |
+| personal repo, ≥2 collaborators | team dropped (impossible outside an org); the approval count survives |
+| solo repo (org or personal) | team **and** approval count dropped; the reviewer ruleset is not created |
+
+**Everything is measured against what the repo can actually supply.** GitHub does not let you
+approve your own pull request, so N accounts with write access yield at most **N−1** approvals. A
+rule demanding more than that can never be satisfied — it would not harden the repo, it would
+brick it, permanently blocking every merge. So the count is reduced to what is achievable and the
+shortfall is named:
+
+```
+  [degraded: required_approving_review_count reduced to 0 — you are the only account with write
+   access, and GitHub forbids approving your own pull request — at most 0 approval(s) can ever be
+   supplied, but 1 is required]
+    to restore it: add a second collaborator with write access, then re-run
+```
+
+If the collaborator list cannot be read, the requirement is **assumed satisfiable** and kept — a
+permissions hiccup must never silently strip a policy the repo can honour.
+
+Reviewer teams are named by **slug** (`tehvault/reviewers`, from the team's GitHub URL), not by
+display name. A display name is refused up front, because GitHub would derive a different slug and
+every later run would fail to find the team.
+
+### Leftovers the sync will not touch
+
+A ruleset the config no longer declares is reported as `UNMANAGED` and left alone. If it is
+*actively blocking merges* — demanding a review this repo cannot supply — that is called out
+rather than presented as a non-event, since it is usually the reason a branch has become
+unmergeable:
+
+```
+  UNMANAGED  team-only-reviewer  → not in config; left untouched
+             ⚠ THIS RULESET IS BLOCKING MERGES into prod: it demands a review
+               this repository cannot supply (at most 0 approval(s) available).
+```
+
+A reviewer ruleset the sync *does* manage but which cannot survive here is **neutered rather than
+abandoned** when it already exists — dropping it from the desired set would leave the live one
+blocking merges forever. Its deletion and force-push protection stay.
+
+An update also names any ref leaving a ruleset's scope, because a full replace silently removes
+that ruleset's protection from it:
+
+```
+  UPDATE   Pull Request Compulsion  → ~DEFAULT_BRANCH, dev
+           [no longer covers test, prod — those refs lose this ruleset's protection]
+```
+
 ## Environment branches
 
-Connecting a repo creates `dev`, `test`, and `prod` from the default branch if they are missing —
+A first sync sets every rule up for **`dev` only**. `test` and `prod` are *profiles*: known names
+carrying their own policy, added when you ask for them, never before. This keeps a freshly
+connected repo to one working environment instead of three, and means `prod` arrives with its
+stricter policy intact rather than as a bare branch:
+
+```jsonc
+"environments":        { "dev": { "statusChecks": ["scope-check"] } },
+"environmentProfiles": {
+  "test": {},
+  "prod": { "requiredApprovals": 1, "reviewerTeams": ["tehvault/reviewers"] }
+}
+```
+
+Adding `prod` later — by answering the first-sync question, or `--env prod` — produces exactly the
+same rulesets as declaring it up front. An unknown name (`staging`, `uat`) is added plain: it picks
+up the baseline PR requirement and is excluded from the nomenclature ruleset, which is the whole
+point of the environment list.
+
+Connecting a repo creates the declared environments from the default branch if they are missing —
 a ruleset naming `refs/heads/dev` protects nothing while that branch does not exist.
 
 **The order is forced.** `Pull Request Compulsion` requires a pull request for `dev`, and creating

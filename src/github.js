@@ -168,11 +168,16 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       };
     },
 
-    /** Resolves `org/team-slug` to the numeric id the rulesets API expects. */
-    async teamId(team) {
+    /**
+     * Resolves `org/team-slug` to the id the rulesets API expects, plus the
+     * facts callers need about it: `members_count` decides whether a team
+     * review is satisfiable at all, and the API-derived `slug` is what later
+     * membership calls must use.
+     */
+    async teamInfo(team) {
       const [org, slug] = String(team).split("/");
-      const info = await request("GET", `orgs/${org}/teams/${slug}`);
-      return info.id;
+      const info = await request("GET", `orgs/${org}/teams/${encodeURIComponent(slug)}`);
+      return { id: info.id, slug: info.slug, membersCount: info.members_count ?? 0 };
     },
 
     /**
@@ -231,6 +236,37 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       execFileSync("gh", ["secret", "set", name, "--repo", `${owner}/${repo}`], {
         stdio: "inherit",
       });
+    },
+
+    /**
+     * Collaborators who could approve a pull request.
+     *
+     * Only push-capable accounts count: an approval from someone without write
+     * access does not satisfy `required_approving_review_count`. Paginated,
+     * because "is a review requirement satisfiable" must not hinge on the
+     * first page.
+     */
+    async pushCapableCollaborators() {
+      const logins = [];
+      for (let page = 1; ; page += 1) {
+        const batch = await request("GET", `${base}/collaborators?per_page=100&page=${page}`);
+        logins.push(...batch.filter((c) => c.permissions?.push).map((c) => c.login));
+        if (batch.length < 100) return logins;
+      }
+    },
+
+    /** Creates an org team. Requires org-admin rights on the token. */
+    createTeam(org, name, description) {
+      return request("POST", `orgs/${org}/teams`, {
+        name,
+        description: description ?? "Reviewers for repositories managed by engineering-ruleset-plugin",
+        privacy: "closed",
+      });
+    },
+
+    /** Adds (or confirms) a user's membership of a team. */
+    addTeamMember(org, slug, username) {
+      return request("PUT", `orgs/${org}/teams/${slug}/memberships/${username}`, { role: "member" });
     },
 
     /** Deletes a file via the Contents API; needs the current blob sha. */

@@ -21,9 +21,16 @@ import {
   detectTokenMisuse,
   OVERRIDE_PATH,
 } from "./config.js";
-import { compile, referencedTeams, addEnvironments } from "./compiler.js";
+import {
+  compile,
+  referencedTeams,
+  addEnvironments,
+  knownEnvironments,
+  approvalsAvailable,
+  assertTeamSlugs,
+} from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
-import { plan, apply } from "./sync.js";
+import { plan, apply, isBlockingMerges } from "./sync.js";
 import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan } from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
@@ -56,13 +63,16 @@ async function askYesNo(question) {
  * and pass it back as `--env`, so the CLI prompting there would either hang
  * or ask a question nobody can answer.
  */
-async function askExtraEnvironments(defaults) {
+async function askExtraEnvironments(current, known) {
   const { createInterface } = await import("node:readline/promises");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    console.log(`\nFirst sync of this repository. Default environments: ${defaults.join(", ")}.`);
+    console.log(
+      `\nFirst sync of this repository. Every rule will be set up for: ${current.join(", ")}.` +
+        (known.length > 0 ? `\nKnown extras you can add now: ${known.join(", ")}.` : ""),
+    );
     const answer = await rl.question(
-      "Extra environments beyond these? (comma-separated, empty for none) ",
+      "Add more environments? (comma-separated, empty for none) ",
     );
     return parseEnvList(answer);
   } finally {
@@ -292,7 +302,10 @@ async function main() {
   // signed up for an interview.
   const preexisting = await client.listRulesets();
   if (preexisting.length === 0 && requestedEnvs.length === 0 && isInteractive() && !asJson && !setToken) {
-    const extras = await askExtraEnvironments(Object.keys(config.environments ?? {}));
+    const extras = await askExtraEnvironments(
+      Object.keys(config.environments ?? {}),
+      knownEnvironments(config),
+    );
     const invalid = extras.filter((name) => !isValidEnvName(name));
     if (invalid.length > 0) throw new Error(`Not usable as branch names: ${invalid.join(", ")}`);
     requestedEnvs.push(...extras);
@@ -355,21 +368,73 @@ async function main() {
     );
   }
 
-  // Team ids are only resolvable when the repo's owner is the team's org.
+  // Whether a review requirement is satisfiable at all here. A failure to read
+  // the collaborator list leaves this undefined, which the compiler reads as
+  // "assume satisfiable" rather than silently stripping the policy.
+  // viewer() returns null rather than throwing, so there is nothing to catch.
+  const viewerLogin = await client.viewer();
+  let reviewCapacity;
+  try {
+    reviewCapacity = (await client.pushCapableCollaborators()).length;
+  } catch {
+    /* undefined: unknown, not zero */
+  }
+
+  // Team ids are only resolvable when the repo's owner is the team's org. A
+  // team that does not exist yet is planned for creation rather than silently
+  // dropping the reviewer rule — creating it also adds whoever is running this,
+  // so the team can actually satisfy the reviews it gates.
   const teamIds = {};
+  const teamSlugs = {};
+  const teamSizes = {};
+  const teamsToCreate = [];
+  assertTeamSlugs(referencedTeams(config));
   if (context.ownerType === "Organization") {
     for (const team of referencedTeams(config)) {
       if (team.split("/")[0].toLowerCase() !== context.ownerLogin.toLowerCase()) continue;
       try {
-        teamIds[team] = await client.teamId(team);
-      } catch {
-        /* compiler degrades when the id is missing */
+        const info = await client.teamInfo(team);
+        teamIds[team] = info.id;
+        teamSlugs[team] = info.slug;
+        teamSizes[team] = info.membersCount;
+      } catch (error) {
+        // Only a 404 means "absent, so create it". Anything else (403 on a
+        // secret team, a transient failure) must not trigger a create that
+        // would then fail with "name already taken".
+        if (error.status === 404) {
+          // A team can only be seeded with a member the API can name. Without
+          // a viewer login the team would be created empty, and an empty team
+          // as required reviewer blocks every merge.
+          if (viewerLogin) teamsToCreate.push(team);
+          else
+            console.log(
+              `\n  NOTE     team ${team} is missing, but the authenticated login could not be read,` +
+                `\n           so it will not be created — an empty reviewer team blocks every merge.`,
+            );
+        }
       }
     }
   }
 
-  const { rulesets, degradations } = compile(config, { ...context, teamIds });
-  const { steps, undeclared } = await plan(client, rulesets);
+  const compileContext = {
+    ...context,
+    teamIds,
+    teamSizes,
+    viewerLogin,
+    reviewCapacity,
+    pendingTeams: teamsToCreate,
+    // Names already on the repo: a reviewer ruleset that cannot survive here
+    // must still be emitted (neutered) if it already exists, or the live one
+    // keeps blocking merges while the plan calls it merely "unmanaged".
+    existingRulesetNames: preexisting.map((r) => r.name),
+  };
+  // A team created by this run starts with exactly one member — the person
+  // running it — which is enough for a team review only when somebody else
+  // authors the pull request.
+  for (const team of teamsToCreate) teamSizes[team] = 1;
+
+  let { rulesets, degradations } = compile(config, compileContext);
+  let { steps, undeclared } = await plan(client, rulesets);
   const sync = await planTaskSync(client, config);
   const orphans = await planSyncOrphans(client, sync?.provider ?? null);
   const syncPending = Boolean(sync && sync.action !== "unchanged") || orphans.length > 0;
@@ -416,6 +481,8 @@ async function main() {
             missingVariables: sync.missingVariables,
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
+          teamsToCreate,
+          reviewCapacity,
           addedEnvironments: addedEnvs,
         },
         null,
@@ -429,16 +496,54 @@ async function main() {
   console.log(`Policy:     ${policyLabel}`);
   console.log(`Auth:       ${client.authMode}\n`);
 
+  const describeDrop = (note) =>
+    `${" ".repeat(13)}[degraded: ${note.dropped}` +
+    (note.reducedTo !== undefined ? ` reduced to ${note.reducedTo}` : " dropped") +
+    ` — ${note.reason}]` +
+    (note.remedy ? `\n${" ".repeat(13)} to restore it: ${note.remedy}` : "");
+
   for (const step of steps) {
-    const note = degradations.find((d) => d.ruleset === step.name);
-    console.log(
-      `  ${ICON[step.action]}  ${step.name.padEnd(30)} → ${describeScope(step.payload)}` +
-        (note ? `\n${" ".repeat(13)}[degraded: ${note.dropped} dropped — ${note.reason}]` : ""),
-    );
+    console.log(`  ${ICON[step.action]}  ${step.name.padEnd(30)} → ${describeScope(step.payload)}`);
+    // A full PUT replaces the conditions, so refs leaving the scope lose this
+    // ruleset's protection entirely — never visible from the new scope alone.
+    if (step.dropped?.length > 0) {
+      console.log(
+        `${" ".repeat(13)}[no longer covers ${step.dropped.map((r) => r.replace("refs/heads/", "")).join(", ")}` +
+          ` — those refs lose this ruleset's protection]`,
+      );
+    }
+    // Every drop, not just the first: a ruleset can lose its team AND its
+    // approval count, and hiding the second one hides the bigger change.
+    for (const note of degradations.filter((d) => d.ruleset === step.name)) {
+      console.log(describeDrop(note));
+    }
   }
 
-  for (const name of undeclared) {
+  // Degradations whose ruleset is no longer generated have no step to hang
+  // off, so they would otherwise vanish silently. One line per ruleset, with
+  // its reasons underneath — not one line per reason.
+  const skipped = [...new Set(degradations.filter((d) => !steps.some((s) => s.name === d.ruleset)).map((d) => d.ruleset))];
+  for (const name of skipped) {
+    console.log(`  SKIPPED  ${name.padEnd(30)} → not created; nothing it asked for can apply here`);
+    for (const note of degradations.filter((d) => d.ruleset === name)) console.log(describeDrop(note));
+  }
+
+  const available = approvalsAvailable(compileContext);
+  for (const { name, ruleset } of undeclared) {
     console.log(`  UNMANAGED  ${name.padEnd(30)} → not in config; left untouched`);
+    // A leftover from an earlier policy can still be blocking every merge.
+    // Saying only "left untouched" would present a live problem as a non-event.
+    if (isBlockingMerges(ruleset, available)) {
+      const refs = (ruleset.conditions?.ref_name?.include ?? [])
+        .map((r) => r.replace("refs/heads/", ""))
+        .join(", ");
+      console.log(
+        `${" ".repeat(13)}⚠ THIS RULESET IS BLOCKING MERGES into ${refs}: it demands a review` +
+          `\n${" ".repeat(13)}  this repository cannot supply (at most ${available} approval(s) available).` +
+          `\n${" ".repeat(13)}  The sync will not touch it — delete or edit it at` +
+          `\n${" ".repeat(13)}  https://github.com/${client.owner}/${client.repo}/settings/rules`,
+      );
+    }
   }
 
   if (addedEnvs.length > 0) {
@@ -458,10 +563,21 @@ async function main() {
       ...(branches.missing.length > 0 ? ["the branches are created"] : []),
       ...(syncPending ? ["the workflow file is committed"] : []),
     ].join(" and ");
+    // With no branches to create there is no CREATE line above this, so the
+    // note needs its own heading or it reads as part of the previous ruleset.
+    const lead = branches.missing.length > 0 ? `${" ".repeat(13)}[` : `\n  RELAX    ${"".padEnd(30)} → [`;
     console.log(
-      `             [${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
+      `${lead}${branches.blocked.map((r) => r.name).join(", ")} would refuse this;` +
         `\n              each is disabled only while ${writes},` +
         `\n              then restored to 'active']`,
+    );
+  }
+
+  for (const team of teamsToCreate) {
+    console.log(
+      `\n  CREATE   ${`team ${team}`.padEnd(30)} → does not exist in '${context.ownerLogin}';` +
+        `\n             it will be created and @${viewerLogin ?? "you"} added as a member,` +
+        `\n             so the reviews it gates can actually be satisfied`,
     );
   }
 
@@ -554,7 +670,8 @@ async function main() {
     (sync && sync.action !== "unchanged" ? 1 : 0) +
     orphans.length +
     branches.missing.length +
-    policyEdits.length;
+    policyEdits.length +
+    teamsToCreate.length;
 
   if (!shouldApply) {
     // The credential writes under --set-token are real even in plan mode;
@@ -570,6 +687,52 @@ async function main() {
   }
 
   console.log("");
+
+  // Teams first: the ruleset payload needs a real team id, so the rulesets are
+  // recompiled once the team exists. Creating a team and adding a member
+  // changes org membership, which is why it is never done during a plan.
+  if (teamsToCreate.length > 0) {
+    for (const team of teamsToCreate) {
+      const [org, slug] = team.split("/");
+      try {
+        const made = await client.createTeam(org, slug);
+        console.log(`  ✓ created team ${team}`);
+        // The membership is not decoration: a team with no members can never
+        // supply the review it gates, so the team only counts as usable once
+        // the member is really in it. Recording the id before this succeeded
+        // is what would bind an empty team into the ruleset.
+        await client.addTeamMember(org, made.slug ?? slug, viewerLogin);
+        teamIds[team] = made.id;
+        teamSizes[team] = 1;
+        console.log(`  ✓ added @${viewerLogin} to ${team}`);
+      } catch (error) {
+        console.log(
+          `  ✗ team ${team}: ${error.message}` +
+            (error.status === 403
+              ? "\n      (creating a team and managing its membership need org-admin rights)"
+              : "") +
+            `\n      the reviewer requirement is dropped rather than bound to a team that cannot approve`,
+        );
+        process.exitCode = 1;
+      }
+    }
+
+    // Always recompile, not only on success. Every team here was treated as
+    // usable purely because it was pending, so a failed creation would
+    // otherwise ship `reviewer: {id: undefined}` and be rejected wholesale.
+    const before = degradations;
+    ({ rulesets, degradations } = compile(config, { ...compileContext, teamIds, teamSizes, pendingTeams: [] }));
+    ({ steps, undeclared } = await plan(client, rulesets));
+
+    // Degradations the plan did not show, because they only became true when
+    // a team creation failed. Silence here would make the apply quietly
+    // weaker than the plan the user approved.
+    for (const note of degradations.filter(
+      (d) => !before.some((b) => b.ruleset === note.ruleset && b.dropped === note.dropped),
+    )) {
+      console.log(`  ! ${note.ruleset}: ${note.dropped} dropped — ${note.reason}`);
+    }
+  }
 
   // Persisting the policy edits is what makes them survive the next run;
   // without it the next sync would plan them away again.

@@ -56,7 +56,22 @@ export function isUnchanged(desired, actual) {
 }
 
 /**
- * @returns {Promise<Array<{action: 'create'|'update'|'unchanged', name: string, payload: object, id?: number}>>}
+ * Refs an update would stop covering. A full PUT replaces the conditions, so a
+ * ref dropped from the scope silently loses whatever that ruleset gave it —
+ * which the plan must name rather than only showing the new scope.
+ */
+export function droppedRefs(desired, actual) {
+  const before = new Set(actual?.conditions?.ref_name?.include ?? []);
+  const after = new Set(desired?.conditions?.ref_name?.include ?? []);
+  return [...before].filter((ref) => !after.has(ref));
+}
+
+/**
+ * @returns {Promise<{steps: Array<{action, name, payload, id?, existing?, dropped?}>,
+ *                    undeclared: Array<{name, id, ruleset}>}>}
+ *   `undeclared` carries each full ruleset, not just its name: a leftover from
+ *   an earlier config can still be actively blocking merges, and that can only
+ *   be judged from its rules.
  */
 export async function plan(client, desiredRulesets) {
   const existing = await client.listRulesets();
@@ -76,13 +91,34 @@ export async function plan(client, desiredRulesets) {
       name: payload.name,
       payload,
       id: match.id,
+      existing: full,
+      dropped: droppedRefs(payload, full),
     });
   }
 
   const declared = new Set(desiredRulesets.map((r) => r.name));
-  const undeclared = existing.filter((r) => !declared.has(r.name)).map((r) => r.name);
+  const undeclared = [];
+  for (const r of existing.filter((r) => !declared.has(r.name))) {
+    undeclared.push({ name: r.name, id: r.id, ruleset: await client.getRuleset(r.id) });
+  }
 
   return { steps, undeclared };
+}
+
+/**
+ * Whether a ruleset the config no longer manages is actively preventing
+ * merges: it demands approvals (or a team review) that this repository cannot
+ * supply. Left in place these silently block every pull request, which is the
+ * worst way to discover an abandoned policy.
+ */
+export function isBlockingMerges(ruleset, approvalsAvailable) {
+  if (ruleset?.enforcement !== "active") return false;
+  const pr = (ruleset.rules ?? []).find((r) => r.type === "pull_request");
+  if (!pr) return false;
+
+  const needed = pr.parameters?.required_approving_review_count ?? 0;
+  const reviewers = pr.parameters?.required_reviewers ?? [];
+  return needed > approvalsAvailable || (reviewers.length > 0 && approvalsAvailable < 1);
 }
 
 /**

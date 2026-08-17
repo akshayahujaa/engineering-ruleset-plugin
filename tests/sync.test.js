@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { plan, apply, isUnchanged } from "../src/sync.js";
+import { plan, apply, isUnchanged, droppedRefs, isBlockingMerges } from "../src/sync.js";
 import { parseRemote, parseSlug } from "../src/github.js";
 
 const RULESET = {
@@ -75,8 +75,45 @@ test("rulesets the config does not declare are reported, never deleted", async (
   const client = stubClient({ existing: [{ id: 9, name: "hand-made-rule" }] });
   const { steps, undeclared } = await plan(client, [RULESET]);
 
-  assert.deepEqual(undeclared, ["hand-made-rule"]);
+  assert.deepEqual(undeclared.map((u) => u.name), ["hand-made-rule"]);
   assert.ok(steps.every((s) => s.name !== "hand-made-rule"));
+});
+
+// --- what an update would stop covering ----------------------------------------
+
+test("refs an update drops out of scope are reported, not silently removed", () => {
+  const desired = { conditions: { ref_name: { include: ["~DEFAULT_BRANCH", "refs/heads/dev"] } } };
+  const actual = {
+    conditions: { ref_name: { include: ["~DEFAULT_BRANCH", "refs/heads/dev", "refs/heads/prod"] } },
+  };
+  assert.deepEqual(droppedRefs(desired, actual), ["refs/heads/prod"]);
+  assert.deepEqual(droppedRefs(desired, desired), []);
+  assert.deepEqual(droppedRefs(desired, undefined), [], "a create drops nothing");
+});
+
+// --- leftovers that block merges -------------------------------------------------
+
+const blocker = (params) => ({
+  enforcement: "active",
+  rules: [{ type: "pull_request", parameters: params }],
+});
+
+test("an abandoned ruleset demanding more approvals than the repo can supply is flagged", () => {
+  // One push-capable account means zero approvals are obtainable.
+  assert.equal(isBlockingMerges(blocker({ required_approving_review_count: 1 }), 0), true);
+  assert.equal(isBlockingMerges(blocker({ required_approving_review_count: 1 }), 1), false);
+});
+
+test("an abandoned team review is blocking when nobody is left to approve", () => {
+  const withTeam = blocker({ required_approving_review_count: 0, required_reviewers: [{}] });
+  assert.equal(isBlockingMerges(withTeam, 0), true);
+  assert.equal(isBlockingMerges(withTeam, 2), false);
+});
+
+test("a disabled or review-free ruleset is never called blocking", () => {
+  assert.equal(isBlockingMerges({ ...blocker({ required_approving_review_count: 5 }), enforcement: "disabled" }, 0), false);
+  assert.equal(isBlockingMerges({ enforcement: "active", rules: [{ type: "deletion" }] }, 0), false);
+  assert.equal(isBlockingMerges(null, 0), false);
 });
 
 test("one rejected ruleset does not stop the others", async () => {

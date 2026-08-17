@@ -2,46 +2,75 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { compile, referencedTeams, addEnvironments } from "../src/compiler.js";
+import {
+  compile,
+  referencedTeams,
+  addEnvironments,
+  knownEnvironments,
+  approvalsAvailable,
+  assertTeamSlugs,
+} from "../src/compiler.js";
 
 const CANONICAL = JSON.parse(
   readFileSync(fileURLToPath(new URL("../ruleset-config.json", import.meta.url)), "utf8"),
 );
 
-/** shop-ui: a repo owned by a user account, so team rules cannot apply. */
-const PERSONAL = { ownerType: "User", ownerLogin: "akshayahujaa", defaultBranch: "main" };
+/**
+ * A repo owned by a user account, so team rules cannot apply — but with enough
+ * collaborators that a plain approval count is still satisfiable.
+ */
+const PERSONAL = {
+  ownerType: "User",
+  ownerLogin: "akshayahujaa",
+  viewerLogin: "akshayahujaa",
+  defaultBranch: "main",
+  reviewCapacity: 3,
+};
 
-/** The same policy on a tehvault org repo, where the team does resolve. */
+/** The same, but the owner is the only person who can push — the solo case. */
+const SOLO = { ...PERSONAL, reviewCapacity: 1 };
+
+/** A tehvault org repo, where the team resolves. */
 const ORG = {
   ownerType: "Organization",
   ownerLogin: "tehvault",
+  viewerLogin: "akshayahujaa",
   defaultBranch: "main",
   teamIds: { "tehvault/reviewers": 18199891 },
+  reviewCapacity: 5,
 };
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const byName = (rulesets, name) => rulesets.find((r) => r.name === name);
 
-test("canonical config generates exactly the four original rulesets", () => {
+/** The canonical config once prod has been added, which is where teams apply. */
+function withProd(context = PERSONAL) {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  return { config, ...compile(config, context) };
+}
+
+// --- dev-first defaults --------------------------------------------------------
+
+test("the canonical config starts at dev only", () => {
+  assert.deepEqual(Object.keys(CANONICAL.environments), ["dev"]);
+  assert.deepEqual(knownEnvironments(CANONICAL), ["test", "prod"]);
+});
+
+test("a first sync generates every rule scoped to dev, and no reviewer ruleset", () => {
   const { rulesets } = compile(CANONICAL, PERSONAL);
   assert.deepEqual(rulesets.map((r) => r.name), [
     "Pull Request Compulsion",
     "PR-SCOPE-CHECK",
-    "team-only-reviewer",
     "Enforce Branch Nomenclature",
   ]);
 });
 
-test("baseline covers the default branch and every environment", () => {
+test("baseline covers the default branch and every declared environment", () => {
   const { rulesets } = compile(CANONICAL, PERSONAL);
   const baseline = byName(rulesets, "Pull Request Compulsion");
 
-  assert.deepEqual(baseline.conditions.ref_name.include, [
-    "~DEFAULT_BRANCH",
-    "refs/heads/dev",
-    "refs/heads/test",
-    "refs/heads/prod",
-  ]);
+  assert.deepEqual(baseline.conditions.ref_name.include, ["~DEFAULT_BRANCH", "refs/heads/dev"]);
   assert.ok(baseline.rules.some((r) => r.type === "deletion"));
   assert.ok(baseline.rules.some((r) => r.type === "non_fast_forward"));
   assert.equal(
@@ -73,8 +102,6 @@ test("requiring a task id narrows each prefix to id-bearing branches", () => {
   // branch through with no task to advance on merge.
   assert.deepEqual(naming.conditions.ref_name.exclude, [
     "refs/heads/dev",
-    "refs/heads/test",
-    "refs/heads/prod",
     "refs/heads/main",
     "refs/heads/feature/CU-*",
     "refs/heads/feature/CU-*/**",
@@ -90,19 +117,46 @@ test("requiring a task id narrows each prefix to id-bearing branches", () => {
   assert.ok(naming.rules.some((r) => r.type === "creation"), "creation rule is what blocks bad names");
 });
 
-// --- environment flexibility -------------------------------------------------
+// --- environment profiles ------------------------------------------------------
 
-test("a bare new environment extends the existing rulesets and creates none", () => {
+test("adding a known environment brings its profile, not a bare object", () => {
   const config = clone(CANONICAL);
-  config.environments.staging = {};
+  assert.deepEqual(addEnvironments(config, ["prod"]), ["prod"]);
+  assert.equal(config.environments.prod.requiredApprovals, 1);
+  assert.deepEqual(config.environments.prod.reviewerTeams, ["tehvault/reviewers"]);
+  assert.equal(config.environments.prod.reviewerRuleset, "team-only-reviewer");
+});
 
+test("a profile is copied, so one repo's edits cannot leak into the next", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  config.environments.prod.requiredApprovals = 99;
+  assert.equal(config.environmentProfiles.prod.requiredApprovals, 1, "the profile is untouched");
+});
+
+test("an unknown environment name is still added, plain", () => {
+  const config = clone(CANONICAL);
+  assert.deepEqual(addEnvironments(config, ["staging", "dev"]), ["staging"]);
+  assert.deepEqual(config.environments.staging, {}, "a bare env still inherits the baseline");
+});
+
+test("adding prod later produces the same reviewer ruleset as declaring it up front", () => {
+  const { rulesets } = withProd(ORG);
+  const prod = byName(rulesets, "team-only-reviewer");
+
+  assert.ok(prod, "the profile's reviewerRuleset name is honoured");
+  assert.deepEqual(prod.conditions.ref_name.include, ["refs/heads/prod"]);
+  assert.equal(
+    prod.rules.find((r) => r.type === "pull_request").parameters.required_approving_review_count,
+    1,
+  );
+});
+
+test("an added environment flows into the baseline and nomenclature rulesets", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["staging"]);
   const { rulesets } = compile(config, PERSONAL);
 
-  assert.deepEqual(
-    rulesets.map((r) => r.name),
-    ["Pull Request Compulsion", "PR-SCOPE-CHECK", "team-only-reviewer", "Enforce Branch Nomenclature"],
-    "no new ruleset appears",
-  );
   assert.ok(
     byName(rulesets, "Pull Request Compulsion").conditions.ref_name.include.includes("refs/heads/staging"),
     "staging requires a PR",
@@ -117,9 +171,7 @@ test("a new environment with its own status check generates a derived ruleset", 
   const config = clone(CANONICAL);
   config.environments.staging = { statusChecks: ["e2e/smoke"] };
 
-  const { rulesets } = compile(config, PERSONAL);
-  const derived = byName(rulesets, "status-checks-staging");
-
+  const derived = byName(compile(config, PERSONAL).rulesets, "status-checks-staging");
   assert.ok(derived, "derived name avoids colliding with PR-SCOPE-CHECK");
   assert.deepEqual(derived.conditions.ref_name.include, ["refs/heads/staging"]);
 });
@@ -128,9 +180,7 @@ test("a new environment demanding approvals generates its own reviewer ruleset",
   const config = clone(CANONICAL);
   config.environments.staging = { requiredApprovals: 2 };
 
-  const { rulesets } = compile(config, PERSONAL);
-  const derived = byName(rulesets, "reviewers-staging");
-
+  const derived = byName(compile(config, PERSONAL).rulesets, "reviewers-staging");
   assert.equal(
     derived.rules.find((r) => r.type === "pull_request").parameters.required_approving_review_count,
     2,
@@ -144,10 +194,10 @@ test("two environments given the same ruleset name fail loudly", () => {
   assert.throws(() => compile(config, PERSONAL), /two rulesets named 'PR-SCOPE-CHECK'/);
 });
 
-// --- degradation -------------------------------------------------------------
+// --- degradation ---------------------------------------------------------------
 
-test("a user-owned repo drops the team requirement but keeps the approval count", () => {
-  const { rulesets, degradations } = compile(CANONICAL, PERSONAL);
+test("a user-owned repo drops the team requirement but keeps a satisfiable approval count", () => {
+  const { rulesets, degradations } = withProd(PERSONAL);
   const prod = byName(rulesets, "team-only-reviewer").rules.find((r) => r.type === "pull_request");
 
   assert.equal(prod.parameters.required_approving_review_count, 1, "approval survives");
@@ -158,8 +208,49 @@ test("a user-owned repo drops the team requirement but keeps the approval count"
   );
 });
 
+/**
+ * The property that keeps a solo repo usable: GitHub forbids approving your own
+ * pull request, so requiring one approval where only one person can push means
+ * no merge can ever complete. Dropping it is the only non-bricking answer.
+ */
+test("a solo repo drops the approval count instead of bricking every merge", () => {
+  const { rulesets, degradations } = withProd(SOLO);
+
+  assert.equal(byName(rulesets, "team-only-reviewer"), undefined, "no reviewer ruleset is created");
+  const dropped = degradations.find((d) => d.dropped === "required_approving_review_count");
+  assert.ok(dropped, "the drop is reported");
+  assert.match(dropped.reason, /approving your own pull request/);
+  assert.match(dropped.remedy, /second collaborator/);
+});
+
+test("a solo repo still gets the baseline, nomenclature and status-check rules", () => {
+  const { rulesets } = compile(CANONICAL, SOLO);
+  assert.deepEqual(rulesets.map((r) => r.name), [
+    "Pull Request Compulsion",
+    "PR-SCOPE-CHECK",
+    "Enforce Branch Nomenclature",
+  ]);
+  // Nomenclature asks for 1 approval; on a solo repo that must not survive, or
+  // every feature branch merge would be blocked.
+  assert.equal(
+    byName(rulesets, "Enforce Branch Nomenclature").rules.find((r) => r.type === "pull_request").parameters
+      .required_approving_review_count,
+    0,
+  );
+});
+
+test("an unreadable collaborator list is assumed satisfiable, never silently stripped", () => {
+  const unknown = { ...PERSONAL, reviewCapacity: undefined };
+  const { rulesets } = withProd(unknown);
+  assert.equal(
+    byName(rulesets, "team-only-reviewer").rules.find((r) => r.type === "pull_request").parameters
+      .required_approving_review_count,
+    1,
+  );
+});
+
 test("the owning org keeps the team requirement with a resolved id", () => {
-  const { rulesets, degradations } = compile(CANONICAL, ORG);
+  const { rulesets, degradations } = withProd(ORG);
   const prod = byName(rulesets, "team-only-reviewer").rules.find((r) => r.type === "pull_request");
 
   assert.deepEqual(prod.parameters.required_reviewers, [
@@ -169,14 +260,32 @@ test("the owning org keeps the team requirement with a resolved id", () => {
 });
 
 test("an org repo naming another org's team degrades", () => {
-  const { degradations } = compile(CANONICAL, { ...ORG, ownerLogin: "someone-else" });
-  assert.ok(degradations.every((d) => /does not belong to org/.test(d.reason)));
+  const { degradations } = withProd({ ...ORG, ownerLogin: "someone-else", teamIds: {} });
+  assert.ok(degradations.some((d) => /is not in org/.test(d.reason)));
 });
 
-// --- payload hygiene ---------------------------------------------------------
+/**
+ * A team that does not exist yet is created during apply, so the compiler must
+ * treat it as usable — otherwise the plan would show a degradation that the
+ * apply immediately contradicts.
+ */
+test("a team pending creation counts as usable", () => {
+  const pending = { ...ORG, teamIds: {}, pendingTeams: ["tehvault/reviewers"] };
+  const { rulesets, degradations } = withProd(pending);
+
+  assert.ok(byName(rulesets, "team-only-reviewer"), "the ruleset is planned");
+  assert.equal(degradations.length, 0, "no drop is reported for a team about to exist");
+});
+
+test("an org team that is neither resolved nor pending degrades", () => {
+  const { degradations } = withProd({ ...ORG, teamIds: {} });
+  assert.ok(degradations.some((d) => d.dropped === "required_reviewers"));
+});
+
+// --- payload hygiene -----------------------------------------------------------
 
 test("payloads carry no response-only fields", () => {
-  const { rulesets } = compile(CANONICAL, PERSONAL);
+  const { rulesets } = withProd(ORG);
   const forbidden = ["id", "source", "source_type", "created_at", "updated_at", "node_id", "_links"];
 
   for (const ruleset of rulesets) {
@@ -189,8 +298,23 @@ test("payloads carry no response-only fields", () => {
   }
 });
 
-test("referencedTeams collects every team the config mentions, deduped", () => {
+test("referencedTeams collects every team the ACTIVE config mentions, deduped", () => {
   assert.deepEqual(referencedTeams(CANONICAL), ["tehvault/reviewers"]);
+});
+
+/**
+ * A profile is inert until its environment is added. Counting its team here
+ * would make an org repo plan to create a reviewer team for an environment
+ * nobody asked for — addEnvironments runs first, so an env added this run is
+ * already in `environments` by the time teams are resolved.
+ */
+test("a team named only by an unused profile is not referenced", () => {
+  const config = clone(CANONICAL);
+  delete config.branchNaming.reviewerTeams;
+  assert.deepEqual(referencedTeams(config), [], "prod's profile team is not pulled in");
+
+  addEnvironments(config, ["prod"]);
+  assert.deepEqual(referencedTeams(config), ["tehvault/reviewers"], "adding prod does reference it");
 });
 
 /**
@@ -200,7 +324,7 @@ test("referencedTeams collects every team the config mentions, deduped", () => {
  * both 422; the count plus all four booleans is accepted.
  */
 test("every pull_request rule carries all four review booleans", () => {
-  const { rulesets } = compile(CANONICAL, PERSONAL);
+  const { rulesets } = withProd(ORG);
   const required = [
     "required_approving_review_count",
     "dismiss_stale_reviews_on_push",
@@ -225,8 +349,7 @@ test("review booleans are configurable per scope", () => {
   const config = clone(CANONICAL);
   config.branchNaming.review = { requireCodeOwnerReview: true, requireLastPushApproval: true };
 
-  const { rulesets } = compile(config, PERSONAL);
-  const params = byName(rulesets, "Enforce Branch Nomenclature").rules.find(
+  const params = byName(compile(config, PERSONAL).rulesets, "Enforce Branch Nomenclature").rules.find(
     (r) => r.type === "pull_request",
   ).parameters;
 
@@ -256,21 +379,107 @@ test("the task id prefix used by nomenclature is configurable", () => {
   assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*"));
 });
 
-test("adding an environment reports only the genuinely new ones", () => {
-  const config = clone(CANONICAL);
-  assert.deepEqual(addEnvironments(config, ["staging", "dev"]), ["staging"]);
-  assert.deepEqual(config.environments.staging, {}, "a bare env still inherits the baseline");
+// --- satisfiability covers the TEAM requirement, not just the count ------------
+
+/**
+ * The blocker this whole check exists to prevent: zeroing the approval count
+ * while leaving a team gate bound still blocks every merge, and `survived`
+ * would even keep the ruleset alive because of it.
+ */
+test("a solo ORG repo drops the team requirement too, not just the count", () => {
+  const soloOrg = { ...ORG, reviewCapacity: 1, teamSizes: { "tehvault/reviewers": 5 } };
+  const { rulesets, degradations } = withProd(soloOrg);
+
+  assert.equal(byName(rulesets, "team-only-reviewer"), undefined, "the ruleset is not created");
+  assert.ok(
+    degradations.some((d) => d.dropped === "required_reviewers"),
+    "the team gate is dropped, not merely the count",
+  );
 });
 
-test("an added environment flows into the compiled rulesets", () => {
-  const config = clone(CANONICAL);
-  addEnvironments(config, ["staging"]);
-  const { rulesets } = compile(config, PERSONAL);
+test("an empty team can never approve, so its requirement is dropped", () => {
+  const emptyTeam = { ...ORG, teamSizes: { "tehvault/reviewers": 0 } };
+  const { rulesets, degradations } = withProd(emptyTeam);
 
-  assert.ok(
-    byName(rulesets, "Pull Request Compulsion").conditions.ref_name.include.includes("refs/heads/staging"),
+  const dropped = degradations.find((d) => d.dropped === "required_reviewers");
+  assert.match(dropped.reason, /has no members/);
+  assert.match(dropped.remedy, /add a member/);
+  // requiredApprovals 1 with capacity 5 still stands on its own.
+  assert.equal(
+    byName(rulesets, "team-only-reviewer").rules.find((r) => r.type === "pull_request").parameters
+      .required_reviewers,
+    undefined,
   );
-  assert.ok(
-    byName(rulesets, "Enforce Branch Nomenclature").conditions.ref_name.exclude.includes("refs/heads/staging"),
+});
+
+test("approvals available is capacity minus the author, and unknown means unlimited", () => {
+  assert.equal(approvalsAvailable({ reviewCapacity: 3 }), 2);
+  assert.equal(approvalsAvailable({ reviewCapacity: 1 }), 0);
+  assert.equal(approvalsAvailable({ reviewCapacity: 0 }), 0);
+  assert.equal(approvalsAvailable({}), Infinity);
+});
+
+/** A count is measured against what the repo can supply, not a fixed 2. */
+test("an approval count above what the repo can supply is reduced to what it can", () => {
+  const config = clone(CANONICAL);
+  config.environments.staging = { requiredApprovals: 3 };
+  const { rulesets, degradations } = compile(config, { ...PERSONAL, reviewCapacity: 3 });
+
+  assert.equal(
+    byName(rulesets, "reviewers-staging").rules.find((r) => r.type === "pull_request").parameters
+      .required_approving_review_count,
+    2,
+    "3 pushers can supply at most 2 approvals",
   );
+  assert.equal(degradations.find((d) => d.dropped === "required_approving_review_count").reducedTo, 2);
+});
+
+test("a satisfiable count is left exactly as configured", () => {
+  const config = clone(CANONICAL);
+  config.environments.staging = { requiredApprovals: 2 };
+  const { rulesets, degradations } = compile(config, { ...PERSONAL, reviewCapacity: 5 });
+
+  assert.equal(
+    byName(rulesets, "reviewers-staging").rules.find((r) => r.type === "pull_request").parameters
+      .required_approving_review_count,
+    2,
+  );
+  assert.equal(
+    degradations.filter((d) => d.dropped === "required_approving_review_count").length,
+    0,
+    "a count the repo can supply is never touched",
+  );
+});
+
+/**
+ * A reviewer ruleset that cannot survive here but ALREADY exists must still be
+ * emitted, neutered — dropping it from the desired set would leave the live
+ * one demanding a review this repo cannot supply, blocking every merge.
+ */
+test("an existing reviewer ruleset that cannot survive is neutered, not abandoned", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  const { rulesets } = compile(config, {
+    ...SOLO,
+    existingRulesetNames: ["team-only-reviewer"],
+  });
+
+  const prod = byName(rulesets, "team-only-reviewer");
+  assert.ok(prod, "it is still emitted so the live ruleset gets updated");
+  const pr = prod.rules.find((r) => r.type === "pull_request");
+  assert.equal(pr.parameters.required_approving_review_count, 0, "the block is removed");
+  assert.equal(pr.parameters.required_reviewers, undefined);
+  assert.ok(prod.rules.some((r) => r.type === "deletion"), "real protection remains");
+});
+
+test("the same ruleset is simply not created when it does not already exist", () => {
+  const { rulesets } = withProd(SOLO);
+  assert.equal(byName(rulesets, "team-only-reviewer"), undefined);
+});
+
+test("a reviewer team must be named by its slug, not its display name", () => {
+  assert.throws(() => assertTeamSlugs(["tehvault/My Team"]), /org\/team-slug/);
+  assert.throws(() => assertTeamSlugs(["tehvault/Reviewers"]), /lowercase/);
+  assert.doesNotThrow(() => assertTeamSlugs(["tehvault/reviewers", "acme/prod-approvers"]));
+  assert.doesNotThrow(() => assertTeamSlugs([]));
 });

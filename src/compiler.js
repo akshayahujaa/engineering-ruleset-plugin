@@ -11,17 +11,57 @@ const ref = (branch) => `refs/heads/${branch}`;
  * `required_reviewers` binds a GitHub team, which only resolves when the
  * repository's owner is the organisation that owns the team. Personal repos,
  * and org repos naming a team from a different org, cannot use it.
+ *
+ * A team the plugin is about to create counts as usable: its id arrives before
+ * the payload is sent, because the apply recompiles once the team exists.
  */
 function teamIsUsable(team, context) {
   if (context.ownerType !== "Organization") return false;
   const org = String(team).split("/")[0];
-  return org.toLowerCase() === String(context.ownerLogin).toLowerCase();
+  if (org.toLowerCase() !== String(context.ownerLogin).toLowerCase()) return false;
+  return context.teamIds?.[team] !== undefined || (context.pendingTeams ?? []).includes(team);
 }
 
 /**
- * Builds a pull_request rule, dropping the team requirement when the target
- * repo cannot honour it. Every drop is recorded so the plan can report it
- * instead of silently weakening the policy.
+ * How many approvals this repository can actually produce for a pull request.
+ *
+ * GitHub does not let an author approve their own pull request, so N
+ * push-capable accounts yield at most N-1 approvals. A requirement above that
+ * can never be met: it does not harden the repo, it bricks it — no merge into
+ * that branch can ever complete.
+ *
+ * `reviewCapacity` is undefined when the collaborator list could not be read;
+ * that becomes Infinity — "assume satisfiable" — so a permissions hiccup never
+ * silently strips a policy the repo can honour.
+ */
+export function approvalsAvailable(context) {
+  if (context?.reviewCapacity === undefined) return Infinity;
+  return Math.max(0, context.reviewCapacity - 1);
+}
+
+/** How the shortfall is described, given who owns the repository. */
+function capacityReason(context, needed, available) {
+  const who =
+    context.ownerType === "Organization"
+      ? `'${context.ownerLogin}' has ${context.reviewCapacity} account(s) with write access`
+      : context.ownerLogin === context.viewerLogin
+        ? `you are the only account with write access`
+        : `'${context.ownerLogin}' has ${context.reviewCapacity} account(s) with write access`;
+
+  return (
+    `${who}, and GitHub forbids approving your own pull request — at most ${available} approval(s) ` +
+    `can ever be supplied, but ${needed} is required`
+  );
+}
+
+/**
+ * Builds a pull_request rule, dropping requirements the target repo cannot
+ * honour. Every drop is recorded so the plan can report it instead of
+ * silently weakening — or silently bricking — the policy.
+ *
+ * @returns {{rule: object, survived: boolean}} `survived` is whether any part
+ *   of the requested review survived. A ruleset whose only purpose was a
+ *   review that did not survive should not be created.
  */
 function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, context, rulesetName, degradations) {
   // GitHub's schema requires all four review booleans alongside the approval
@@ -36,18 +76,45 @@ function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, contex
 
   if (mergeMethods) parameters.allowed_merge_methods = mergeMethods;
 
+  const available = approvalsAvailable(context);
+  const moreCollaborators =
+    context.ownerType === "Organization"
+      ? "grant write access to another member (directly or via a team), then re-run"
+      : "add a second collaborator with write access, then re-run";
+
   const usable = (teams ?? []).filter((team) => {
-    if (teamIsUsable(team, context)) return true;
-    degradations.push({
-      ruleset: rulesetName,
-      dropped: "required_reviewers",
-      team,
-      reason:
-        context.ownerType === "Organization"
-          ? `team '${team}' does not belong to org '${context.ownerLogin}'`
-          : `'${context.ownerLogin}' is a user account, which cannot require team review`,
-    });
-    return false;
+    if (!teamIsUsable(team, context)) {
+      degradations.push({
+        ruleset: rulesetName,
+        dropped: "required_reviewers",
+        team,
+        reason:
+          context.ownerType === "Organization"
+            ? `team '${team}' is not in org '${context.ownerLogin}', or could not be resolved`
+            : `'${context.ownerLogin}' is a user account — GitHub has no teams outside an organisation`,
+      });
+      return false;
+    }
+
+    // A team review needs one approver who is not the author. Nobody can
+    // supply that from an empty team, or on a repo with no spare approver —
+    // and a bound-but-unsatisfiable team blocks merges just as hard as an
+    // impossible approval count.
+    const size = context.teamSizes?.[team];
+    if (available < 1 || size === 0) {
+      degradations.push({
+        ruleset: rulesetName,
+        dropped: "required_reviewers",
+        team,
+        reason:
+          size === 0
+            ? `team '${team}' has no members, so its review could never be supplied`
+            : capacityReason(context, 1, available),
+        remedy: size === 0 ? `add a member to '${team}', then re-run` : moreCollaborators,
+      });
+      return false;
+    }
+    return true;
   });
 
   if (usable.length > 0) {
@@ -58,7 +125,25 @@ function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, contex
     }));
   }
 
-  return { type: "pull_request", parameters };
+  // An approval requirement nobody can meet is worse than no requirement: it
+  // permanently blocks every pull request. Reduce it to what this repository
+  // can actually supply rather than dropping the whole idea.
+  const needed = parameters.required_approving_review_count;
+  if (needed > available) {
+    degradations.push({
+      ruleset: rulesetName,
+      dropped: "required_approving_review_count",
+      reason: capacityReason(context, needed, available),
+      remedy: moreCollaborators,
+      reducedTo: available,
+    });
+    parameters.required_approving_review_count = available;
+  }
+
+  const survived =
+    parameters.required_approving_review_count > 0 || (parameters.required_reviewers ?? []).length > 0;
+
+  return { rule: { type: "pull_request", parameters }, survived };
 }
 
 function baselineRuleset(config, context, degradations) {
@@ -76,6 +161,8 @@ function baselineRuleset(config, context, degradations) {
   if (baseline.preventDeletion) rules.push({ type: "deletion" });
   if (baseline.preventForcePush) rules.push({ type: "non_fast_forward" });
   if (baseline.requirePullRequest) {
+    // The baseline's pull_request rule earns its place even with zero
+    // approvals: requiring a PR at all is the point.
     rules.push(
       pullRequestRule(
         {
@@ -87,7 +174,7 @@ function baselineRuleset(config, context, degradations) {
         context,
         name,
         degradations,
-      ),
+      ).rule,
     );
   }
 
@@ -135,29 +222,36 @@ function reviewerRulesets(config, context, degradations) {
     .filter(([, env]) => (env.requiredApprovals ?? 0) > baselineApprovals || (env.reviewerTeams ?? []).length > 0)
     .map(([envName, env]) => {
       const name = env.reviewerRuleset ?? `reviewers-${envName}`;
+      const { rule, survived } = pullRequestRule(
+        {
+          approvals: env.requiredApprovals,
+          teams: env.reviewerTeams,
+          mergeMethods: env.allowedMergeMethods ?? config.baseline?.allowedMergeMethods,
+          review: env.review ?? config.baseline?.review,
+        },
+        context,
+        name,
+        degradations,
+      );
+
+      // This ruleset exists ONLY to add a review on top of the baseline. If
+      // none of that survived the target repo's limits there is nothing to
+      // create — but if a previous sync already created it, it must still be
+      // emitted, neutered. Dropping it from the desired set would leave the
+      // live ruleset in place, still demanding the review this repo cannot
+      // supply, still blocking every merge, and reported only as "unmanaged".
+      if (!survived && !(context.existingRulesetNames ?? []).includes(name)) return null;
+
       return {
         name,
         target: "branch",
         enforcement: "active",
         bypass_actors: [],
         conditions: { ref_name: { include: [ref(envName)], exclude: [] } },
-        rules: [
-          { type: "deletion" },
-          { type: "non_fast_forward" },
-          pullRequestRule(
-            {
-              approvals: env.requiredApprovals,
-              teams: env.reviewerTeams,
-              mergeMethods: env.allowedMergeMethods ?? config.baseline?.allowedMergeMethods,
-              review: env.review ?? config.baseline?.review,
-            },
-            context,
-            name,
-            degradations,
-          ),
-        ],
+        rules: [{ type: "deletion" }, { type: "non_fast_forward" }, rule],
       };
-    });
+    })
+    .filter(Boolean);
 }
 
 /**
@@ -202,7 +296,7 @@ function nomenclatureRuleset(config, context, degradations) {
       context,
       name,
       degradations,
-    ),
+    ).rule,
   );
 
   return {
@@ -247,12 +341,33 @@ export function compile(config, context) {
  * Teams referenced anywhere in the config, so the caller can resolve their
  * numeric ids before compiling.
  */
+/**
+ * Teams are addressed by slug. A config naming `org/My Team` would create a
+ * team whose GitHub-derived slug is `my-team`, which the next run then fails
+ * to find — queueing a second create that GitHub refuses as a duplicate name.
+ * Refusing up front beats that loop.
+ */
+export function assertTeamSlugs(teams) {
+  const bad = teams.filter((t) => !/^[\w.-]+\/[a-z0-9][a-z0-9-]*$/.test(t));
+  if (bad.length > 0) {
+    throw new Error(
+      `reviewerTeams must be 'org/team-slug', lowercase and hyphenated: ${bad.join(", ")}. ` +
+        "The slug is in the team's GitHub URL (/orgs/<org>/teams/<slug>).",
+    );
+  }
+}
+
 export function referencedTeams(config) {
   const teams = [
     ...(config.baseline?.reviewerTeams ?? []),
     ...(config.branchNaming?.reviewerTeams ?? []),
     ...Object.values(config.environments ?? {}).flatMap((env) => env.reviewerTeams ?? []),
   ];
+  // Deliberately NOT environmentProfiles: a profile is inert until its
+  // environment is added, and addEnvironments runs first, so an environment
+  // added this run is already in `environments` by the time teams resolve.
+  // Scanning profiles here would plan to create a team for an environment
+  // nobody asked for.
   return dedupe(teams);
 }
 
@@ -269,9 +384,20 @@ export function addEnvironments(config, names) {
 
   for (const name of names) {
     if (Object.hasOwn(config.environments, name)) continue;
-    config.environments[name] = {};
+    // A known name brings its profile — adding 'prod' later must give the same
+    // stricter policy as declaring it up front, or the environment that most
+    // needs guarding would be the one that silently gets the least.
+    const profile = config.environmentProfiles?.[name];
+    config.environments[name] = profile ? structuredClone(profile) : {};
     added.push(name);
   }
 
   return added;
+}
+
+/** Environment names the config knows a profile for, in declaration order. */
+export function knownEnvironments(config) {
+  return Object.keys(config.environmentProfiles ?? {}).filter(
+    (name) => !Object.hasOwn(config.environments ?? {}, name),
+  );
 }
