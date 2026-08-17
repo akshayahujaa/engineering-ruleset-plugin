@@ -14,12 +14,25 @@ const ref = (branch) => `refs/heads/${branch}`;
  *
  * A team the plugin is about to create counts as usable: its id arrives before
  * the payload is sent, because the apply recompiles once the team exists.
+ *
+ * @returns {string|null} why the team cannot be used, or null when it can.
+ *   Each case reads differently on purpose — "it is another org's team" and
+ *   "it does not exist yet" have completely different fixes.
  */
-function teamIsUsable(team, context) {
-  if (context.ownerType !== "Organization") return false;
+function whyTeamUnusable(team, context) {
+  if (context.ownerType !== "Organization") {
+    return `'${context.ownerLogin}' is a user account — GitHub has no teams outside an organisation`;
+  }
   const org = String(team).split("/")[0];
-  if (org.toLowerCase() !== String(context.ownerLogin).toLowerCase()) return false;
-  return context.teamIds?.[team] !== undefined || (context.pendingTeams ?? []).includes(team);
+  if (org.toLowerCase() !== String(context.ownerLogin).toLowerCase()) {
+    return `team '${team}' belongs to '${org}', but this repository is owned by '${context.ownerLogin}'`;
+  }
+  if (context.teamIds?.[team] !== undefined || (context.pendingTeams ?? []).includes(team)) return null;
+
+  return (
+    `team '${team}' could not be resolved in '${context.ownerLogin}' — it does not exist and could ` +
+    "not be seeded, or this token cannot see it"
+  );
 }
 
 /**
@@ -55,6 +68,48 @@ function capacityReason(context, needed, available) {
 }
 
 /**
+ * A team requirement that could not be bound leaves the review with nothing
+ * behind it — and that is the common case, not the exotic one: teams exist
+ * only inside organisations, so every personal repo lands here.
+ *
+ * `require_code_owner_review` needs no team. Where CODEOWNERS can actually
+ * supply the review (see assessCodeownerReview), it takes over, so the rule
+ * still gates the merge instead of quietly becoming a bare approval count.
+ *
+ * It is only substituted alongside a surviving approval count. GitHub's own
+ * documentation pairs the two, and betting a repository's merges on
+ * code-owner review being enforced at a count of zero is not worth the
+ * uncertainty — at zero the plan says what is missing instead.
+ */
+function substituteCodeownerReview({ parameters, teams, context, rulesetName, degradations }) {
+  const wanted = (teams ?? []).length > 0;
+  const bound = (parameters.required_reviewers ?? []).length > 0;
+  const review = context.codeownerReview;
+
+  if (!wanted || bound || parameters.require_code_owner_review) return;
+  if (parameters.required_approving_review_count < 1 || !review) return;
+
+  if (review.usable) {
+    parameters.require_code_owner_review = true;
+    degradations.push({
+      ruleset: rulesetName,
+      substituted: "require_code_owner_review",
+      reason:
+        `no team could be bound, so ${review.path} gates the review instead — ` +
+        `${review.owners.length} owner(s) with write access across ${review.patterns} pattern(s)`,
+    });
+    return;
+  }
+
+  degradations.push({
+    ruleset: rulesetName,
+    unsubstituted: "require_code_owner_review",
+    reason: `it would have replaced the dropped team, but ${review.reason}`,
+    remedy: review.remedy,
+  });
+}
+
+/**
  * Builds a pull_request rule, dropping requirements the target repo cannot
  * honour. Every drop is recorded so the plan can report it instead of
  * silently weakening — or silently bricking — the policy.
@@ -83,16 +138,9 @@ function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, contex
       : "add a second collaborator with write access, then re-run";
 
   const usable = (teams ?? []).filter((team) => {
-    if (!teamIsUsable(team, context)) {
-      degradations.push({
-        ruleset: rulesetName,
-        dropped: "required_reviewers",
-        team,
-        reason:
-          context.ownerType === "Organization"
-            ? `team '${team}' is not in org '${context.ownerLogin}', or could not be resolved`
-            : `'${context.ownerLogin}' is a user account — GitHub has no teams outside an organisation`,
-      });
+    const unusable = whyTeamUnusable(team, context);
+    if (unusable) {
+      degradations.push({ ruleset: rulesetName, dropped: "required_reviewers", team, reason: unusable });
       return false;
     }
 
@@ -140,8 +188,12 @@ function pullRequestRule({ approvals, teams, mergeMethods, review = {} }, contex
     parameters.required_approving_review_count = available;
   }
 
+  substituteCodeownerReview({ parameters, teams, context, rulesetName, degradations });
+
   const survived =
-    parameters.required_approving_review_count > 0 || (parameters.required_reviewers ?? []).length > 0;
+    parameters.required_approving_review_count > 0 ||
+    (parameters.required_reviewers ?? []).length > 0 ||
+    parameters.require_code_owner_review === true;
 
   return { rule: { type: "pull_request", parameters }, survived };
 }

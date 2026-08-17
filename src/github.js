@@ -255,6 +255,41 @@ export function createClient({ cwd = process.cwd(), repo: slug } = {}) {
       }
     },
 
+    /**
+     * A team's members, paginated. Whether a team can supply the review it
+     * gates must not hinge on the first page — and these logins are what a
+     * `@org/team` code owner expands to.
+     */
+    async teamMembers(org, slug) {
+      const logins = [];
+      for (let page = 1; ; page += 1) {
+        const batch = await request(
+          "GET",
+          `orgs/${org}/teams/${encodeURIComponent(slug)}/members?per_page=100&page=${page}`,
+        );
+        logins.push(...batch.map((m) => m.login));
+        if (batch.length < 100) return logins;
+      }
+    },
+
+    /**
+     * The organisation's members.
+     *
+     * Adding someone who is NOT one to a team invites them to the
+     * organisation, so this list is what keeps the sync from sending an
+     * invitation on somebody's behalf. A caller who is not an org member sees
+     * only public members, which under-reports rather than over-reports —
+     * the safe direction.
+     */
+    async orgMembers(org) {
+      const logins = [];
+      for (let page = 1; ; page += 1) {
+        const batch = await request("GET", `orgs/${org}/members?per_page=100&page=${page}`);
+        logins.push(...batch.map((m) => m.login));
+        if (batch.length < 100) return logins;
+      }
+    },
+
     /** Creates an org team. Requires org-admin rights on the token. */
     createTeam(org, name, description) {
       return request("POST", `orgs/${org}/teams`, {

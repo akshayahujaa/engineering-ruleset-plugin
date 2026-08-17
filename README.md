@@ -198,11 +198,118 @@ sync does depends on what the target repo can actually honour:
 
 | Target | Reviewer rule |
 |---|---|
-| org repo, team exists with members | bound to the team, by its resolved id |
-| org repo, team missing | the team is **created** and whoever ran the sync is **added to it**, then bound — shown in the plan first, because it changes org membership |
-| org repo, team exists but empty | team requirement dropped: an empty team can never approve |
-| personal repo, ≥2 collaborators | team dropped (impossible outside an org); the approval count survives |
+| org repo, team exists with members | bound to the team, by its resolved id; its membership is never touched |
+| org repo, team missing | the team is **created and seeded from the repository's CODEOWNERS**, then bound |
+| org repo, team exists but empty | the same seed is **added to it** — an empty team can never approve, so filling it is what makes the rule bind instead of degrade |
+| org repo, nobody eligible to seed | the team is left alone and the requirement is dropped, naming every candidate that was considered and why it was rejected |
+| personal repo, ≥2 collaborators | team dropped (impossible outside an org) — **CODEOWNERS takes the review over** where it can supply it; the approval count survives either way |
+| any repo, team dropped for any reason | same substitution: `require_code_owner_review` needs no team |
 | solo repo (org or personal) | team **and** approval count dropped; the reviewer ruleset is not created |
+
+Both team rows change organisation membership, so they are shown in the plan — with the names —
+before anything happens.
+
+### Where the reviewers come from: CODEOWNERS
+
+A reviewer team that does not exist, or that exists with nobody in it, used to drop the rule:
+`team-only-reviewer` degraded to no team at all. It no longer does. The people who already own
+the code are the people who should review it, so the team is built from the repository's own
+`CODEOWNERS` — looked for exactly where GitHub looks, in GitHub's order:
+
+```
+.github/CODEOWNERS   →   CODEOWNERS   →   docs/CODEOWNERS
+```
+
+`@user` owners are taken as they are, `@org/team` owners are expanded to that team's members, and
+every candidate is screened before it is proposed:
+
+| Candidate | Outcome |
+|---|---|
+| org member with write access | added |
+| no write access to this repo | skipped — GitHub does not count their approval, so the seat would be decorative |
+| not a member of the organisation | skipped — adding them to a team **invites them to the org**, and this sync does not send someone an invitation as a side effect |
+| an email address, or another org's team | skipped — GitHub cannot resolve either to a member |
+
+Whoever runs the sync is the fallback: they join only when CODEOWNERS produced nobody, so a team is
+never created empty, and running the command does not quietly enrol you as a reviewer for a
+repository you do not own.
+
+```
+  CREATE   team tehvault/reviewers        → does not exist in 'tehvault'; it will be
+             created with 2 member(s) from .github/CODEOWNERS: @alice, @bob,
+             so the reviews it gates can actually be satisfied
+             [not added:
+               dev@tehvault.com — is an email address, which GitHub cannot resolve to a login
+               @carol — has no write access to tehvault/app, so their approval would not count]
+```
+
+If nothing survives the screening the team is **not** created — an empty reviewer team blocks every
+merge, which is worse than no rule — and the plan says who it considered and what would fix it.
+
+Behaviour is declared in the config, and all three settings default on:
+
+```jsonc
+"teamSeeding": {
+  "fromCodeowners": true,        // false: fall back to the runner, as before
+  "includeRunner": "fallback",   // true: always; false: never
+  "populateEmptyTeams": true     // false: leave an existing empty team alone
+}
+```
+
+Membership is applied one person at a time, so one refusal costs one person rather than the team,
+and the size the rule is judged against is how many members **actually landed** — a team whose
+memberships all bounced is reported and left unbound rather than blocking every merge.
+
+### When no team can be bound at all
+
+Teams exist only inside organisations, so on a personal repo there is nothing to bind — and the
+same is true when a config names another org's team, or when nobody could be found to seed one.
+The reviewer requirement used to simply vanish there, leaving a bare approval count that anybody
+could satisfy.
+
+`require_code_owner_review` needs no team, so where CODEOWNERS can supply the review it takes the
+gate over instead:
+
+```
+  CREATE   Enforce Branch Nomenclature    → ~ALL (except 3 excluded refs)
+           [degraded: required_reviewers dropped — 'tehvault' is a user account — GitHub has no
+            teams outside an organisation]
+           [substituted: require_code_owner_review on — no team could be bound, so
+            .github/CODEOWNERS gates the review instead — 2 owner(s) with write access across
+            1 pattern(s)]
+```
+
+**It is only substituted where it is satisfiable**, which is stricter than it first looks. The last
+matching pattern decides who owns a file, so every owned pattern needs at least **two** owners with
+write access:
+
+- an owner without write access does not count — GitHub ignores them, so they could never clear the
+  gate
+- a pattern with exactly **one** eligible owner is refused: a pull request that person writes,
+  touching their own files, could never be approved by anyone
+- a pattern nobody eligible owns is fine — GitHub asks for no code-owner review on paths with no
+  owner
+- an owner given as an email address is not counted, because it cannot be resolved to a login from
+  here
+
+When it cannot be enabled, the plan says which pattern is the problem and what would fix it, rather
+than going quiet:
+
+```
+           [require_code_owner_review not substituted — it would have replaced the dropped team,
+            but /infra/ has a single owner who can push, so a pull request that owner writes could
+            never be approved]
+            to enable it: give /infra/ a second owner with write access in .github/CODEOWNERS,
+            then re-run
+```
+
+A team that binds is left to do its job — the substitution is a fallback, never an addition. And on
+a solo repo nothing is substituted at all: the approval count is already reduced to zero there
+because nobody but the author could approve, and a code owner review would be just as impossible.
+Setting `review.requireCodeOwnerReview` explicitly in the config always wins over any of this.
+
+CODEOWNERS is read only when some team the policy names will not bind as things stand — a repo
+whose reviewer team resolves with members costs no extra API calls.
 
 **Everything is measured against what the repo can actually supply.** GitHub does not let you
 approve your own pull request, so N accounts with write access yield at most **N−1** approvals. A
@@ -352,7 +459,7 @@ takes precedence.
 |---|---|---|
 | `Pull Request Compulsion` | default branch + every environment | PR required; no deletion, no force-push |
 | `PR-SCOPE-CHECK` | `dev` | status check `pr-scope/check` |
-| `team-only-reviewer` | `prod` | 1 approval, from `tehvault/reviewers` where available |
+| `team-only-reviewer` | `prod` | 1 approval, from `tehvault/reviewers` where available, else from a code owner |
 | `Enforce Branch Nomenclature` | everything else | restricts creation; PR + 1 approval |
 
 ## Behaviour worth knowing
@@ -363,9 +470,11 @@ creating duplicates. Server-side defaults GitHub fills in are not mistaken for d
 **Never deletes.** A ruleset the config does not declare is reported as `UNMANAGED` and left
 alone.
 
-**Degrades loudly.** `required_reviewers` binds a GitHub team, which only resolves when the
-repo's owner is that team's organisation. On a personal repo the team requirement is dropped,
-the approval count is kept, and the plan says so.
+**Degrades loudly — but only when it must.** `required_reviewers` binds a GitHub team, which only
+resolves when the repo's owner is that team's organisation. A missing or empty team in the owning
+org is seeded from CODEOWNERS rather than dropped; where no team can be bound at all, CODEOWNERS
+gates the review instead. Only when neither is possible is the requirement dropped — and the plan
+says which one was missing and what would restore it.
 
 **No bypass actors.** The rules bind everyone, including the repo owner. Once
 `Pull Request Compulsion` is active, changing the default branch requires a pull request.

@@ -25,6 +25,12 @@
     }
   },
 
+  "teamSeeding": {
+    "fromCodeowners": true,
+    "includeRunner": "fallback",
+    "populateEmptyTeams": true
+  },
+
   "taskSync": {
     "enabled": true,
     "provider": "clickup",
