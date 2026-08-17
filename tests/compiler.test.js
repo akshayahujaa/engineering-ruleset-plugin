@@ -9,6 +9,7 @@ import {
   knownEnvironments,
   approvalsAvailable,
   assertTeamSlugs,
+  assertEnvironmentNames,
 } from "../src/compiler.js";
 
 const CANONICAL = JSON.parse(
@@ -482,4 +483,10 @@ test("a reviewer team must be named by its slug, not its display name", () => {
   assert.throws(() => assertTeamSlugs(["tehvault/Reviewers"]), /lowercase/);
   assert.doesNotThrow(() => assertTeamSlugs(["tehvault/reviewers", "acme/prod-approvers"]));
   assert.doesNotThrow(() => assertTeamSlugs([]));
+});
+
+test("a numeric environment name is refused, since it would reorder the pipeline", () => {
+  assert.throws(() => assertEnvironmentNames({ environments: { dev: {}, 2: {} } }), /must not be numbers/);
+  assert.doesNotThrow(() => assertEnvironmentNames({ environments: { dev: {}, "qa2": {} } }));
+  assert.doesNotThrow(() => assertEnvironmentNames({}));
 });

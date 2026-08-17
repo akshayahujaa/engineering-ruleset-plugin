@@ -28,10 +28,13 @@
   "taskSync": {
     "enabled": true,
     "provider": "clickup",
-    "targetBranch": "dev",
     "taskIdPrefix": "CU-",
     "todoStatuses": ["to do", "todo", "open", "backlog", "pending"],
-    "targetStatus": "in progress",
+    "environmentStatuses": {
+      "dev": "in progress",
+      "test": "QA",
+      "prod": "done"
+    },
     "secretName": "CLICKUP_TOKEN"
   },
 

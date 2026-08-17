@@ -7,6 +7,8 @@ import {
   renderClickUpWorkflow,
   renderJiraWorkflow,
   normalizeTaskSync,
+  statusPipeline,
+  planTaskSync,
   planSyncOrphans,
   removeSyncOrphan,
   GENERATED_MARKER,
@@ -89,7 +91,7 @@ test("a task past to-do is never dragged backwards", () => {
   for (const status of ["in review", "done", "closed", "blocked"]) {
     const result = decideTransition(status);
     assert.equal(result.move, false, `expected '${status}' to stay put`);
-    assert.match(result.reason, /past to-do/);
+    assert.match(result.reason, /not in the configured pipeline|already at or past/);
   }
 });
 
@@ -109,47 +111,95 @@ test("the to-do set and target are configurable", () => {
 
 // --- the generated workflow --------------------------------------------------
 
+/** Most render tests care about one aspect, not the pipeline; this is the stand-in. */
+const ONE = [{ env: "dev", status: "in progress", rank: 1 }];
+
 test("the workflow never embeds the token, only the secret reference", () => {
-  const yaml = renderWorkflow({});
+  const yaml = renderWorkflow({}, ONE);
   assert.match(yaml, /CLICKUP_TOKEN: \$\{\{ secrets\.CLICKUP_TOKEN \}\}/);
   assert.doesNotMatch(yaml, /pk_[A-Za-z0-9]/);
 });
 
-test("the workflow only fires on a merged PR into the target branch", () => {
-  const yaml = renderWorkflow({ targetBranch: "dev" });
-  assert.match(yaml, /branches: \[dev\]/);
+test("the workflow only fires on a merged PR into a pipeline branch", () => {
+  const yaml = renderWorkflow({}, [{ env: "dev", status: "in progress", rank: 1 }]);
+  assert.match(yaml, /branches:\n      - 'dev'/);
   assert.match(yaml, /types: \[closed\]/);
   assert.match(yaml, /github\.event\.pull_request\.merged == true/);
 });
 
-test("the target branch and status come from config", () => {
-  const yaml = renderWorkflow({ targetBranch: "develop", targetStatus: "doing" });
-  assert.match(yaml, /branches: \[develop\]/);
-  assert.match(yaml, /\{"status":"doing"\}/);
+// --- the multi-environment pipeline ---------------------------------------------
+
+const PIPELINE = [
+  { env: "dev", status: "in progress", rank: 1 },
+  { env: "test", status: "QA", rank: 2 },
+  { env: "prod", status: "done", rank: 3 },
+];
+
+test("every pipeline environment becomes a trigger branch and a case arm", () => {
+  const yaml = renderWorkflow({}, PIPELINE);
+  for (const st of PIPELINE) {
+    assert.ok(yaml.includes(`      - '${st.env}'`), `${st.env} triggers the workflow`);
+    assert.match(yaml, new RegExp(`'${st.env}'\\) want='${st.status}'; want_rank=${st.rank}`));
+  }
+});
+
+test("the pipeline is documented at the top of the generated file", () => {
+  const yaml = renderWorkflow({}, PIPELINE);
+  assert.match(yaml, /#   dev → in progress\n#   test → QA\n#   prod → done/);
+});
+
+test("each pipeline status is rankable, so a later merge cannot pull a task back", () => {
+  const yaml = renderWorkflow({}, PIPELINE);
+  assert.match(yaml, /'in progress'\) rank=1/);
+  assert.match(yaml, /'qa'\) rank=2/);
+  assert.match(yaml, /'done'\) rank=3/);
+  assert.match(yaml, /\*\) rank=-1/, "an unlisted status stays unranked");
+  assert.match(yaml, /\[ "\$rank" -ge "\$want_rank" \]/, "the forward-only comparison");
+});
+
+test("the base branch decides the target, and an unknown base is a no-op", () => {
+  const yaml = renderWorkflow({}, PIPELINE);
+  assert.match(yaml, /BASE_REF: \$\{\{ github\.event\.pull_request\.base\.ref \|\| inputs\.base_ref \}\}/);
+  assert.match(yaml, /is not a pipeline environment; nothing to sync/);
+});
+
+test("a status appearing at two stages is ranked once, at its first stage", () => {
+  const yaml = renderWorkflow({}, [
+    { env: "dev", status: "in progress", rank: 1 },
+    { env: "staging", status: "in progress", rank: 2 },
+  ]);
+  assert.equal((yaml.match(/'in progress'\) rank=/g) ?? []).length, 1, "no duplicate case arm");
+  assert.match(yaml, /'in progress'\) rank=1/, "the earliest rank wins");
+});
+
+test("the status is passed through jq, so a quote in it cannot break the payload", () => {
+  const yaml = renderWorkflow({}, [{ env: "dev", status: `it's "done"`, rank: 1 }]);
+  assert.match(yaml, /jq -nc --arg s "\$want"/);
+  assert.doesNotMatch(yaml, /-d '\{"status"/, "never a hand-built JSON literal");
 });
 
 test("configured to-do statuses become the shell case arms", () => {
-  const yaml = renderWorkflow({ todoStatuses: ["to do", "icebox"] });
+  const yaml = renderWorkflow({ todoStatuses: ["to do", "icebox"] }, ONE);
   assert.match(yaml, /'to do'\|'icebox'/);
 });
 
 test("a status containing a quote cannot break out of the shell literal", () => {
-  const yaml = renderWorkflow({ todoStatuses: ["it's ready"] });
+  const yaml = renderWorkflow({ todoStatuses: ["it's ready"] }, ONE);
   assert.match(yaml, /'it'\\''s ready'/);
 });
 
 test("the task id prefix is carried into the extraction step", () => {
-  assert.match(renderWorkflow({ taskIdPrefix: "TASK-" }), /-v p='TASK-'/);
+  assert.match(renderWorkflow({ taskIdPrefix: "TASK-" }, ONE), /-v p='TASK-'/);
 });
 
 test("a custom secret name is what the workflow reads, matching what the CLI sets", () => {
-  const yaml = renderWorkflow({ secretName: "CU_API_TOKEN" });
+  const yaml = renderWorkflow({ secretName: "CU_API_TOKEN" }, ONE);
   assert.match(yaml, /CLICKUP_TOKEN: \$\{\{ secrets\.CU_API_TOKEN \}\}/);
   assert.doesNotMatch(yaml, /secrets\.CLICKUP_TOKEN/);
 });
 
 test("the dispatch test path simulates a merge but a closed-unmerged PR still cannot", () => {
-  const yaml = renderWorkflow({});
+  const yaml = renderWorkflow({}, ONE);
   assert.match(yaml, /workflow_dispatch:/);
   assert.match(yaml, /github\.event_name == 'workflow_dispatch' \|\| github\.event\.pull_request\.merged == true/);
   assert.match(yaml, /github\.event\.pull_request\.head\.ref \|\| inputs\.head_ref/);
@@ -193,55 +243,54 @@ test("an unknown provider is refused by name", () => {
 // --- the Jira workflow -------------------------------------------------------------
 
 test("the Jira workflow follows the scope-check credential conventions", () => {
-  const yaml = renderJiraWorkflow({});
+  const yaml = renderJiraWorkflow({}, ONE);
   assert.match(yaml, /JIRA_BASE_URL: \$\{\{ vars\.JIRA_BASE_URL \}\}/);
   assert.match(yaml, /JIRA_EMAIL: \$\{\{ vars\.JIRA_EMAIL \}\}/);
   assert.match(yaml, /JIRA_API_TOKEN: \$\{\{ secrets\.JIRA_API_TOKEN \}\}/);
 });
 
 test("the Jira workflow guards the merge event exactly like the ClickUp one", () => {
-  const yaml = renderJiraWorkflow({});
+  const yaml = renderJiraWorkflow({}, ONE);
   assert.match(yaml, /github\.event_name == 'workflow_dispatch' \|\| github\.event\.pull_request\.merged == true/);
   assert.match(yaml, /workflow_dispatch:/);
 });
 
 test("the Jira workflow looks the transition up by name rather than baking in an id", () => {
-  const yaml = renderJiraWorkflow({ targetStatus: "In Progress" });
+  const yaml = renderJiraWorkflow({ targetStatus: "In Progress" }, ONE);
   assert.match(yaml, /\/transitions/);
   assert.match(yaml, /'in progress'/);
   assert.ok(!yaml.includes('"id":"2'), "no hard-coded transition id");
 });
 
 test("the Jira workflow never interpolates a credential into the YAML", () => {
-  const yaml = renderJiraWorkflow({ secretName: "JIRA_API_TOKEN" });
+  const yaml = renderJiraWorkflow({ secretName: "JIRA_API_TOKEN" }, ONE);
   assert.ok(!/ATATT/.test(yaml));
   assert.match(yaml, /-u "\$JIRA_EMAIL:\$JIRA_API_TOKEN"/);
 });
 
 test("renderWorkflow dispatches on provider", () => {
-  assert.match(renderWorkflow({ provider: "jira" }), /Jira issue sync/);
-  assert.match(renderWorkflow({ provider: "clickup" }), /ClickUp task sync/);
-  assert.match(renderWorkflow({}), /ClickUp task sync/);
+  assert.match(renderWorkflow({ provider: "jira" }, ONE), /Jira issue sync/);
+  assert.match(renderWorkflow({ provider: "clickup" }, ONE), /ClickUp task sync/);
+  assert.match(renderWorkflow({}, ONE), /ClickUp task sync/);
 });
 
 /**
- * Byte-stability: a repo synced before providers existed must plan
- * `unchanged` for its committed clickup-sync.yml, not `update`.
+ * The provider split must not change what a given pipeline renders: dispatching
+ * through renderWorkflow and calling the ClickUp renderer directly have to
+ * agree, or a provider-aware plan would differ from a direct one.
+ *
+ * (Byte-stability against the PRE-pipeline workflow is deliberately not
+ * claimed: multi-environment support changed the file on purpose, so already
+ * synced repos correctly plan an UPDATE.)
  */
-test("the ClickUp workflow is byte-identical for the bundled config shape", () => {
-  const bundled = {
-    enabled: true,
-    provider: "clickup",
-    targetBranch: "dev",
-    taskIdPrefix: "CU-",
-    todoStatuses: ["to do", "todo", "open", "backlog", "pending"],
-    targetStatus: "in progress",
-    secretName: "CLICKUP_TOKEN",
-  };
-  const viaProvider = renderWorkflow(normalizeTaskSync({ taskSync: bundled }));
-  const direct = renderClickUpWorkflow(bundled);
-  assert.equal(viaProvider, direct);
-  assert.match(viaProvider, /name: ClickUp task sync/);
+test("renderWorkflow and the direct ClickUp renderer agree for the same pipeline", () => {
+  const bundled = { provider: "clickup", taskIdPrefix: "CU-", secretName: "CLICKUP_TOKEN" };
+  const pipeline = [
+    { env: "dev", status: "in progress", rank: 1 },
+    { env: "prod", status: "done", rank: 2 },
+  ];
+  assert.equal(renderWorkflow(bundled, pipeline), renderClickUpWorkflow(bundled, pipeline));
+  assert.match(renderWorkflow(bundled, pipeline), /name: ClickUp task sync/);
 });
 
 // --- orphaned workflows after a provider switch --------------------------------
@@ -291,8 +340,8 @@ test("the active provider's own workflow is never an orphan", async () => {
 });
 
 test("both rendered workflows actually carry the ownership marker", () => {
-  assert.ok(renderClickUpWorkflow({}).startsWith(GENERATED_MARKER));
-  assert.ok(renderJiraWorkflow({}).startsWith(GENERATED_MARKER));
+  assert.ok(renderClickUpWorkflow({}, ONE).startsWith(GENERATED_MARKER));
+  assert.ok(renderJiraWorkflow({}, ONE).startsWith(GENERATED_MARKER));
 });
 
 test("removing an orphan passes the sha the delete API requires", async () => {
@@ -304,5 +353,199 @@ test("removing an orphan passes the sha the delete API requires", async () => {
 });
 
 test("a lowercase branch key is uppercased before it reaches the Jira API", () => {
-  assert.match(renderJiraWorkflow({}), /tr '\[:lower:\]' '\[:upper:\]'/);
+  assert.match(renderJiraWorkflow({}, ONE), /tr '\[:lower:\]' '\[:upper:\]'/);
+});
+
+// --- statusPipeline: order comes from the environment order ----------------------
+
+const CFG = (envs, taskSync = {}) => ({
+  environments: Object.fromEntries(envs.map((e) => [e, {}])),
+  taskSync: { enabled: true, ...taskSync },
+});
+
+test("environments map to their configured statuses, in declaration order", () => {
+  const cfg = CFG(["dev", "test", "prod"], {
+    environmentStatuses: { dev: "in progress", test: "QA", prod: "done" },
+  });
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "dev", status: "in progress", rank: 1 },
+    { env: "test", status: "QA", rank: 2 },
+    { env: "prod", status: "done", rank: 3 },
+  ]);
+});
+
+/** The point of the feature: a new environment needs no extra configuration. */
+test("an environment with no configured status maps to its own name", () => {
+  const cfg = CFG(["dev", "staging"], { environmentStatuses: { dev: "in progress" } });
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "dev", status: "in progress", rank: 1 },
+    { env: "staging", status: "staging", rank: 2 },
+  ]);
+});
+
+test("an environment can opt out of task sync with null", () => {
+  const cfg = CFG(["dev", "test", "prod"], { environmentStatuses: { test: null } });
+  assert.deepEqual(
+    statusPipeline(cfg, normalizeTaskSync(cfg)).map((s) => s.env),
+    ["dev", "prod"],
+  );
+});
+
+test("the legacy single-branch config becomes a one-stage pipeline", () => {
+  const cfg = { environments: { dev: {} }, clickup: { enabled: true, targetBranch: "dev", targetStatus: "doing" } };
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "dev", status: "doing", rank: 1 },
+  ]);
+});
+
+test("a legacy target branch that is not a declared environment still gets a stage", () => {
+  const cfg = { environments: {}, clickup: { enabled: true, targetBranch: "develop" } };
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "develop", status: "in progress", rank: 1 },
+  ]);
+});
+
+// --- forwards-only across the whole pipeline ------------------------------------
+
+const STAGE = (target, rank) => ({ pipeline: PIPELINE, target, targetRank: rank });
+
+test("a to-do task advances to whichever stage it arrives at", () => {
+  assert.equal(decideTransition("to do", STAGE("in progress", 1)).move, true);
+  assert.equal(decideTransition("backlog", STAGE("QA", 2)).move, true);
+  assert.equal(decideTransition("to do", STAGE("done", 3)).move, true);
+});
+
+test("a task mid-pipeline advances only forwards", () => {
+  // in progress (1) → QA (2) is forward
+  assert.equal(decideTransition("in progress", STAGE("QA", 2)).move, true);
+  // QA (2) → in progress (1) would be backwards
+  const back = decideTransition("QA", STAGE("in progress", 1));
+  assert.equal(back.move, false);
+  assert.match(back.reason, /already at or past/);
+});
+
+/** Merging an old branch into dev must never resurrect a finished task. */
+test("a done task is never pulled back by a later merge into an earlier stage", () => {
+  for (const [target, rank] of [["in progress", 1], ["QA", 2], ["done", 3]]) {
+    assert.equal(decideTransition("done", STAGE(target, rank)).move, false, `done → ${target}`);
+  }
+});
+
+test("a status outside the pipeline is left alone rather than guessed at", () => {
+  const result = decideTransition("blocked", STAGE("QA", 2));
+  assert.equal(result.move, false);
+  assert.match(result.reason, /not in the configured pipeline/);
+});
+
+test("status matching ignores case", () => {
+  assert.equal(decideTransition("IN PROGRESS", STAGE("QA", 2)).move, true);
+  assert.equal(decideTransition("Done", STAGE("QA", 2)).move, false);
+});
+
+/**
+ * environmentStatuses is a lookup table, not a stage list: a status declared
+ * for an environment the repository does not have must not create a stage, or
+ * the workflow would trigger on branches nobody manages.
+ */
+test("a status declared for an undeclared environment creates no stage", () => {
+  const cfg = CFG(["dev"], { environmentStatuses: { dev: "in progress", test: "QA", prod: "done" } });
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "dev", status: "in progress", rank: 1 },
+  ]);
+});
+
+test("adding that environment is what brings its stage in", () => {
+  const cfg = CFG(["dev", "test"], { environmentStatuses: { dev: "in progress", test: "QA", prod: "done" } });
+  assert.deepEqual(
+    statusPipeline(cfg, normalizeTaskSync(cfg)).map((s) => `${s.env}→${s.status}`),
+    ["dev→in progress", "test→QA"],
+  );
+});
+
+// --- regressions from the pipeline review ---------------------------------------
+
+/**
+ * The shape the CLI writes on a first sync carries no environmentStatuses at
+ * all. Falling through to "status named after the environment" gave dev→'dev',
+ * a status no workspace has, so every merge failed the job.
+ */
+test("conventional environments keep their meaning with no statuses configured", () => {
+  const cfg = CFG(["dev", "test", "prod", "staging"], {});
+  assert.deepEqual(
+    statusPipeline(cfg, normalizeTaskSync(cfg)).map((s) => `${s.env}→${s.status}`),
+    ["dev→in progress", "test→QA", "prod→done", "staging→staging"],
+  );
+});
+
+test("an explicit status still overrides the conventional default", () => {
+  const cfg = CFG(["dev"], { environmentStatuses: { dev: "doing" } });
+  assert.equal(statusPipeline(cfg, normalizeTaskSync(cfg))[0].status, "doing");
+});
+
+/** Upgrading a legacy config must not start syncing environments it never did. */
+test("a legacy single-branch config stays a single stage even with other environments", () => {
+  const cfg = {
+    environments: { dev: {}, test: {}, prod: {} },
+    clickup: { enabled: true, targetBranch: "dev", targetStatus: "in progress" },
+  };
+  assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
+    { env: "dev", status: "in progress", rank: 1 },
+  ]);
+});
+
+test("a pipeline with no stages renders nothing rather than inventing dev", () => {
+  assert.throws(() => renderWorkflow({}, []), /no pipeline stages/);
+  assert.throws(() => renderJiraWorkflow({}, []), /no pipeline stages/);
+});
+
+test("opting every environment out plans no workflow at all", async () => {
+  const cfg = CFG(["dev"], { environmentStatuses: { dev: null } });
+  const client = { getFile: async () => null, hasSecret: async () => true, hasVariable: async () => true };
+  assert.equal(await planTaskSync(client, cfg), null);
+});
+
+test("an empty status is an opt-out, not a stage matching an unreadable status", () => {
+  const cfg = CFG(["dev", "prod"], { environmentStatuses: { dev: "", prod: "done" } });
+  assert.deepEqual(
+    statusPipeline(cfg, normalizeTaskSync(cfg)).map((s) => s.env),
+    ["prod"],
+  );
+});
+
+test("an empty todo list emits no case arm rather than invalid bash", () => {
+  const yaml = renderWorkflow({ todoStatuses: [] }, ONE);
+  assert.doesNotMatch(yaml, /^\s*\) rank=0/m, "a patternless arm is a bash syntax error");
+});
+
+test("arriving at a status the task already holds is a no-op, not a write", () => {
+  const shared = [
+    { env: "dev", status: "in progress", rank: 1 },
+    { env: "test", status: "in progress", rank: 2 },
+  ];
+  // JS model
+  const result = decideTransition("in progress", { pipeline: shared, target: "in progress", targetRank: 2 });
+  assert.equal(result.move, false);
+  assert.match(result.reason, /already/);
+  // and the generated shell short-circuits the same way
+  assert.match(renderWorkflow({}, shared), /\[ "\$lower" = "\$want_lower" \]/);
+});
+
+test("a target outside the pipeline is refused rather than treated as stage one", () => {
+  const result = decideTransition("to do", { pipeline: PIPELINE, target: "released" });
+  assert.equal(result.move, false);
+  assert.match(result.reason, /not a stage in the configured pipeline/);
+});
+
+test("environment names and statuses are YAML-quoted so they cannot change type", () => {
+  const yaml = renderWorkflow({}, [{ env: "no", status: "QA", rank: 1 }]);
+  assert.match(yaml, /      - 'no'/, "unquoted, YAML reads 'no' as false");
+});
+
+test("the generated shell trims the status, matching the JS model", () => {
+  assert.match(renderWorkflow({}, ONE), /sed 's\/\^\[\[:space:\]\]\*\/\/;s\/\[\[:space:\]\]\*\$\/\//);
+});
+
+test("the dispatch base_ref defaults to the first stage, so old invocations still work", () => {
+  const yaml = renderWorkflow({}, PIPELINE);
+  assert.match(yaml, /required: false\n        default: 'dev'/);
 });

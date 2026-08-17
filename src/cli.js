@@ -28,6 +28,7 @@ import {
   knownEnvironments,
   approvalsAvailable,
   assertTeamSlugs,
+  assertEnvironmentNames,
 } from "./compiler.js";
 import { createClient, GitHubError } from "./github.js";
 import { plan, apply, isBlockingMerges } from "./sync.js";
@@ -351,7 +352,7 @@ async function main() {
       syncSection.enabled = true;
       syncSection.provider = chosenProvider;
     } else {
-      config.taskSync = { enabled: true, provider: chosenProvider, targetBranch: "dev" };
+      config.taskSync = { enabled: true, provider: chosenProvider };
     }
     // The documented shape is `taskSync`; a legacy `clickup` section being
     // rewritten anyway is renamed rather than persisted with, say, a Jira
@@ -396,6 +397,7 @@ async function main() {
   const teamSlugs = {};
   const teamSizes = {};
   const teamsToCreate = [];
+  assertEnvironmentNames(config);
   assertTeamSlugs(referencedTeams(config));
   if (context.ownerType === "Organization") {
     for (const team of referencedTeams(config)) {
@@ -497,6 +499,9 @@ async function main() {
             action: sync.action,
             hasToken: sync.hasToken,
             missingVariables: sync.missingVariables,
+            // The pipeline is the whole subject of a task-sync change; a JSON
+            // consumer approving an update must be able to see it.
+            pipeline: sync.pipeline,
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
           teamsToCreate,
@@ -634,8 +639,9 @@ async function main() {
 
   if (sync) {
     console.log(
-      `\n  ${ICON[sync.action]}  ${sync.path.padEnd(30)} → on merge into ` +
-        `${sync.targetBranch}, move the ${sync.providerLabel} task to '${sync.targetStatus}'`,
+      `\n  ${ICON[sync.action]}  ${sync.path.padEnd(30)} → ${sync.providerLabel} pipeline:` +
+        `\n${sync.pipeline.map((st) => `${" ".repeat(13)} merge into ${st.env} → '${st.status}'`).join("\n")}` +
+        `\n${" ".repeat(13)} (forwards only — a task at or past a stage is never pulled back)`,
     );
     if (sync.provider === "jira" && config.branchNaming && (config.branchNaming.taskIdPrefix ?? "CU-") === "CU-") {
       console.log(

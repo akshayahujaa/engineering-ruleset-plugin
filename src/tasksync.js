@@ -13,6 +13,15 @@
 /** ClickUp's own default to-do status, plus the spellings teams commonly use. */
 export const DEFAULT_TODO_STATUSES = ["to do", "todo", "open", "backlog", "pending"];
 
+/**
+ * What the conventional environments mean in a tracker, when the config does
+ * not say. Without these, an unlisted `dev` would map to a status literally
+ * called "dev" — which no workspace has, so every merge would fail. Any other
+ * environment name still falls back to itself, which is what makes a new
+ * `staging` work with no configuration at all.
+ */
+export const DEFAULT_ENVIRONMENT_STATUSES = { dev: "in progress", test: "QA", prod: "done" };
+
 export const PROVIDERS = {
   clickup: {
     label: "ClickUp",
@@ -53,12 +62,60 @@ export function normalizeTaskSync(config) {
 
   return {
     provider,
-    targetBranch: raw.targetBranch ?? "dev",
     taskIdPrefix: raw.taskIdPrefix ?? known.taskIdPrefix,
     todoStatuses: raw.todoStatuses ?? DEFAULT_TODO_STATUSES,
-    targetStatus: raw.targetStatus ?? "in progress",
+    // Per-environment target statuses. The legacy single-branch form
+    // (targetBranch + targetStatus) maps onto exactly one stage.
+    environmentStatuses:
+      raw.environmentStatuses ??
+      (raw.targetBranch ? { [raw.targetBranch]: raw.targetStatus ?? "in progress" } : undefined),
+    // Only set for the legacy single-branch form, whose branch may not be a
+    // declared environment at all. An explicit environmentStatuses map is a
+    // lookup table, not a list of stages — a status declared there for an
+    // environment the repo does not have must not become one.
+    legacyBranch: raw.environmentStatuses ? undefined : raw.targetBranch,
     secretName: raw.secretName ?? known.secretName,
   };
+}
+
+/**
+ * The ordered pipeline a task walks as its branch is merged onward.
+ *
+ * Order comes from the order of `environments` in the config — that IS the
+ * delivery pipeline — and each stage carries the tracker status to move to.
+ * A status is taken from `environmentStatuses`, falling back to the
+ * environment's own name, so a newly added `staging` maps to a `staging`
+ * status without any extra configuration. An explicit `null` opts an
+ * environment out of task sync entirely.
+ *
+ * Rank is what makes "never drag a task backwards" work with more than one
+ * target: every to-do status sits at rank 0, and a merge only advances a task
+ * whose current rank is strictly lower than the stage it is arriving at.
+ *
+ * @returns {Array<{env: string, status: string, rank: number}>}
+ */
+export function statusPipeline(config, sync) {
+  // The legacy single-branch form synced exactly one branch. Upgrading must
+  // not quietly start moving tasks on merges into other environments.
+  if (sync?.legacyBranch) {
+    const status = sync.environmentStatuses?.[sync.legacyBranch] ?? "in progress";
+    if (status === null || status === false || status === "") return [];
+    return [{ env: sync.legacyBranch, status: String(status), rank: 1 }];
+  }
+
+  const explicit = sync?.environmentStatuses;
+  const stages = [];
+
+  for (const env of Object.keys(config?.environments ?? {})) {
+    const status =
+      explicit && Object.hasOwn(explicit, env) ? explicit[env] : DEFAULT_ENVIRONMENT_STATUSES[env] ?? env;
+    // null/false is the documented opt-out; "" would otherwise become a stage
+    // that matches an unreadable tracker status.
+    if (status === null || status === false || status === "") continue;
+    stages.push({ env, status: String(status), rank: stages.length + 1 });
+  }
+
+  return stages;
 }
 
 /**
@@ -91,17 +148,43 @@ export function extractTaskId(branchName, { prefixes = [], taskIdPrefix = "CU-" 
  * is left alone — a later merge must never drag a task backwards, which is the
  * failure mode that makes people distrust this kind of automation.
  */
-export function decideTransition(currentStatus, { todoStatuses = DEFAULT_TODO_STATUSES, target = "in progress" } = {}) {
+export function decideTransition(
+  currentStatus,
+  { todoStatuses = DEFAULT_TODO_STATUSES, target = "in progress", pipeline = [], targetRank } = {},
+) {
   const current = String(currentStatus ?? "").trim().toLowerCase();
-
   if (!current) return { move: false, reason: "the task has no readable status" };
-  if (current === target.toLowerCase()) return { move: false, reason: `already '${currentStatus}'` };
 
-  if (!todoStatuses.map((s) => s.toLowerCase()).includes(current)) {
-    return { move: false, reason: `status '${currentStatus}' is past to-do; leaving it alone` };
+  const stages = pipeline.length > 0 ? pipeline : [{ status: target, rank: 1 }];
+  const wantRank = targetRank ?? stages.find((s) => s.status.toLowerCase() === target.toLowerCase())?.rank;
+
+  // Treating an unlocatable target as the first stage would advance tasks to a
+  // status the pipeline does not contain, and report nonsense about the rest.
+  if (wantRank === undefined) {
+    return { move: false, reason: `target '${target}' is not a stage in the configured pipeline` };
+  }
+  // Two stages can share a status; arriving at one the task already holds is a
+  // no-op, not a forward move. Writing it anyway makes Jira fail on a
+  // self-transition that usually does not exist.
+  if (current === target.toLowerCase()) {
+    return { move: false, reason: `already '${currentStatus}'` };
   }
 
-  return { move: true, target, reason: `'${currentStatus}' is a to-do status` };
+  // Rank 0 is everything before the pipeline starts.
+  const currentRank = todoStatuses.map((s) => s.toLowerCase()).includes(current)
+    ? 0
+    : stages.find((s) => s.status.toLowerCase() === current)?.rank;
+
+  // A status nobody declared could be anywhere in the workflow — including
+  // past the end. Guessing risks dragging a task backwards, so it is left be.
+  if (currentRank === undefined) {
+    return { move: false, reason: `status '${currentStatus}' is not in the configured pipeline; leaving it alone` };
+  }
+  if (currentRank >= wantRank) {
+    return { move: false, reason: `'${currentStatus}' is already at or past '${target}'` };
+  }
+
+  return { move: true, target, reason: `'${currentStatus}' comes before '${target}'` };
 }
 
 /** The first line of every rendered workflow — the ownership marker. */
@@ -111,35 +194,89 @@ export const GENERATED_MARKER = "# Generated by engineering-ruleset-plugin";
 const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
 
 /**
- * Renders the ClickUp workflow. Byte-stable for existing configs: a repo
- * synced before providers existed must plan `unchanged`, not `update`.
+ * Single-quoted YAML scalar. Unquoted, an environment called `no`, `on` or
+ * `2` is parsed as a boolean or a number and stops naming its branch, and a
+ * `#`, `*`, `&` or quote breaks the document outright.
  */
-export function renderClickUpWorkflow(sync = {}) {
-  const branch = sync.targetBranch ?? "dev";
+const yamlQuote = (value) => `'${String(value).replace(/'/g, "''")}'`;
+
+/** One-line, comment-safe: a newline in a name would split the YAML block. */
+const commentSafe = (value) => String(value).replace(/\s+/g, " ").trim();
+
+
+/** `dev) want='in progress'; want_rank=1 ;;` — one arm per pipeline stage. */
+function branchCases(pipeline) {
+  return pipeline
+    .map((st) => `            ${shellQuote(st.env)}) want=${shellQuote(st.status)}; want_rank=${st.rank} ;;`)
+    .join("\n");
+}
+
+/**
+ * Ranks the task's CURRENT status. To-do spellings are rank 0; each pipeline
+ * status takes its own rank; anything else stays unranked so the task is left
+ * alone rather than risked backwards.
+ */
+function statusCases(pipeline, todo) {
+  const seen = new Set();
+  // An empty list must emit no arm at all: `) rank=0 ;;` is a bash syntax error
+  // that only surfaces when the workflow runs, on every merge.
+  const arms = todo.length
+    ? [`            ${todo.map((t) => shellQuote(String(t).toLowerCase())).join("|")}) rank=0 ;;`]
+    : [];
+  for (const st of pipeline) {
+    const key = st.status.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    arms.push(`            ${shellQuote(key)}) rank=${st.rank} ;;`);
+  }
+  arms.push("            *) rank=-1 ;;");
+  return arms.join("\n");
+}
+
+/**
+ * Renders the ClickUp workflow.
+ *
+ * It fires on a merge into ANY pipeline environment and moves the task to that
+ * environment's status — but only forwards: a task whose current status already
+ * ranks at or past the arriving stage is left alone, so merging an old branch
+ * into dev can never pull a finished task back to "in progress".
+ */
+export function renderClickUpWorkflow(sync = {}, pipeline = []) {
   const idPrefix = sync.taskIdPrefix ?? "CU-";
-  const target = sync.targetStatus ?? "in progress";
   const todo = sync.todoStatuses ?? DEFAULT_TODO_STATUSES;
   // Must match what planTaskSync checks and --set-token sets, or the
   // committed workflow would read a secret nobody ever wrote.
   const secretName = sync.secretName ?? "CLICKUP_TOKEN";
-
-  const cases = todo.map((s) => shellQuote(String(s).toLowerCase())).join("|");
+  // No invented default: a caller with no stages has nothing to sync, and
+  // fabricating `dev → in progress` here silently defeated the documented
+  // opt-out and rendered a workflow the plan never showed.
+  const stages = pipeline;
+  if (stages.length === 0) throw new Error("Cannot render a task-sync workflow with no pipeline stages.");
 
   return `# Generated by engineering-ruleset-plugin. Re-run the sync to update it;
 # local edits are overwritten.
+#
+# Pipeline (a merge only ever moves a task forwards):
+${stages.map((st) => `#   ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
 name: ClickUp task sync
 
 on:
   pull_request:
     types: [closed]
-    branches: [${branch}]
+    branches:
+${stages.map((st) => `      - ${yamlQuote(st.env)}`).join("\n")}
   # Manual test entry: simulates a merged branch without needing a real PR,
   # so the wiring (secret, id extraction, ClickUp auth) can be verified alone.
   workflow_dispatch:
     inputs:
       head_ref:
-        description: "Branch name to simulate, e.g. feature/${idPrefix}123/thing"
+        description: "Branch that was merged, e.g. feature/${idPrefix}123/thing"
         required: true
+        type: string
+      base_ref:
+        description: ${yamlQuote(`Environment merged into (${stages.map((st) => commentSafe(st.env)).join(", ")})`)}
+        required: false
+        default: ${yamlQuote(stages[0].env)}
         type: string
 
 permissions:
@@ -157,6 +294,7 @@ jobs:
           # Only needed when the workspace uses ClickUp Custom Task IDs.
           CLICKUP_TEAM_ID: \${{ secrets.CLICKUP_TEAM_ID }}
           HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref }}
+          BASE_REF: \${{ github.event.pull_request.base.ref || inputs.base_ref }}
         run: |
           set -euo pipefail
 
@@ -164,6 +302,13 @@ jobs:
             echo "::warning::CLICKUP_TOKEN is not set; skipping ClickUp sync."
             exit 0
           fi
+
+          # Which stage did this merge arrive at?
+          want=""; want_rank=0
+          case "$BASE_REF" in
+${branchCases(stages)}
+            *) echo "::warning::'$BASE_REF' is not a pipeline environment; nothing to sync."; exit 0 ;;
+          esac
 
           # Branches are <prefix>/${idPrefix}<id>[/description], enforced by the
           # branch-nomenclature ruleset.
@@ -183,25 +328,43 @@ jobs:
 
           status="$(curl -sS -f -H "Authorization: $CLICKUP_TOKEN" "$url" \\
             | jq -r '.status.status // empty')"
-          echo "Task $id is currently '\${status:-unknown}'."
+          echo "Task $id is '\${status:-unknown}'; merging into $BASE_REF wants '$want'."
 
-          lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')"
+          # Trimmed as well as lowered: the case patterns are exact literals,
+          # so a padded status would fall through to "not in the pipeline".
+          lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          want_lower="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+
+          # Two stages may share a status; arriving at one already held is a
+          # no-op. Jira has no self-transition, so writing it would fail the job.
+          if [ "$lower" = "$want_lower" ]; then
+            echo "Already '$want'; nothing to do."
+            exit 0
+          fi
+
+          rank=-1
           case "$lower" in
-            ${cases})
-              ;;
-            *)
-              echo "Not a to-do status; leaving task $id untouched."
-              exit 0
-              ;;
+${statusCases(stages, todo)}
           esac
+
+          # An unranked status could be anywhere in the workflow, including past
+          # the end — guessing risks dragging the task backwards.
+          if [ "$rank" -lt 0 ]; then
+            echo "Status '\${status:-unknown}' is not in the configured pipeline; leaving task $id alone."
+            exit 0
+          fi
+          if [ "$rank" -ge "$want_rank" ]; then
+            echo "Task $id is already at or past '$want'; leaving it alone."
+            exit 0
+          fi
 
           curl -sS -f -X PUT \\
             -H "Authorization: $CLICKUP_TOKEN" \\
             -H "Content-Type: application/json" \\
-            -d ${shellQuote(JSON.stringify({ status: target }))} \\
+            -d "$(jq -nc --arg s "$want" '{status: $s}')" \\
             "$url" > /dev/null
 
-          echo "Task $id moved to '${target}'."
+          echo "Task $id moved to '$want'."
 `;
 }
 
@@ -216,32 +379,42 @@ jobs:
  * Auth follows the scope-check convention: JIRA_BASE_URL and JIRA_EMAIL as
  * repository variables (not sensitive), JIRA_API_TOKEN as a secret.
  */
-export function renderJiraWorkflow(sync = {}) {
-  const branch = sync.targetBranch ?? "dev";
+export function renderJiraWorkflow(sync = {}, pipeline = []) {
   const idPrefix = sync.taskIdPrefix ?? "";
-  const target = sync.targetStatus ?? "in progress";
   const todo = sync.todoStatuses ?? DEFAULT_TODO_STATUSES;
   const secretName = sync.secretName ?? "JIRA_API_TOKEN";
-
-  const cases = todo.map((s) => shellQuote(String(s).toLowerCase())).join("|");
+  // No invented default: a caller with no stages has nothing to sync, and
+  // fabricating `dev → in progress` here silently defeated the documented
+  // opt-out and rendered a workflow the plan never showed.
+  const stages = pipeline;
+  if (stages.length === 0) throw new Error("Cannot render a task-sync workflow with no pipeline stages.");
   const example = `${idPrefix}PROJ-123`;
 
   return `# Generated by engineering-ruleset-plugin. Re-run the sync to update it;
 # local edits are overwritten.
+#
+# Pipeline (a merge only ever moves an issue forwards):
+${stages.map((st) => `#   ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
 name: Jira issue sync
 
 on:
   pull_request:
     types: [closed]
-    branches: [${branch}]
+    branches:
+${stages.map((st) => `      - ${yamlQuote(st.env)}`).join("\n")}
   # Manual test entry: simulates a merged branch without needing a real PR,
   # so the wiring (variables, secret, key extraction, Jira auth) can be
   # verified alone.
   workflow_dispatch:
     inputs:
       head_ref:
-        description: "Branch name to simulate, e.g. feature/${example}/thing"
+        description: "Branch that was merged, e.g. feature/${example}/thing"
         required: true
+        type: string
+      base_ref:
+        description: ${yamlQuote(`Environment merged into (${stages.map((st) => commentSafe(st.env)).join(", ")})`)}
+        required: false
+        default: ${yamlQuote(stages[0].env)}
         type: string
 
 permissions:
@@ -259,6 +432,7 @@ jobs:
           JIRA_EMAIL: \${{ vars.JIRA_EMAIL }}
           JIRA_API_TOKEN: \${{ secrets.${secretName} }}
           HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref }}
+          BASE_REF: \${{ github.event.pull_request.base.ref || inputs.base_ref }}
         run: |
           set -euo pipefail
 
@@ -267,7 +441,13 @@ jobs:
             exit 0
           fi
           base="\${JIRA_BASE_URL%/}"
-          want=${shellQuote(target)}
+
+          # Which stage did this merge arrive at?
+          want=""; want_rank=0
+          case "$BASE_REF" in
+${branchCases(stages)}
+            *) echo "::warning::'$BASE_REF' is not a pipeline environment; nothing to sync."; exit 0 ;;
+          esac
 
           # Branches are <prefix>/${idPrefix}<KEY>[/description]; the key is the
           # standard Jira form PROJ-123.
@@ -284,23 +464,39 @@ jobs:
           status="$(curl -sS -f -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \\
             "$base/rest/api/3/issue/$key?fields=status" \\
             | jq -r '.fields.status.name // empty')"
-          echo "Issue $key is currently '\${status:-unknown}'."
+          echo "Issue $key is '\${status:-unknown}'; merging into $BASE_REF wants '$want'."
 
-          lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')"
+          # Trimmed as well as lowered: the case patterns are exact literals,
+          # so a padded status would fall through to "not in the pipeline".
+          lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          want_lower="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+
+          # Two stages may share a status; arriving at one already held is a
+          # no-op. Jira has no self-transition, so writing it would fail the job.
+          if [ "$lower" = "$want_lower" ]; then
+            echo "Already '$want'; nothing to do."
+            exit 0
+          fi
+
+          rank=-1
           case "$lower" in
-            ${cases})
-              ;;
-            *)
-              echo "Not a to-do status; leaving issue $key untouched."
-              exit 0
-              ;;
+${statusCases(stages, todo)}
           esac
+
+          if [ "$rank" -lt 0 ]; then
+            echo "Status '\${status:-unknown}' is not in the configured pipeline; leaving issue $key alone."
+            exit 0
+          fi
+          if [ "$rank" -ge "$want_rank" ]; then
+            echo "Issue $key is already at or past '$want'; leaving it alone."
+            exit 0
+          fi
 
           # Transition ids are per-project; find the one whose name (or target
           # status) matches at run time.
           transition="$(curl -sS -f -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \\
             "$base/rest/api/3/issue/$key/transitions" \\
-            | jq -r --arg t ${shellQuote(target.toLowerCase())} \\
+            | jq -r --arg t "$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')" \\
               '.transitions[] | select(((.name // "") | ascii_downcase) == $t or ((.to.name // "") | ascii_downcase) == $t) | .id' \\
             | head -1 || true)"
 
@@ -312,15 +508,17 @@ jobs:
           curl -sS -f -X POST \\
             -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \\
             -H "Content-Type: application/json" \\
-            -d "{\\"transition\\":{\\"id\\":\\"$transition\\"}}" \\
+            -d "$(jq -nc --arg id "$transition" '{transition: {id: $id}}')" \\
             "$base/rest/api/3/issue/$key/transitions" > /dev/null
 
           echo "Issue $key moved to '$want'."
 `;
 }
 
-export const renderWorkflow = (sync) =>
-  (sync?.provider ?? "clickup") === "jira" ? renderJiraWorkflow(sync) : renderClickUpWorkflow(sync);
+export const renderWorkflow = (sync, pipeline = []) =>
+  (sync?.provider ?? "clickup") === "jira"
+    ? renderJiraWorkflow(sync, pipeline)
+    : renderClickUpWorkflow(sync, pipeline);
 
 /**
  * Works out what the task-sync side of a sync would change. Read-only.
@@ -334,7 +532,12 @@ export async function planTaskSync(client, config) {
   if (!sync) return null;
 
   const known = PROVIDERS[sync.provider];
-  const desired = renderWorkflow(sync);
+  const pipeline = statusPipeline(config, sync);
+  // Every environment opted out, or none declared: there is nothing to sync,
+  // so no workflow is planned — and any existing one becomes an orphan and is
+  // removed, rather than being left running against a pipeline of nothing.
+  if (pipeline.length === 0) return null;
+  const desired = renderWorkflow(sync, pipeline);
   const existing = await client.getFile(known.workflowPath);
 
   const missingVariables = [];
@@ -353,8 +556,7 @@ export async function planTaskSync(client, config) {
     secretName: sync.secretName,
     missingVariables,
     tokenHint: known.tokenHint,
-    targetBranch: sync.targetBranch,
-    targetStatus: sync.targetStatus,
+    pipeline,
   };
 }
 

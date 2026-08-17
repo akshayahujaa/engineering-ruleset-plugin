@@ -86,9 +86,56 @@ have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
 When `taskSync.enabled` is set (a legacy `clickup` section still works), the sync also installs a
 tracker workflow in the target repo — `.github/workflows/clickup-sync.yml` or `jira-sync.yml`,
-by `taskSync.provider`. On a merged PR into `dev` it reads the task id from the branch name and
-moves the task to **in progress** — but only if it is still in a to-do status. A task already in
-progress, in review, or done is left alone, so a later merge can never drag it backwards.
+by `taskSync.provider`. It fires on a merged PR into **any** environment and moves the linked task
+to that environment's status.
+
+### The pipeline
+
+**Only declared environments are stages**, and the **order of `environments` is the pipeline
+order**. A stage's status comes from `taskSync.environmentStatuses`; where that is silent, `dev`,
+`test` and `prod` fall back to their conventional meanings and any other name falls back to
+itself:
+
+```jsonc
+"environments":  { "dev": {…}, "test": {…}, "prod": {…} },   // ← this order is the pipeline
+"taskSync": {
+  "environmentStatuses": { "dev": "in progress", "test": "QA", "prod": "done" }
+}
+```
+
+An entry for an environment that is not declared does nothing — the shipped config names all
+three, but a repo that has only `dev` gets a one-stage pipeline until it adds the others.
+
+```
+merge into dev   → in progress
+merge into test  → QA
+merge into prod  → done
+merge into staging → staging      (no entry needed: an env defaults to its own name)
+```
+
+Add `staging` and it becomes a stage automatically, with a `staging` status — the workflow is
+regenerated with the new trigger branch and the new mapping. Set an environment's status to
+`null` to keep it out of task sync entirely; if that leaves no stages at all, no workflow is
+installed and an existing one is removed.
+
+**Forwards only.** Each stage has a rank; every to-do spelling is rank 0. A merge advances a task
+only when its current status ranks *below* the arriving stage, so merging an old branch into `dev`
+can never pull a finished task back to *in progress*:
+
+```
+to do       → merge to test  → moves to QA
+in progress → merge to test  → moves to QA
+QA          → merge to dev   → left alone (already past 'in progress')
+done        → merge to prod  → left alone (already at 'done')
+blocked     → merge to test  → left alone (not in the pipeline — never guessed at)
+```
+
+A status the config never declares is deliberately left alone rather than ranked, because it could
+sit anywhere in the workflow — including past the end.
+
+Because rank follows the order of `environments`, an environment added later lands **last**. If
+your real pipeline puts it earlier (staging before prod, say), reorder `environments` in the
+config; the plan prints the resulting pipeline every run so the order is visible before you apply.
 
 On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, or
 none — on a terminal by the CLI itself, under the slash command via a widget, and `--provider`

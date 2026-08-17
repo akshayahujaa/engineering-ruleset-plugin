@@ -135,6 +135,18 @@ If the target repository commits its own `.github/ruleset-config.json`, `--env` 
 are refused alike — that policy can only change by a pull request to that repository. Relay the
 instruction as printed, and do not carry the refused flag onto further runs against that repo.
 
+## The task-sync pipeline
+
+The plan prints the full pipeline under the workflow line — one row per environment, e.g.
+`merge into test → 'QA'`. Show it: it is how the user checks the mapping and, importantly, the
+**order**. Rank follows the order of `environments` in the config, so an environment added later
+lands last; if that is wrong for their real pipeline (staging usually precedes prod), tell them to
+reorder `environments` in the config rather than hand-editing the workflow, which is regenerated.
+
+An environment with no entry in `taskSync.environmentStatuses` maps to a status of the same name.
+That is the intended default for a newly added environment — do not invent a mapping for it, and
+do not suggest editing the generated workflow directly.
+
 ## Task tracker credentials (ClickUp or Jira)
 
 When the plan includes a sync workflow (`clickup-sync.yml` or `jira-sync.yml`), applying commits

@@ -357,6 +357,22 @@ export function assertTeamSlugs(teams) {
   }
 }
 
+/**
+ * Environment names must not be integer-like. JS enumerates integer-like keys
+ * first, in numeric order, so an environment called `2` would silently become
+ * the first pipeline stage regardless of where it is written — breaking the
+ * "declaration order is the pipeline" rule the whole task sync rests on.
+ */
+export function assertEnvironmentNames(config) {
+  const numeric = Object.keys(config?.environments ?? {}).filter((n) => /^\d+$/.test(n));
+  if (numeric.length > 0) {
+    throw new Error(
+      `Environment names must not be numbers: ${numeric.join(", ")}. ` +
+        "They would jump to the front of the task-sync pipeline regardless of their position.",
+    );
+  }
+}
+
 export function referencedTeams(config) {
   const teams = [
     ...(config.baseline?.reviewerTeams ?? []),
