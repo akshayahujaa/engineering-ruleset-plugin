@@ -662,3 +662,148 @@ test("a team whose members all fail to join is not bound into the rule", () => {
   assert.match(stdout, /has no members, so it cannot supply the review it gates/);
   assert.equal(status, 1, "a membership that did not land is a partial failure, not a clean run");
 });
+
+// --- every credential the chosen provider needs, surfaced at once ----------------
+
+/**
+ * Picking a tracker turns on more than the tracker: the scope check reads the
+ * ticket from it, and both PR checks call an AI provider. All of those secrets
+ * are required from that moment, so all of them are reported together — the AI
+ * key used to be reachable only via a `statusCheckSecrets` entry, which meant a
+ * repo could adopt PR-Agent and never be told what it needs to run.
+ */
+test("choosing a provider reports the AI key as well as the tracker token", () => {
+  const { plan } = run({ ...baseFixture(), ...override(WITH_PR_CHECKS) });
+
+  assert.deepEqual(plan.missingStatusCheckSecrets, ["OPENROUTER_API_KEY"]);
+  assert.equal(plan.taskSync.hasToken, false, "the tracker token has its own field");
+});
+
+test("the tracker's own credentials are not also listed as check secrets", () => {
+  const { plan } = run({ ...baseFixture(), ...override(WITH_PR_CHECKS) });
+
+  assert.ok(
+    !plan.missingStatusCheckSecrets.includes("CLICKUP_TOKEN"),
+    "reported once, via taskSync.hasToken — not twice",
+  );
+});
+
+test("Jira's variables are reported as variables, and only by the tracker", () => {
+  const jira = { ...WITH_PR_CHECKS, taskSync: { enabled: true, provider: "jira" } };
+  const { plan } = run({ ...baseFixture(), ...override(jira) });
+
+  assert.deepEqual(plan.taskSync.missingVariables, ["JIRA_BASE_URL", "JIRA_EMAIL"]);
+  assert.deepEqual(plan.missingCheckVariables, [], "not repeated under the checks");
+  assert.ok(!plan.missingStatusCheckSecrets.includes("JIRA_API_TOKEN"));
+});
+
+test("an AI key already set is not reported as missing", () => {
+  const { plan } = run({
+    ...baseFixture(),
+    ...override(WITH_PR_CHECKS),
+    [`GET repos/${REPO}/actions/secrets/OPENROUTER_API_KEY`]: { name: "OPENROUTER_API_KEY" },
+  });
+  assert.deepEqual(plan.missingStatusCheckSecrets, []);
+});
+
+test("the plan prints the command for a secret a generated check needs", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_PR_CHECKS) }, []);
+
+  assert.match(stdout, /The 'OPENROUTER_API_KEY' secret is required by a pull-request check/);
+  assert.match(stdout, new RegExp(`gh secret set OPENROUTER_API_KEY --repo ${REPO}`));
+});
+
+/**
+ * A secret wanted by a required status check AND by a generated workflow takes
+ * the status check's wording: that is the stronger claim, since a required check
+ * that cannot run blocks merges rather than merely skipping a review.
+ */
+test("a status check's wording wins when two things need one secret", () => {
+  const both = {
+    ...WITH_PR_CHECKS,
+    baseline: { ...WITH_PR_CHECKS.baseline, statusCheckSecrets: ["OPENROUTER_API_KEY"] },
+  };
+  const { stdout } = run({ ...baseFixture(), ...override(both) }, []);
+
+  assert.match(stdout, /The 'OPENROUTER_API_KEY' secret is required for a configured status check/);
+});
+
+// --- the scope check follows the environments ------------------------------------
+
+test("a baseline status check is required on every environment, added ones included", () => {
+  const withBaselineCheck = {
+    ...WITH_PR_CHECKS,
+    baseline: { ...WITH_PR_CHECKS.baseline, statusChecks: ["scope-check"], statusCheckRuleset: "PR-SCOPE-CHECK" },
+  };
+  const { plan } = run({ ...baseFixture(), ...override(withBaselineCheck) });
+  const scope = plan.steps.find((s) => s.name === "PR-SCOPE-CHECK");
+
+  assert.deepEqual(scope.payload.conditions.ref_name.include, ["refs/heads/dev", "refs/heads/prod"]);
+  // The workflow that reports it triggers on the same list, from the same source.
+  const workflow = plan.prChecks.files.find((f) => f.path.endsWith("pr-scope-check.yml"));
+  assert.equal(workflow.action, "create");
+});
+
+/**
+ * With no tracker the scope-check workflow cannot be generated, so requiring
+ * `scope-check` would block every merge into every environment on a check
+ * nothing reports. The requirement is dropped and said out loud instead.
+ */
+test("a required scope check with no tracker to read is dropped, not left blocking", () => {
+  const noTracker = {
+    ...WITH_PR_CHECKS,
+    taskSync: { enabled: false },
+    baseline: { ...WITH_PR_CHECKS.baseline, statusChecks: ["scope-check"], statusCheckRuleset: "PR-SCOPE-CHECK" },
+  };
+  const { plan, stdout } = run({ ...baseFixture(), ...override(noTracker) });
+
+  assert.equal(plan.steps.find((s) => s.name === "PR-SCOPE-CHECK"), undefined);
+  assert.ok(
+    plan.degradations.some((d) => d.dropped === "required_status_checks" && d.check === "scope-check"),
+  );
+  assert.match(plan.prChecks.blocked[0].reason, /taskSync is off/);
+
+  const { stdout: human } = run({ ...baseFixture(), ...override(noTracker) }, []);
+  assert.match(human, /SKIPPED\s+PR-SCOPE-CHECK/);
+  assert.ok(stdout.length > 0);
+});
+
+// --- the push stage in the plan --------------------------------------------------
+
+const WITH_PUSH_SYNC = {
+  ...MINIMAL,
+  taskSync: {
+    enabled: true,
+    provider: "clickup",
+    branchPushStatus: "in progress",
+    environmentStatuses: { dev: "dev" },
+  },
+};
+
+test("the push stage is planned at rank 1, ahead of every environment", () => {
+  const { plan } = run({ ...baseFixture(), ...override(WITH_PUSH_SYNC) });
+
+  assert.deepEqual(plan.taskSync.push, {
+    status: "in progress",
+    rank: 1,
+    prefixes: ["feature"],
+  });
+  assert.deepEqual(plan.taskSync.pipeline, [{ env: "dev", status: "dev", rank: 2 }]);
+});
+
+test("the plan prints the push stage before the merge stages", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_PUSH_SYNC) }, []);
+
+  const push = stdout.indexOf("push feature/** → 'in progress'");
+  const merge = stdout.indexOf("merge into dev → 'dev'");
+  assert.ok(push > -1, "the push stage is shown");
+  assert.ok(merge > push, "and it is shown first, being rank 1");
+});
+
+test("a push stage with nothing to match is reported in the plan", () => {
+  const blocked = { ...WITH_PUSH_SYNC, branchNaming: { ...MINIMAL.branchNaming, allowedPrefixes: [] } };
+  const { plan, stdout } = run({ ...baseFixture(), ...override(blocked) }, []);
+
+  assert.equal(plan, null, "human output, not --json");
+  assert.match(stdout, /no push stage: branchNaming\.allowedPrefixes is empty/);
+});

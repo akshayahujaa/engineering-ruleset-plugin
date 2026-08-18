@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { globToRegExp } from "../src/branches.js";
 import {
   compile,
   referencedTeams,
@@ -81,7 +82,7 @@ test("baseline covers the default branch and every declared environment", () => 
   );
 });
 
-test("dev's status check becomes its own ruleset scoped to dev", () => {
+test("the baseline status check covers the only environment there is, on a first sync", () => {
   const { rulesets } = compile(CANONICAL, PERSONAL);
   const scope = byName(rulesets, "PR-SCOPE-CHECK");
 
@@ -95,28 +96,54 @@ test("dev's status check becomes its own ruleset scoped to dev", () => {
   );
 });
 
-test("requiring a task id narrows each prefix to id-bearing branches", () => {
+test("requiring a task id and a description narrows each prefix to <prefix>/<id>/<description>", () => {
   const { rulesets } = compile(CANONICAL, PERSONAL);
   const naming = byName(rulesets, "Enforce Branch Nomenclature");
 
   assert.deepEqual(naming.conditions.ref_name.include, ["~ALL"]);
-  // Excluded refs are the permitted ones; a bare `feature/**/*` would let a
-  // branch through with no task to advance on merge.
+  // Excluded refs are the permitted ones. With no taskIdPrefix marking the id,
+  // the mandatory third segment is what a ref pattern can still insist on — a
+  // bare `feature/**/*` would let any two-word branch through.
   assert.deepEqual(naming.conditions.ref_name.exclude, [
     "refs/heads/dev",
     "refs/heads/main",
-    "refs/heads/feature/CU-*",
-    "refs/heads/feature/CU-*/**",
-    "refs/heads/bugfix/CU-*",
-    "refs/heads/bugfix/CU-*/**",
-    "refs/heads/hotfix/CU-*",
-    "refs/heads/hotfix/CU-*/**",
-    "refs/heads/docs/CU-*",
-    "refs/heads/docs/CU-*/**",
-    "refs/heads/chore/CU-*",
-    "refs/heads/chore/CU-*/**",
+    "refs/heads/feature/*/**",
+    "refs/heads/bugfix/*/**",
+    "refs/heads/hotfix/*/**",
+    "refs/heads/docs/*/**",
+    "refs/heads/chore/*/**",
   ]);
   assert.ok(naming.rules.some((r) => r.type === "creation"), "creation rule is what blocks bad names");
+});
+
+/**
+ * The shape the excludes really enforce, checked against the same matcher
+ * GitHub's patterns are read with — the deepEqual above proves the patterns,
+ * not what they let through.
+ */
+test("the permitted patterns admit feature/<id>/<description> and nothing shorter", () => {
+  const naming = byName(compile(CANONICAL, PERSONAL).rulesets, "Enforce Branch Nomenclature");
+  const permitted = (branch) =>
+    naming.conditions.ref_name.exclude.some((p) => globToRegExp(p).test(`refs/heads/${branch}`));
+
+  assert.ok(permitted("feature/86d3bzhgq/add-login"), "id plus description");
+  assert.ok(permitted("feature/PROJ-123/add-login"), "a Jira key is just as valid an id");
+  assert.ok(permitted("feature/86d3bzhgq/fix/retry"), "a description may itself contain slashes");
+  assert.ok(!permitted("feature/86d3bzhgq"), "an id with no description is refused");
+  assert.ok(!permitted("feature/add-login"), "two segments is refused however it is spelled");
+  assert.ok(!permitted("feature"), "the prefix alone is refused");
+});
+
+test("requireDescription off keeps the bare <prefix>/<id> form permitted", () => {
+  const relaxed = {
+    ...CANONICAL,
+    branchNaming: { ...CANONICAL.branchNaming, requireDescription: false },
+  };
+  const exclude = byName(compile(relaxed, PERSONAL).rulesets, "Enforce Branch Nomenclature").conditions
+    .ref_name.exclude;
+
+  assert.ok(exclude.includes("refs/heads/feature/*"), "the id-only form is permitted again");
+  assert.ok(exclude.includes("refs/heads/feature/*/**"), "and so is the described form");
 });
 
 // --- environment profiles ------------------------------------------------------
@@ -491,7 +518,10 @@ test("the task id prefix used by nomenclature is configurable", () => {
   };
   const naming = byName(compile(custom, PERSONAL).rulesets, "Enforce Branch Nomenclature");
 
-  assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*"));
+  // A prefix and a mandatory description compose: the id segment must start
+  // with TASK-, and something must still follow it.
+  assert.ok(naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*/**"));
+  assert.ok(!naming.conditions.ref_name.exclude.includes("refs/heads/feature/TASK-*"));
 });
 
 // --- satisfiability covers the TEAM requirement, not just the count ------------
@@ -628,4 +658,136 @@ test("secrets from multiple environments are collected and deduped", () => {
 test("no environments at all is not an error", () => {
   assert.deepEqual(requiredStatusCheckSecrets({}), []);
   assert.deepEqual(requiredStatusCheckSecrets(undefined), []);
+});
+
+// --- baseline status checks reach every environment, added ones included --------
+
+/**
+ * The gap this closes: the scope check used to be declared on `dev` alone, so
+ * `test`, `prod` and any name added later were the branches nobody verified —
+ * the workflow ran on their pull requests but nothing required it to pass.
+ */
+test("the baseline status check extends to an environment added later", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["test", "prod", "staging"]);
+  const scope = byName(compile(config, PERSONAL).rulesets, "PR-SCOPE-CHECK");
+
+  assert.deepEqual(scope.conditions.ref_name.include, [
+    "refs/heads/dev",
+    "refs/heads/test",
+    "refs/heads/prod",
+    "refs/heads/staging",
+  ]);
+  assert.deepEqual(
+    scope.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
+    [{ context: "scope-check" }],
+  );
+});
+
+/**
+ * Deliberately NOT the default branch, even though the baseline's other rules
+ * cover it: the check reports on pull requests targeting an environment, so
+ * requiring it on the default branch would demand a check nothing ever reports
+ * there — permanently unmergeable.
+ */
+test("the baseline status check never reaches the default branch", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  const scope = byName(compile(config, PERSONAL).rulesets, "PR-SCOPE-CHECK");
+
+  assert.ok(!scope.conditions.ref_name.include.includes("~DEFAULT_BRANCH"));
+  assert.ok(!scope.conditions.ref_name.include.includes("refs/heads/main"));
+});
+
+test("an environment's own checks keep their own ruleset, without repeating the baseline's", () => {
+  const config = clone(CANONICAL);
+  config.environments.staging = { statusChecks: ["scope-check", "e2e/smoke"] };
+  const { rulesets } = compile(config, PERSONAL);
+
+  const derived = byName(rulesets, "status-checks-staging");
+  assert.deepEqual(
+    derived.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
+    [{ context: "e2e/smoke" }],
+    "scope-check is already required by the baseline ruleset covering staging",
+  );
+  assert.ok(
+    byName(rulesets, "PR-SCOPE-CHECK").conditions.ref_name.include.includes("refs/heads/staging"),
+  );
+});
+
+test("with no baseline statusChecks the per-environment form still works exactly as before", () => {
+  const config = clone(CANONICAL);
+  delete config.baseline.statusChecks;
+  config.environments.dev = { statusChecks: ["scope-check"], statusCheckRuleset: "PR-SCOPE-CHECK" };
+  const scope = byName(compile(config, PERSONAL).rulesets, "PR-SCOPE-CHECK");
+
+  assert.deepEqual(scope.conditions.ref_name.include, ["refs/heads/dev"]);
+});
+
+// --- a required check nothing can report ---------------------------------------
+
+/**
+ * The hazard that grows with the change above: one ruleset now carries the check
+ * across EVERY environment, so requiring a check no workflow reports would not
+ * block one branch, it would block the whole pipeline — forever, since a check
+ * that never runs never turns green.
+ */
+test("a check nothing can report is dropped, loudly, instead of blocking every merge", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["prod"]);
+  const { rulesets, degradations } = compile(config, {
+    ...PERSONAL,
+    unavailableStatusChecks: ["scope-check"],
+  });
+
+  assert.equal(byName(rulesets, "PR-SCOPE-CHECK"), undefined, "not created at all");
+  const note = degradations.find((d) => d.dropped === "required_status_checks");
+  assert.equal(note.ruleset, "PR-SCOPE-CHECK");
+  assert.equal(note.check, "scope-check");
+  assert.match(note.reason, /would block every merge/);
+  assert.ok(note.remedy, "and it says what to do about it");
+});
+
+/**
+ * Same as the reviewer rulesets: dropping it from the desired set would leave
+ * the LIVE ruleset in place, still demanding the impossible check, and report it
+ * as merely "unmanaged".
+ */
+test("an existing ruleset whose check cannot be reported is neutered, not abandoned", () => {
+  const { rulesets } = compile(CANONICAL, {
+    ...PERSONAL,
+    unavailableStatusChecks: ["scope-check"],
+    existingRulesetNames: ["PR-SCOPE-CHECK"],
+  });
+  const scope = byName(rulesets, "PR-SCOPE-CHECK");
+
+  assert.ok(scope, "still emitted, so the live one is overwritten");
+  assert.ok(!scope.rules.some((r) => r.type === "required_status_checks"), "the blocking rule is gone");
+  assert.deepEqual(
+    scope.rules.map((r) => r.type).sort(),
+    ["deletion", "non_fast_forward"],
+    "deletion and force-push protection stay",
+  );
+});
+
+test("only the unreportable check is dropped; the rest of the ruleset survives", () => {
+  const config = clone(CANONICAL);
+  config.baseline.statusChecks = ["scope-check", "build"];
+  const scope = byName(
+    compile(config, { ...PERSONAL, unavailableStatusChecks: ["scope-check"] }).rulesets,
+    "PR-SCOPE-CHECK",
+  );
+
+  assert.deepEqual(
+    scope.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
+    [{ context: "build" }],
+  );
+});
+
+test("baseline statusCheckSecrets are collected like the per-environment ones", () => {
+  assert.deepEqual(requiredStatusCheckSecrets(CANONICAL), ["OPENROUTER_API_KEY"]);
+
+  const both = clone(CANONICAL);
+  both.environments.dev = { statusCheckSecrets: ["SNYK_TOKEN", "OPENROUTER_API_KEY"] };
+  assert.deepEqual(requiredStatusCheckSecrets(both), ["OPENROUTER_API_KEY", "SNYK_TOKEN"], "deduped");
 });

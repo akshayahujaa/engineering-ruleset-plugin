@@ -240,27 +240,103 @@ function baselineRuleset(config, context, degradations) {
   };
 }
 
-function statusCheckRulesets(config, _context, _degradations) {
-  return Object.entries(config.environments ?? {})
-    .filter(([, env]) => (env.statusChecks ?? []).length > 0)
-    .map(([envName, env]) => ({
-      name: env.statusCheckRuleset ?? `status-checks-${envName}`,
-      target: "branch",
-      enforcement: "active",
-      bypass_actors: [],
-      conditions: { ref_name: { include: [ref(envName)], exclude: [] } },
-      rules: [
-        { type: "deletion" },
-        { type: "non_fast_forward" },
-        {
-          type: "required_status_checks",
-          parameters: {
-            strict_required_status_checks_policy: false,
-            required_status_checks: env.statusChecks.map((context) => ({ context })),
-          },
-        },
-      ],
-    }));
+/**
+ * A status-check ruleset. With no checks left it is *neutered* — deletion and
+ * force-push protection only — which is what an existing ruleset must become
+ * when its check cannot be produced; see statusCheckRulesets.
+ */
+function statusCheckRuleset(name, include, checks) {
+  const rules = [{ type: "deletion" }, { type: "non_fast_forward" }];
+
+  if (checks.length > 0) {
+    rules.push({
+      type: "required_status_checks",
+      parameters: {
+        strict_required_status_checks_policy: false,
+        required_status_checks: checks.map((context) => ({ context })),
+      },
+    });
+  }
+
+  return {
+    name,
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: { ref_name: { include, exclude: [] } },
+    rules,
+  };
+}
+
+/**
+ * Status-check rulesets.
+ *
+ * `baseline.statusChecks` apply to EVERY declared environment, in one ruleset.
+ * That is what makes an environment added later inherit the check instead of
+ * becoming the one branch nobody verifies — the same single-source rule the
+ * baseline pull_request rule and the nomenclature excludes already follow.
+ *
+ * Deliberately NOT the default branch, even though the baseline's other rules
+ * cover it: the check that reports these contexts triggers on pull requests
+ * targeting an *environment*, so requiring it on the default branch would
+ * demand a check nothing ever reports there — permanently unmergeable.
+ *
+ * An environment may still name extra checks of its own; those keep their own
+ * ruleset, minus anything the baseline already requires, so one check is never
+ * demanded twice from two different rulesets.
+ */
+function statusCheckRulesets(config, context, degradations) {
+  const environments = Object.keys(config.environments ?? {});
+  const baselineChecks = config.baseline?.statusChecks ?? [];
+  const existing = context.existingRulesetNames ?? [];
+  const rulesets = [];
+
+  /**
+   * Drops the checks nothing can report here.
+   *
+   * A required check no workflow reports never turns green, so it does not
+   * guard the branch — it blocks every merge into it, forever. That is the same
+   * unsatisfiability rule the review requirements follow, and it matters more
+   * now that one ruleset can carry the check across every environment.
+   */
+  const satisfiable = (checks, rulesetName, scope) => {
+    const unavailable = new Set(context.unavailableStatusChecks ?? []);
+    for (const check of checks.filter((c) => unavailable.has(c))) {
+      degradations.push({
+        ruleset: rulesetName,
+        dropped: "required_status_checks",
+        check,
+        reason:
+          `'${check}' cannot be reported on this repository, so requiring it on ${scope} would ` +
+          "block every merge instead of guarding it",
+        remedy: "restore whatever produces that check (see the SKIPPED line above), then re-run",
+      });
+    }
+    return checks.filter((c) => !unavailable.has(c));
+  };
+
+  if (baselineChecks.length > 0 && environments.length > 0) {
+    const name = config.baseline.statusCheckRuleset ?? "status-checks";
+    const kept = satisfiable(baselineChecks, name, environments.join(", "));
+    // Nothing survived: only worth emitting if a previous sync already created
+    // it, and then only to neuter it — dropping it from the desired set would
+    // leave the live ruleset demanding the same impossible check.
+    if (kept.length > 0 || existing.includes(name)) {
+      rulesets.push(statusCheckRuleset(name, environments.map(ref), kept));
+    }
+  }
+
+  for (const [envName, env] of Object.entries(config.environments ?? {})) {
+    const own = (env.statusChecks ?? []).filter((check) => !baselineChecks.includes(check));
+    if (own.length === 0) continue;
+
+    const name = env.statusCheckRuleset ?? `status-checks-${envName}`;
+    const kept = satisfiable(own, name, envName);
+    if (kept.length === 0 && !existing.includes(name)) continue;
+    rulesets.push(statusCheckRuleset(name, [ref(envName)], kept));
+  }
+
+  return rulesets;
 }
 
 /**
@@ -322,10 +398,18 @@ function nomenclatureRuleset(config, context, degradations) {
   // Excluded refs are the *permitted* ones. Requiring a task id narrows each
   // prefix from "anything below it" to "a task-id segment, optionally followed
   // by a description", which is what lets a merge be traced back to a task.
+  //
+  // `requireDescription` makes the description segment mandatory too, so the
+  // shape is `<prefix>/<task-id>/<description>`. That matters most when
+  // `taskIdPrefix` is empty: with no prefix marking the id, `feature/*` matches
+  // any word, so the third segment is the only thing left that a
+  // ref pattern can actually insist on. Whether the second segment names a REAL
+  // ticket is not knowable from a ref pattern at all — the scope check enforces
+  // that at pull-request time, where the tracker can be asked.
   const permitted = (naming.allowedPrefixes ?? []).flatMap((prefix) => {
     if (!naming.requireTaskId) return [`${ref(prefix)}/**/*`];
     const id = `${ref(prefix)}/${naming.taskIdPrefix ?? "CU-"}*`;
-    return [id, `${id}/**`];
+    return naming.requireDescription ? [`${id}/**`] : [id, `${id}/**`];
   });
 
   const exclude = [
@@ -440,17 +524,18 @@ export function referencedTeams(config) {
 }
 
 /**
- * Secrets a configured status check needs in order to actually run — e.g.
- * dev's `scope-check` calls an AI provider and needs `OPENROUTER_API_KEY`.
+ * Secrets a required status check needs in order to actually run — e.g. the
+ * `scope-check` context calls an AI provider and needs `OPENROUTER_API_KEY`.
  *
- * This plugin does not generate that workflow (contrast tasksync.js, which
- * DOES generate the ClickUp/Jira sync workflow it depends on) — the check
- * itself is supplied separately, by the pr-guardrails scope-check suite — but
- * it still names the ingredient the check needs, so the sync can make sure
- * that secret exists before a merge ever depends on it.
+ * Read from the baseline (where a check covering every environment is declared)
+ * as well as per environment, so moving a check up to the baseline does not
+ * quietly stop the sync from checking for its secret.
  */
 export function requiredStatusCheckSecrets(config) {
-  const names = Object.values(config?.environments ?? {}).flatMap((env) => env.statusCheckSecrets ?? []);
+  const names = [
+    ...(config?.baseline?.statusCheckSecrets ?? []),
+    ...Object.values(config?.environments ?? {}).flatMap((env) => env.statusCheckSecrets ?? []),
+  ];
   return dedupe(names);
 }
 

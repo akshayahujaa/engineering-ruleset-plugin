@@ -64,6 +64,11 @@ export function normalizeTaskSync(config) {
     provider,
     taskIdPrefix: raw.taskIdPrefix ?? known.taskIdPrefix,
     todoStatuses: raw.todoStatuses ?? DEFAULT_TODO_STATUSES,
+    // The status a task moves to when its branch is first pushed — work has
+    // started, before anything is merged anywhere. Off unless configured:
+    // switching it on by default would start writing to the tracker on every
+    // push in every repo already synced, which is not a version bump's call.
+    branchPushStatus: raw.branchPushStatus ?? null,
     // Per-environment target statuses. The legacy single-branch form
     // (targetBranch + targetStatus) maps onto exactly one stage.
     environmentStatuses:
@@ -77,6 +82,61 @@ export function normalizeTaskSync(config) {
     secretName: raw.secretName ?? known.secretName,
   };
 }
+
+/** An opt-out spelling for a status: nothing to move to. */
+const optedOut = (status) => status === null || status === undefined || status === false || status === "";
+
+/**
+ * The stage a task reaches when its branch is PUSHED, before any merge.
+ *
+ * It is always rank 1 — ahead of every environment — because pushing the branch
+ * is the earliest evidence the work has actually started, which is exactly the
+ * transition a to-do task is waiting for. Environment stages shift up behind it
+ * so the forwards-only rule still holds end to end.
+ *
+ * The trigger patterns come from `branchNaming.allowedPrefixes`, so the one list
+ * that decides which branch names are legal also decides which pushes count.
+ * With no prefixes there is nothing to match, and no stage; see
+ * `pushStageBlocked` for saying so out loud.
+ *
+ * @returns {{status: string, rank: 1, prefixes: string[]}|null}
+ */
+export function pushStage(config, sync) {
+  if (optedOut(sync?.branchPushStatus)) return null;
+
+  const prefixes = config?.branchNaming?.allowedPrefixes ?? [];
+  if (prefixes.length === 0) return null;
+
+  return { status: String(sync.branchPushStatus), rank: 1, prefixes: [...prefixes] };
+}
+
+/**
+ * Why a configured push stage produced nothing, so the plan can say it rather
+ * than silently shipping a workflow that ignores half the config.
+ *
+ * @returns {string|null} null when there is nothing wrong
+ */
+export function pushStageBlocked(config, sync) {
+  if (optedOut(sync?.branchPushStatus)) return null;
+  if ((config?.branchNaming?.allowedPrefixes ?? []).length > 0) return null;
+
+  return (
+    "branchNaming.allowedPrefixes is empty, so there are no branch patterns a push could match — " +
+    "add the prefixes your work branches use, or remove taskSync.branchPushStatus"
+  );
+}
+
+/**
+ * Every stage a status can be ranked against, the push stage included.
+ *
+ * Ranking the task's CURRENT status needs the push stage as well as the
+ * environments: a task sitting at the push status must rank as 1, or the first
+ * merge would read it as "not in the pipeline" and leave it there forever —
+ * which is the one thing that would make the push stage a trap rather than a
+ * head start.
+ */
+export const rankedStages = (push, pipeline = []) =>
+  push ? [{ env: null, status: push.status, rank: push.rank }, ...pipeline] : [...pipeline];
 
 /**
  * The ordered pipeline a task walks as its branch is merged onward.
@@ -95,12 +155,15 @@ export function normalizeTaskSync(config) {
  * @returns {Array<{env: string, status: string, rank: number}>}
  */
 export function statusPipeline(config, sync) {
+  // A push stage occupies rank 1, so every environment shifts up behind it.
+  const offset = pushStage(config, sync) ? 1 : 0;
+
   // The legacy single-branch form synced exactly one branch. Upgrading must
   // not quietly start moving tasks on merges into other environments.
   if (sync?.legacyBranch) {
     const status = sync.environmentStatuses?.[sync.legacyBranch] ?? "in progress";
     if (status === null || status === false || status === "") return [];
-    return [{ env: sync.legacyBranch, status: String(status), rank: 1 }];
+    return [{ env: sync.legacyBranch, status: String(status), rank: 1 + offset }];
   }
 
   const explicit = sync?.environmentStatuses;
@@ -112,7 +175,7 @@ export function statusPipeline(config, sync) {
     // null/false is the documented opt-out; "" would otherwise become a stage
     // that matches an unreadable tracker status.
     if (status === null || status === false || status === "") continue;
-    stages.push({ env, status: String(status), rank: stages.length + 1 });
+    stages.push({ env, status: String(status), rank: stages.length + 1 + offset });
   }
 
   return stages;
@@ -212,6 +275,40 @@ function branchCases(pipeline) {
 }
 
 /**
+ * The `on.push.branches` list, one pattern per allowed branch prefix, so a push
+ * to a work branch fires the workflow. Environment branches are never in this
+ * list — their stage is reached by a merge, not a push.
+ */
+function pushBranches(push) {
+  return push.prefixes.map((prefix) => `      - ${yamlQuote(`${prefix}/**`)}`).join("\n");
+}
+
+/**
+ * Picks the stage this run arrived at.
+ *
+ * With a push stage there are two ways in, so the event decides: a push to a
+ * work branch is rank 1, and a merged pull request is its target environment's
+ * stage. Without one, this is exactly the `case` it always was — so a config
+ * that never asked for push sync renders byte-identical output.
+ */
+function stageSelection(push, pipeline) {
+  const cases =
+    `case "$BASE_REF" in\n${branchCases(pipeline)}\n` +
+    `            *) echo "::warning::'$BASE_REF' is not a pipeline environment; nothing to sync."; exit 0 ;;\n` +
+    `          esac`;
+
+  if (!push) return cases;
+
+  return (
+    `if [ "\${EVENT_NAME:-}" = "push" ]; then\n` +
+    `            want=${shellQuote(push.status)}; want_rank=${push.rank}\n` +
+    `          else\n` +
+    `            ${cases.split("\n").join("\n  ")}\n` +
+    `          fi`
+  );
+}
+
+/**
  * Ranks the task's CURRENT status. To-do spellings are rank 0; each pipeline
  * status takes its own rank; anything else stays unranked so the task is left
  * alone rather than risked backwards.
@@ -237,11 +334,13 @@ function statusCases(pipeline, todo) {
  * Renders the ClickUp workflow.
  *
  * It fires on a merge into ANY pipeline environment and moves the task to that
- * environment's status — but only forwards: a task whose current status already
- * ranks at or past the arriving stage is left alone, so merging an old branch
- * into dev can never pull a finished task back to "in progress".
+ * environment's status — and, when a push stage is configured, on a push to a
+ * work branch too, which is what moves a to-do task the moment work starts.
+ * Either way only forwards: a task whose current status already ranks at or past
+ * the arriving stage is left alone, so merging an old branch into dev can never
+ * pull a finished task back.
  */
-export function renderClickUpWorkflow(sync = {}, pipeline = []) {
+export function renderClickUpWorkflow(sync = {}, pipeline = [], push = null) {
   const idPrefix = sync.taskIdPrefix ?? "CU-";
   const todo = sync.todoStatuses ?? DEFAULT_TODO_STATUSES;
   // Must match what planTaskSync checks and --set-token sets, or the
@@ -252,12 +351,16 @@ export function renderClickUpWorkflow(sync = {}, pipeline = []) {
   // opt-out and rendered a workflow the plan never showed.
   const stages = pipeline;
   if (stages.length === 0) throw new Error("Cannot render a task-sync workflow with no pipeline stages.");
+  // An empty idPrefix is the bare-task-id form; "No  task id" would read as a
+  // typo, so the label collapses to just "task id" there.
+  const idLabel = idPrefix ? `${idPrefix} task id` : "task id";
 
   return `# Generated by engineering-ruleset-plugin. Re-run the sync to update it;
 # local edits are overwritten.
 #
-# Pipeline (a merge only ever moves a task forwards):
-${stages.map((st) => `#   ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
+# Pipeline (a task only ever moves forwards):
+${push ? `#   push ${push.prefixes.map((p) => `${commentSafe(p)}/**`).join(", ")} → ${commentSafe(push.status)}\n` : ""}\
+${stages.map((st) => `#   merge into ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
 name: ClickUp task sync
 
 on:
@@ -265,6 +368,12 @@ on:
     types: [closed]
     branches:
 ${stages.map((st) => `      - ${yamlQuote(st.env)}`).join("\n")}
+${
+  push
+    ? `  # Work has started: the first push of a work branch moves its task out of to-do.\n` +
+      `  push:\n    branches:\n${pushBranches(push)}\n`
+    : ""
+}\
   # Manual test entry: simulates a merged branch without needing a real PR,
   # so the wiring (secret, id extraction, ClickUp auth) can be verified alone.
   workflow_dispatch:
@@ -285,7 +394,7 @@ permissions:
 jobs:
   advance-task:
     # Closing a PR without merging must not touch the task.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    if: ${push ? "github.event_name == 'push' || " : ""}github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Advance the linked ClickUp task
@@ -293,7 +402,11 @@ jobs:
           CLICKUP_TOKEN: \${{ secrets.${secretName} }}
           # Only needed when the workspace uses ClickUp Custom Task IDs.
           CLICKUP_TEAM_ID: \${{ secrets.CLICKUP_TEAM_ID }}
-          HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref }}
+          EVENT_NAME: \${{ github.event_name }}
+          # inputs.head_ref BEFORE github.ref_name: on a manual dispatch the ref
+          # is whatever branch the run was started from, which would otherwise
+          # win over the branch the operator actually typed.
+          HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref || github.ref_name }}
           BASE_REF: \${{ github.event.pull_request.base.ref || inputs.base_ref }}
         run: |
           set -euo pipefail
@@ -303,12 +416,9 @@ jobs:
             exit 0
           fi
 
-          # Which stage did this merge arrive at?
+          # Which stage did this arrive at?
           want=""; want_rank=0
-          case "$BASE_REF" in
-${branchCases(stages)}
-            *) echo "::warning::'$BASE_REF' is not a pipeline environment; nothing to sync."; exit 0 ;;
-          esac
+          ${stageSelection(push, stages)}
 
           # Branches are <prefix>/${idPrefix}<id>[/description], enforced by the
           # branch-nomenclature ruleset.
@@ -316,7 +426,7 @@ ${branchCases(stages)}
             'index($2, p) == 1 { print substr($2, length(p) + 1) }')"
 
           if [ -z "$id" ]; then
-            echo "::warning::No ${idPrefix} task id in '$HEAD_REF'; nothing to sync."
+            echo "::warning::No ${idLabel} in '$HEAD_REF'; nothing to sync."
             exit 0
           fi
 
@@ -328,7 +438,7 @@ ${branchCases(stages)}
 
           status="$(curl -sS -f -H "Authorization: $CLICKUP_TOKEN" "$url" \\
             | jq -r '.status.status // empty')"
-          echo "Task $id is '\${status:-unknown}'; merging into $BASE_REF wants '$want'."
+          echo "Task $id is '\${status:-unknown}'; this \${EVENT_NAME:-event} wants '$want'."
 
           # Trimmed as well as lowered: the case patterns are exact literals,
           # so a padded status would fall through to "not in the pipeline".
@@ -344,7 +454,7 @@ ${branchCases(stages)}
 
           rank=-1
           case "$lower" in
-${statusCases(stages, todo)}
+${statusCases(rankedStages(push, stages), todo)}
           esac
 
           # An unranked status could be anywhere in the workflow, including past
@@ -379,7 +489,7 @@ ${statusCases(stages, todo)}
  * Auth follows the scope-check convention: JIRA_BASE_URL and JIRA_EMAIL as
  * repository variables (not sensitive), JIRA_API_TOKEN as a secret.
  */
-export function renderJiraWorkflow(sync = {}, pipeline = []) {
+export function renderJiraWorkflow(sync = {}, pipeline = [], push = null) {
   const idPrefix = sync.taskIdPrefix ?? "";
   const todo = sync.todoStatuses ?? DEFAULT_TODO_STATUSES;
   const secretName = sync.secretName ?? "JIRA_API_TOKEN";
@@ -393,8 +503,9 @@ export function renderJiraWorkflow(sync = {}, pipeline = []) {
   return `# Generated by engineering-ruleset-plugin. Re-run the sync to update it;
 # local edits are overwritten.
 #
-# Pipeline (a merge only ever moves an issue forwards):
-${stages.map((st) => `#   ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
+# Pipeline (an issue only ever moves forwards):
+${push ? `#   push ${push.prefixes.map((p) => `${commentSafe(p)}/**`).join(", ")} → ${commentSafe(push.status)}\n` : ""}\
+${stages.map((st) => `#   merge into ${commentSafe(st.env)} → ${commentSafe(st.status)}`).join("\n")}
 name: Jira issue sync
 
 on:
@@ -402,6 +513,12 @@ on:
     types: [closed]
     branches:
 ${stages.map((st) => `      - ${yamlQuote(st.env)}`).join("\n")}
+${
+  push
+    ? `  # Work has started: the first push of a work branch moves its issue out of to-do.\n` +
+      `  push:\n    branches:\n${pushBranches(push)}\n`
+    : ""
+}\
   # Manual test entry: simulates a merged branch without needing a real PR,
   # so the wiring (variables, secret, key extraction, Jira auth) can be
   # verified alone.
@@ -423,7 +540,7 @@ permissions:
 jobs:
   advance-issue:
     # Closing a PR without merging must not touch the issue.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    if: ${push ? "github.event_name == 'push' || " : ""}github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Advance the linked Jira issue
@@ -431,7 +548,11 @@ jobs:
           JIRA_BASE_URL: \${{ vars.JIRA_BASE_URL }}
           JIRA_EMAIL: \${{ vars.JIRA_EMAIL }}
           JIRA_API_TOKEN: \${{ secrets.${secretName} }}
-          HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref }}
+          EVENT_NAME: \${{ github.event_name }}
+          # inputs.head_ref BEFORE github.ref_name: on a manual dispatch the ref
+          # is whatever branch the run was started from, which would otherwise
+          # win over the branch the operator actually typed.
+          HEAD_REF: \${{ github.event.pull_request.head.ref || inputs.head_ref || github.ref_name }}
           BASE_REF: \${{ github.event.pull_request.base.ref || inputs.base_ref }}
         run: |
           set -euo pipefail
@@ -442,12 +563,9 @@ jobs:
           fi
           base="\${JIRA_BASE_URL%/}"
 
-          # Which stage did this merge arrive at?
+          # Which stage did this arrive at?
           want=""; want_rank=0
-          case "$BASE_REF" in
-${branchCases(stages)}
-            *) echo "::warning::'$BASE_REF' is not a pipeline environment; nothing to sync."; exit 0 ;;
-          esac
+          ${stageSelection(push, stages)}
 
           # Branches are <prefix>/${idPrefix}<KEY>[/description]; the key is the
           # standard Jira form PROJ-123.
@@ -464,7 +582,7 @@ ${branchCases(stages)}
           status="$(curl -sS -f -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \\
             "$base/rest/api/3/issue/$key?fields=status" \\
             | jq -r '.fields.status.name // empty')"
-          echo "Issue $key is '\${status:-unknown}'; merging into $BASE_REF wants '$want'."
+          echo "Issue $key is '\${status:-unknown}'; this \${EVENT_NAME:-event} wants '$want'."
 
           # Trimmed as well as lowered: the case patterns are exact literals,
           # so a padded status would fall through to "not in the pipeline".
@@ -480,7 +598,7 @@ ${branchCases(stages)}
 
           rank=-1
           case "$lower" in
-${statusCases(stages, todo)}
+${statusCases(rankedStages(push, stages), todo)}
           esac
 
           if [ "$rank" -lt 0 ]; then
@@ -515,10 +633,10 @@ ${statusCases(stages, todo)}
 `;
 }
 
-export const renderWorkflow = (sync, pipeline = []) =>
+export const renderWorkflow = (sync, pipeline = [], push = null) =>
   (sync?.provider ?? "clickup") === "jira"
-    ? renderJiraWorkflow(sync, pipeline)
-    : renderClickUpWorkflow(sync, pipeline);
+    ? renderJiraWorkflow(sync, pipeline, push)
+    : renderClickUpWorkflow(sync, pipeline, push);
 
 /**
  * Works out what the task-sync side of a sync would change. Read-only.
@@ -536,8 +654,11 @@ export async function planTaskSync(client, config) {
   // Every environment opted out, or none declared: there is nothing to sync,
   // so no workflow is planned — and any existing one becomes an orphan and is
   // removed, rather than being left running against a pipeline of nothing.
+  // A push stage alone is not enough: the workflow's other trigger is a pull
+  // request into an environment, and there would be none to name.
   if (pipeline.length === 0) return null;
-  const desired = renderWorkflow(sync, pipeline);
+  const push = pushStage(config, sync);
+  const desired = renderWorkflow(sync, pipeline, push);
   const existing = await client.getFile(known.workflowPath);
 
   const missingVariables = [];
@@ -557,6 +678,10 @@ export async function planTaskSync(client, config) {
     missingVariables,
     tokenHint: known.tokenHint,
     pipeline,
+    push,
+    // A push stage that was asked for and could not be built. Reported rather
+    // than dropped: silence would look exactly like "not configured".
+    pushBlocked: pushStageBlocked(config, sync),
   };
 }
 

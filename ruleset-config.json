@@ -6,15 +6,14 @@
     "requiredApprovals": 0,
     "preventDeletion": true,
     "preventForcePush": true,
-    "allowedMergeMethods": ["merge", "squash", "rebase"]
+    "allowedMergeMethods": ["merge", "squash", "rebase"],
+    "statusChecks": ["scope-check"],
+    "statusCheckRuleset": "PR-SCOPE-CHECK",
+    "statusCheckSecrets": ["OPENROUTER_API_KEY"]
   },
 
   "environments": {
-    "dev": {
-      "statusChecks": ["scope-check"],
-      "statusCheckRuleset": "PR-SCOPE-CHECK",
-      "statusCheckSecrets": ["OPENROUTER_API_KEY"]
-    }
+    "dev": {}
   },
 
   "environmentProfiles": {
@@ -35,10 +34,11 @@
   "taskSync": {
     "enabled": true,
     "provider": "clickup",
-    "taskIdPrefix": "CU-",
+    "taskIdPrefix": "",
     "todoStatuses": ["to do", "todo", "open", "backlog", "pending"],
+    "branchPushStatus": "in progress",
     "environmentStatuses": {
-      "dev": "in progress",
+      "dev": "dev",
       "test": "QA",
       "prod": "done"
     },
@@ -71,7 +71,8 @@
     "rulesetName": "Enforce Branch Nomenclature",
     "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],
     "requireTaskId": true,
-    "taskIdPrefix": "CU-",
+    "taskIdPrefix": "",
+    "requireDescription": true,
     "restrictCreation": true,
     "preventForcePush": true,
     "requiredApprovals": 1,

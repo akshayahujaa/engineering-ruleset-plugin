@@ -164,15 +164,30 @@ instruction as printed, and do not carry the refused flag onto further runs agai
 
 ## The task-sync pipeline
 
-The plan prints the full pipeline under the workflow line — one row per environment, e.g.
+The plan prints the full pipeline under the workflow line — one row per stage, e.g.
 `merge into test → 'QA'`. Show it: it is how the user checks the mapping and, importantly, the
 **order**. Rank follows the order of `environments` in the config, so an environment added later
 lands last; if that is wrong for their real pipeline (staging usually precedes prod), tell them to
 reorder `environments` in the config rather than hand-editing the workflow, which is regenerated.
 
+A `push feature/**, … → 'in progress'` row is the **first** stage, ahead of every environment: it
+fires when a work branch is pushed, which is what moves a ticket out of to-do the moment work
+starts. It comes from `taskSync.branchPushStatus`, and its branch patterns come from
+`branchNaming.allowedPrefixes` — the same list the nomenclature ruleset enforces. Every push runs
+it, but only the first one moves anything; the rest are no-ops, because the pipeline is
+forwards-only.
+
+`[no push stage: …]` means it was configured and could not be built. Relay it — a missing push row
+looks exactly like a config that never asked for one.
+
 An environment with no entry in `taskSync.environmentStatuses` maps to a status of the same name.
 That is the intended default for a newly added environment — do not invent a mapping for it, and
 do not suggest editing the generated workflow directly.
+
+Every status in the pipeline has to exist in the tracker's own workflow. If the user's board has
+no status matching a stage, the job fails there (Jira) or writes a status nobody uses (ClickUp) —
+so if they say a stage never lands, the tracker's status names are the first thing to check, not
+the plugin.
 
 ## Task tracker credentials (ClickUp or Jira)
 
@@ -235,25 +250,39 @@ relay carefully:
 - `SKIPPED .github/workflows/pr-scope-check.yml` means it could not be generated — almost
   always because the task tracker is off (`provider: 'none'`), since the check has no
   ticket to read without one. Relay the reason; an absent check looks exactly like a
-  passing one, which is the whole hazard.
+  passing one, which is the whole hazard. When that happens you will usually also see
+  `[degraded: required_status_checks dropped]` on `PR-SCOPE-CHECK`: the check is required
+  on every environment, so requiring one nothing reports would block the whole pipeline
+  rather than one branch. Relay both lines together — they are one event.
 
 The scope check's issue provider is derived from `taskSync.provider`, so never suggest
 configuring the tracker separately for it — switching the tracker rewrites the workflow.
 Both checks need `OPENROUTER_API_KEY` (see below).
 
-## Other status-check secrets (e.g. OPENROUTER_API_KEY)
+`PR-SCOPE-CHECK` covers **every declared environment**, from `baseline.statusChecks` — so
+an environment added by `--env` is checked from the moment it exists, and there is no
+per-environment edit to make. If a plan shows it scoped to fewer refs than the
+environments in play, that is drift worth mentioning, not a default.
 
-If the plan reports `The '<NAME>' secret is required for a configured status check and is not
-set`, this is a **different** secret from the tracker's — `PR-SCOPE-CHECK` requires a status check
-named `scope-check`, but this plugin does not generate the workflow that produces it (that is the
-separate pr-guardrails scope-check suite); it only knows the check needs `OPENROUTER_API_KEY` to
-run. On the user's own real terminal the CLI already asks about this itself, on every interactive
+## Check credentials (e.g. OPENROUTER_API_KEY)
+
+If the plan reports `The '<NAME>' secret is required ...  and is not set`, this is a
+**different** secret from the tracker's. The wording says which kind:
+
+- `required for a configured status check` — a merge can block on it, because the check it
+  feeds is required by a ruleset.
+- `required by a pull-request check this sync generates` — the workflow is installed by this
+  sync (the scope check, PR-Agent) and cannot run without it.
+
+Both are reported the moment a tracker is chosen, since choosing one turns the checks on.
+On the user's own real terminal the CLI asks about each of them itself, on every interactive
 run (not just first sync) — nothing for Claude to do there beyond showing the output verbatim.
 
 Under `/enforce-rules`, relay the exact `gh secret set NAME --repo owner/name` command the plan
 prints, with the same never-collect-it-in-chat rule as any other secret. There is no `--set-token`
-equivalent for this one — it is not a tracker credential, so only the manual command or the user's
-own terminal can set it.
+equivalent for these — they are not tracker credentials, so only the manual command or the user's
+own terminal can set them. A `gh variable set NAME` line is the same thing for a
+**non-sensitive** value (a base URL, an email); those are answered in the clear.
 
 Notes:
 

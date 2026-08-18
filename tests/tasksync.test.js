@@ -11,6 +11,9 @@ import {
   planTaskSync,
   planSyncOrphans,
   removeSyncOrphan,
+  pushStage,
+  pushStageBlocked,
+  rankedStages,
   GENERATED_MARKER,
   DEFAULT_TODO_STATUSES,
 } from "../src/tasksync.js";
@@ -145,7 +148,7 @@ test("every pipeline environment becomes a trigger branch and a case arm", () =>
 
 test("the pipeline is documented at the top of the generated file", () => {
   const yaml = renderWorkflow({}, PIPELINE);
-  assert.match(yaml, /#   dev → in progress\n#   test → QA\n#   prod → done/);
+  assert.match(yaml, /#   merge into dev → in progress\n#   merge into test → QA\n#   merge into prod → done/);
 });
 
 test("each pipeline status is rankable, so a later merge cannot pull a task back", () => {
@@ -548,4 +551,154 @@ test("the generated shell trims the status, matching the JS model", () => {
 test("the dispatch base_ref defaults to the first stage, so old invocations still work", () => {
   const yaml = renderWorkflow({}, PIPELINE);
   assert.match(yaml, /required: false\n        default: 'dev'/);
+});
+
+// --- the push stage: work starting, before anything is merged --------------------
+
+/**
+ * A config shaped like the shipped one: a push moves a to-do task to
+ * "in progress", and the environments follow behind it.
+ */
+const WITH_PUSH = {
+  environments: { dev: {}, test: {}, prod: {} },
+  branchNaming: { allowedPrefixes: ["feature", "bugfix"] },
+  taskSync: {
+    enabled: true,
+    provider: "clickup",
+    branchPushStatus: "in progress",
+    environmentStatuses: { dev: "dev", test: "QA", prod: "done" },
+  },
+};
+
+const pushSync = (config = WITH_PUSH) => normalizeTaskSync(config);
+
+test("a push stage takes rank 1 and shifts every environment behind it", () => {
+  const sync = pushSync();
+  assert.deepEqual(pushStage(WITH_PUSH, sync), {
+    status: "in progress",
+    rank: 1,
+    prefixes: ["feature", "bugfix"],
+  });
+  assert.deepEqual(statusPipeline(WITH_PUSH, sync), [
+    { env: "dev", status: "dev", rank: 2 },
+    { env: "test", status: "QA", rank: 3 },
+    { env: "prod", status: "done", rank: 4 },
+  ]);
+});
+
+test("without branchPushStatus the environments keep the ranks they always had", () => {
+  const config = { ...WITH_PUSH, taskSync: { ...WITH_PUSH.taskSync, branchPushStatus: null } };
+  assert.equal(pushStage(config, normalizeTaskSync(config)), null);
+  assert.deepEqual(
+    statusPipeline(config, normalizeTaskSync(config)).map((st) => st.rank),
+    [1, 2, 3],
+    "no push stage, no offset",
+  );
+});
+
+test("branchPushStatus is off unless configured, so no repo starts syncing pushes on upgrade", () => {
+  const config = { environments: { dev: {} }, taskSync: { enabled: true, provider: "clickup" } };
+  assert.equal(normalizeTaskSync(config).branchPushStatus, null);
+  assert.equal(pushStage(config, normalizeTaskSync(config)), null);
+});
+
+/**
+ * The trap this guards: a task left at the push status must still rank, or the
+ * first merge would read "in progress" as a status outside the pipeline and
+ * leave it there for good — turning a head start into a dead end.
+ */
+test("the push status is rankable, so the first merge can still move the task on", () => {
+  const sync = pushSync();
+  const stages = rankedStages(pushStage(WITH_PUSH, sync), statusPipeline(WITH_PUSH, sync));
+
+  assert.deepEqual(
+    stages.map((st) => [st.status, st.rank]),
+    [
+      ["in progress", 1],
+      ["dev", 2],
+      ["QA", 3],
+      ["done", 4],
+    ],
+  );
+  assert.deepEqual(
+    decideTransition("in progress", { pipeline: stages, target: "dev", targetRank: 2 }),
+    { move: true, target: "dev", reason: "'in progress' comes before 'dev'" },
+  );
+});
+
+test("a to-do task moves on a push, and a second push changes nothing", () => {
+  const sync = pushSync();
+  const push = pushStage(WITH_PUSH, sync);
+  const stages = rankedStages(push, statusPipeline(WITH_PUSH, sync));
+  const onPush = (current) =>
+    decideTransition(current, {
+      pipeline: stages,
+      target: push.status,
+      targetRank: push.rank,
+      todoStatuses: sync.todoStatuses,
+    });
+
+  assert.equal(onPush("to do").move, true, "work has started");
+  assert.equal(onPush("backlog").move, true, "any to-do spelling counts");
+  assert.equal(onPush("in progress").move, false, "already there");
+  assert.equal(onPush("done").move, false, "a push must never pull a finished task back");
+  assert.match(onPush("done").reason, /already at or past/);
+});
+
+test("the push stage becomes a push trigger, one pattern per allowed prefix", () => {
+  const sync = pushSync();
+  const yaml = renderWorkflow(sync, statusPipeline(WITH_PUSH, sync), pushStage(WITH_PUSH, sync));
+
+  assert.match(yaml, /\n  push:\n    branches:\n      - 'feature\/\*\*'\n      - 'bugfix\/\*\*'\n/);
+  assert.match(yaml, /if: github\.event_name == 'push' \|\|/, "a push must not be gated on a merge");
+  assert.match(yaml, /#   push feature\/\*\*, bugfix\/\*\* → in progress/, "documented first, being rank 1");
+});
+
+test("the generated shell picks the stage from the event, not only the base branch", () => {
+  const sync = pushSync();
+  const yaml = renderWorkflow(sync, statusPipeline(WITH_PUSH, sync), pushStage(WITH_PUSH, sync));
+
+  assert.match(yaml, /if \[ "\$\{EVENT_NAME:-\}" = "push" \]; then\n\s+want='in progress'; want_rank=1/);
+  assert.match(yaml, /'dev'\) want='dev'; want_rank=2/, "the merge arms keep their shifted ranks");
+  assert.match(yaml, /'in progress'\) rank=1/, "and the push status is rankable in the shell too");
+});
+
+/**
+ * On a manual dispatch `github.ref_name` is whatever branch the run was started
+ * from, so it must lose to the branch the operator actually typed — otherwise
+ * the test entry silently syncs the wrong branch.
+ */
+test("HEAD_REF prefers a dispatch input over the pushed ref", () => {
+  const sync = pushSync();
+  const yaml = renderWorkflow(sync, statusPipeline(WITH_PUSH, sync), pushStage(WITH_PUSH, sync));
+
+  assert.match(
+    yaml,
+    /HEAD_REF: \$\{\{ github\.event\.pull_request\.head\.ref \|\| inputs\.head_ref \|\| github\.ref_name \}\}/,
+  );
+});
+
+test("a push stage with no branch prefixes to match is reported, not dropped in silence", () => {
+  const config = { ...WITH_PUSH, branchNaming: { allowedPrefixes: [] } };
+  const sync = normalizeTaskSync(config);
+
+  assert.equal(pushStage(config, sync), null);
+  assert.match(pushStageBlocked(config, sync), /allowedPrefixes is empty/);
+  assert.equal(pushStageBlocked(WITH_PUSH, pushSync()), null, "nothing to report when it works");
+});
+
+test("both providers render the push trigger", () => {
+  const jira = { ...WITH_PUSH, taskSync: { ...WITH_PUSH.taskSync, provider: "jira" } };
+  const sync = normalizeTaskSync(jira);
+  const yaml = renderJiraWorkflow(sync, statusPipeline(jira, sync), pushStage(jira, sync));
+
+  assert.match(yaml, /\n  push:\n    branches:\n      - 'feature\/\*\*'/);
+  assert.match(yaml, /if: github\.event_name == 'push' \|\|/);
+  assert.match(yaml, /'in progress'\) rank=1/);
+});
+
+test("a bare task id needs no prefix in the extraction step", () => {
+  const yaml = renderClickUpWorkflow({ taskIdPrefix: "" }, PIPELINE);
+  assert.match(yaml, /-v p='' /, "an empty prefix takes the whole second segment");
+  assert.match(yaml, /No task id in/, "and the message does not read as a typo");
 });
