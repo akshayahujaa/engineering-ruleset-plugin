@@ -222,6 +222,25 @@ After the user says they have run it, re-run the plan; the token notice disappea
 a revoked one. If a token was exposed and revoked after it had already been uploaded, the user
 must run `--set-token` again with the replacement, even though `hasToken` reads true.
 
+## PR checks (scope check and PR-Agent)
+
+When `prChecks` is on, the plan also writes `.github/workflows/pr-scope-check.yml`,
+`.github/scripts/scope-check.mjs` and `.github/workflows/pr-agent.yml`. Two things to
+relay carefully:
+
+- `[this file already exists and was NOT written by this plugin]` means applying
+  **replaces a hand-written workflow** and regenerates over it every run afterwards. Say
+  this plainly before applying — for many repos these files already exist and are
+  maintained by hand, and adopting them is a real decision, not a detail.
+- `SKIPPED .github/workflows/pr-scope-check.yml` means it could not be generated — almost
+  always because the task tracker is off (`provider: 'none'`), since the check has no
+  ticket to read without one. Relay the reason; an absent check looks exactly like a
+  passing one, which is the whole hazard.
+
+The scope check's issue provider is derived from `taskSync.provider`, so never suggest
+configuring the tracker separately for it — switching the tracker rewrites the workflow.
+Both checks need `OPENROUTER_API_KEY` (see below).
+
 ## Other status-check secrets (e.g. OPENROUTER_API_KEY)
 
 If the plan reports `The '<NAME>' secret is required for a configured status check and is not

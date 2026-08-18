@@ -282,6 +282,88 @@ merges may block on it until it is. Set it yourself, in your own terminal:
 
 `--json` carries the same list as `missingStatusCheckSecrets`.
 
+## PR checks: scope check and PR-Agent review
+
+Two more workflows are generated the same way the task-sync one is, when
+`prChecks` turns them on:
+
+| File | What it does |
+|---|---|
+| `.github/workflows/pr-scope-check.yml` | asks an AI whether a PR's changes stay within its linked ticket's scope, and blocks the merge if not |
+| `.github/scripts/scope-check.mjs` | the logic that workflow runs — written alongside it, so the two can never drift apart |
+| `.github/workflows/pr-agent.yml` | runs [PR-Agent](https://github.com/qodo-ai/pr-agent) for an auto description, review and inline suggestions, plus a blocking security gate |
+
+### The tracker is never configured twice
+
+The scope check reads the ticket from whichever tracker `taskSync.provider`
+already names. Pick ClickUp and the workflow gets `ISSUE_PROVIDER: "clickup"`
+and `CLICKUP_TOKEN`; pick Jira and it gets `ISSUE_PROVIDER: "jira"` with
+`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`. Switch provider and the
+workflow is rewritten to match — there is no second place to keep in sync.
+
+With `provider: "none"` there is no ticket to read, so the scope check is
+**not** written and the plan says why rather than leaving an absent check
+looking like a passing one:
+
+```
+  SKIPPED  .github/workflows/pr-scope-check.yml → it reads the ticket from a task tracker,
+           but taskSync is off (provider 'none') — enable ClickUp or Jira, or set
+           prChecks.scopeCheck.enabled to false
+```
+
+### It follows your environments
+
+The scope check triggers on pull requests targeting **every declared
+environment**, from the same list that drives every ruleset — add `staging` and
+it is checked there too, with no second edit. The job id is `scope-check`,
+which is exactly the context `PR-SCOPE-CHECK` requires: they are generated from
+the same source so a rename can never leave a required check waiting on a
+workflow nobody reports.
+
+### Configuration
+
+```jsonc
+"prChecks": {
+  "scopeCheck": {
+    "enabled": true,
+    "aiProvider": "openrouter",        // openrouter | gemini | github-models
+    "aiModel": "qwen/qwen3-coder",
+    "aiKeySecret": "OPENROUTER_API_KEY",
+    "requireTask": true,               // block a PR with no ticket linked
+    "failOpenOnError": false,          // block if the check itself errors
+    "maxDiffChars": 60000,
+    "autoCloseOutOfScope": true        // close the PR on an out-of-scope verdict
+  },
+  "prAgent": {
+    "enabled": true,
+    "model": "openrouter/qwen/qwen3-coder",
+    "fallbackModels": ["openrouter/qwen/qwen-2.5-72b-instruct"],
+    "maxTokens": 32000,
+    "numCodeSuggestions": 4,
+    "keySecret": "OPENROUTER_API_KEY",
+    "securityGate": true               // fail the check when PR-Agent flags a security concern
+  }
+}
+```
+
+Both need `OPENROUTER_API_KEY`, which the sync offers to set for you — see
+*Secrets other status checks need* above.
+
+### Adopting a file you already wrote
+
+These paths commonly already exist, hand-maintained. The sync will overwrite
+them — that is the point of adopting them — but never silently:
+
+```
+  UPDATE   .github/workflows/pr-agent.yml → PR Agent review
+           [this file already exists and was NOT written by this plugin —
+            applying REPLACES it, and regenerates over it on every run afterwards]
+```
+
+Turning a check back off removes the file again, but **only** if the plugin
+wrote it: a hand-written workflow at a managed path is left exactly where it
+is, the same ownership rule the sync workflows follow.
+
 ## Reviewers and teams
 
 `required_reviewers` binds a GitHub **team**, and teams exist only inside organisations. What the

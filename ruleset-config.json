@@ -45,6 +45,28 @@
     "secretName": "CLICKUP_TOKEN"
   },
 
+  "prChecks": {
+    "scopeCheck": {
+      "enabled": true,
+      "aiProvider": "openrouter",
+      "aiModel": "qwen/qwen3-coder",
+      "aiKeySecret": "OPENROUTER_API_KEY",
+      "requireTask": true,
+      "failOpenOnError": false,
+      "maxDiffChars": 60000,
+      "autoCloseOutOfScope": true
+    },
+    "prAgent": {
+      "enabled": true,
+      "model": "openrouter/qwen/qwen3-coder",
+      "fallbackModels": ["openrouter/qwen/qwen-2.5-72b-instruct"],
+      "maxTokens": 32000,
+      "numCodeSuggestions": 4,
+      "keySecret": "OPENROUTER_API_KEY",
+      "securityGate": true
+    }
+  },
+
   "branchNaming": {
     "rulesetName": "Enforce Branch Nomenclature",
     "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],

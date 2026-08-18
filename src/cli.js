@@ -44,6 +44,12 @@ import { plan, apply, isBlockingMerges } from "./sync.js";
 import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan, PROVIDERS } from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
+  planPrChecks,
+  planPrCheckOrphans,
+  applyPrCheckFile,
+  removePrCheckOrphan,
+} from "./prchecks.js";
+import {
   probeAccess,
   acceptAndReprobe,
   invitationGrantsAdmin,
@@ -662,7 +668,19 @@ async function main() {
   let { steps, undeclared } = await plan(client, rulesets);
   const sync = await planTaskSync(client, config);
   const orphans = await planSyncOrphans(client, sync?.provider ?? null);
-  const syncPending = Boolean(sync && sync.action !== "unchanged") || orphans.length > 0;
+
+  // PR-check workflows are generated the same way and land in the same place,
+  // so they share the relax window below. Their issue provider comes from the
+  // tracker already chosen, so ClickUp/Jira never has to be configured twice.
+  const prChecks = await planPrChecks(client, config, { provider: sync?.provider ?? null });
+  const prCheckOrphans = await planPrCheckOrphans(client, prChecks.files.map((f) => f.path));
+  const prCheckWrites = prChecks.files.filter((f) => f.action !== "unchanged");
+
+  const syncPending =
+    Boolean(sync && sync.action !== "unchanged") ||
+    orphans.length > 0 ||
+    prCheckWrites.length > 0 ||
+    prCheckOrphans.length > 0;
   // Pending workflow writes (and orphan removals) share the branch-creation
   // relax window: the same pull_request rule refuses all of them, so they
   // must not earn a second window.
@@ -722,6 +740,11 @@ async function main() {
             pipeline: sync.pipeline,
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
+          prChecks: {
+            files: prChecks.files.map(({ path, action, label }) => ({ path, action, label })),
+            blocked: prChecks.blocked,
+            removed: prCheckOrphans.map((o) => o.path),
+          },
           // Secrets a configured status check needs (e.g. OPENROUTER_API_KEY
           // for dev's scope-check) that are not set on the repository. This
           // plugin does not generate that workflow, only names what it needs.
@@ -954,6 +977,27 @@ async function main() {
     );
   }
 
+  for (const file of prChecks.files) {
+    console.log(`\n  ${ICON[file.action]}  ${file.path.padEnd(30)} → ${file.label}`);
+    if (file.adopting) {
+      console.log(
+        `${" ".repeat(13)}[this file already exists and was NOT written by this plugin —` +
+          `\n${" ".repeat(13)} applying REPLACES it, and regenerates over it on every run afterwards]`,
+      );
+    }
+  }
+  // A check the config asked for that cannot be generated here is named, not
+  // silently skipped — an absent scope check looks identical to a passing one.
+  for (const note of prChecks.blocked) {
+    console.log(`\n  SKIPPED  ${note.what.padEnd(30)} → ${note.reason}`);
+  }
+  for (const orphan of prCheckOrphans) {
+    console.log(
+      `\n  DELETE   ${orphan.path.padEnd(30)} → no longer enabled in the policy;` +
+        `\n             it would keep running on every pull request`,
+    );
+  }
+
   const writes = steps.filter((s) => s.action !== "unchanged");
   const guardsDefault = rulesets.some((r) =>
     (r.conditions?.ref_name?.include ?? []).includes("~DEFAULT_BRANCH"),
@@ -1020,6 +1064,8 @@ async function main() {
 
   const pending =
     writes.length +
+    prCheckWrites.length +
+    prCheckOrphans.length +
     (sync && sync.action !== "unchanged" ? 1 : 0) +
     orphans.length +
     branches.missing.length +
@@ -1112,6 +1158,8 @@ async function main() {
     let syncDone = false;
     const orphansRemoved = [];
     const orphanErrors = [];
+    const prCheckResults = [];
+    const prCheckErrors = [];
 
     const { restoreFailures } = await withRelaxedEnforcement(client, branches.blocked, async () => {
       // Workflow file BEFORE branches: the branches are cut from the default
@@ -1128,6 +1176,24 @@ async function main() {
       for (const orphan of orphans) {
         try {
           await removeSyncOrphan(client, orphan);
+          orphansRemoved.push(orphan.path);
+        } catch (error) {
+          orphanErrors.push({ path: orphan.path, error });
+        }
+      }
+      // Same window, same reason: these are writes to the default branch that
+      // the pull_request rule would otherwise refuse.
+      for (const file of prCheckWrites) {
+        try {
+          await applyPrCheckFile(client, file);
+          prCheckResults.push({ path: file.path, action: file.action });
+        } catch (error) {
+          prCheckErrors.push({ path: file.path, error });
+        }
+      }
+      for (const orphan of prCheckOrphans) {
+        try {
+          await removePrCheckOrphan(client, orphan);
           orphansRemoved.push(orphan.path);
         } catch (error) {
           orphanErrors.push({ path: orphan.path, error });
@@ -1162,6 +1228,15 @@ async function main() {
       // A token without the 'workflow' scope cannot write under .github/workflows.
       const scope = syncError.status === 403 ? " (the credential may lack the 'workflow' scope)" : "";
       console.log(`  ✗ ${sync.path}: ${syncError.message}${scope}`);
+      workflowNote = " 1 workflow failed";
+      process.exitCode = 1;
+    }
+    for (const result of prCheckResults) {
+      console.log(`  ✓ ${result.action === "create" ? "created" : "updated"} ${result.path}`);
+    }
+    for (const failure of prCheckErrors) {
+      const scope = failure.error.status === 403 ? " (the credential may lack the 'workflow' scope)" : "";
+      console.log(`  ✗ ${failure.path}: ${failure.error.message}${scope}`);
       workflowNote = " 1 workflow failed";
       process.exitCode = 1;
     }
