@@ -29,7 +29,10 @@ export const PROVIDERS = {
     secretName: "CLICKUP_TOKEN",
     taskIdPrefix: "CU-",
     requiredVariables: [],
-    tokenHint: "ClickUp → Settings → Apps → API Token",
+    // A URL, not a breadcrumb trail through a settings tree: whoever holds the
+    // account should be able to open one link and generate the token there.
+    tokenHint: "https://app.clickup.com/settings/apps  (Apps → API Token; the value starts 'pk_')",
+    variableHints: {},
   },
   jira: {
     label: "Jira",
@@ -37,7 +40,16 @@ export const PROVIDERS = {
     secretName: "JIRA_API_TOKEN",
     taskIdPrefix: "",
     requiredVariables: ["JIRA_BASE_URL", "JIRA_EMAIL"],
-    tokenHint: "id.atlassian.com → Security → Create and manage API tokens",
+    tokenHint:
+      "https://id.atlassian.com/manage-profile/security/api-tokens  (Create API token; the value starts 'ATATT')",
+    // Where each non-sensitive variable comes from. Kept beside the token hint
+    // so the interactive prompt and the plan's fallback cannot drift apart.
+    variableHints: {
+      JIRA_BASE_URL:
+        "the root URL of your Jira site, e.g. https://your-company.atlassian.net — copy it from the browser bar, with no trailing slash or path",
+      JIRA_EMAIL:
+        "the Atlassian account email that created the API token — https://id.atlassian.com/manage-profile/profile-and-visibility",
+    },
   },
 };
 
@@ -677,6 +689,7 @@ export async function planTaskSync(client, config) {
     secretName: sync.secretName,
     missingVariables,
     tokenHint: known.tokenHint,
+    variableHints: known.variableHints ?? {},
     pipeline,
     push,
     // A push stage that was asked for and could not be built. Reported rather

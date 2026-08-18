@@ -69,7 +69,10 @@ const PROVIDER_CHOICES = ["clickup", "jira", "none"];
  * repeat check name would collide on.
  */
 const STATUS_CHECK_SECRETS = {
-  OPENROUTER_API_KEY: { label: "OpenRouter", tokenHint: "openrouter.ai → Keys → Create Key" },
+  OPENROUTER_API_KEY: {
+    label: "OpenRouter",
+    tokenHint: "https://openrouter.ai/keys  (Create Key; the value starts 'sk-or-')",
+  },
 };
 
 /**
@@ -200,9 +203,8 @@ async function setupCredentials(client, sync) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
       for (const name of [...sync.missingVariables]) {
-        const hint =
-          name === "JIRA_BASE_URL" ? "e.g. https://your-org.atlassian.net" : "your Atlassian account email";
-        const value = (await rl.question(`  ${name} (${hint}): `)).trim();
+        const hint = sync.variableHints?.[name] ?? "value";
+        const value = (await rl.question(`  ${name}\n    ${hint}\n  > `)).trim();
         if (name === "JIRA_BASE_URL" && !/^https:\/\/.+/.test(value)) {
           throw new Error(`${name} must be an https:// URL.`);
         }
@@ -541,6 +543,7 @@ async function main() {
       secretName: syncSection?.secretName ?? known.secretName,
       providerLabel: known.label,
       tokenHint: known.tokenHint,
+      variableHints: known.variableHints ?? {},
       missingVariables: [],
     };
     for (const name of known.requiredVariables) {
@@ -1081,6 +1084,24 @@ async function main() {
       );
     }
   }
+  // The Trivy gate's threshold and scope are policy, not implementation detail:
+  // they decide which pull requests stop, so they belong in the plan the user
+  // approves rather than only in the generated YAML.
+  if (prChecks.trivy) {
+    const t = prChecks.trivy;
+    const scope =
+      t.blockScope === "repository"
+        ? "anywhere in the repository"
+        : "in the files a pull request touches";
+    console.log(
+      `\n  GATE     ${t.rulesetName.padEnd(30)} → status check '${t.statusCheck}' on every environment:` +
+        `\n${" ".repeat(13)} ${t.blockOn.join("/")} blocks the merge, ${scope}` +
+        `\n${" ".repeat(13)} scanners: ${t.scanners.join(", ")}; ` +
+        `${t.severities.filter((sv) => !t.blockOn.includes(sv)).join("/") || "nothing else"} reported only` +
+        (t.ignoreUnfixed ? `\n${" ".repeat(13)} a vulnerability with no released fix is reported, never blocking` : ""),
+    );
+  }
+
   // A check the config asked for that cannot be generated here is named, not
   // silently skipped — an absent scope check looks identical to a passing one.
   for (const note of prChecks.blocked) {
@@ -1129,8 +1150,15 @@ async function main() {
     if (!sync.hasToken || sync.missingVariables.length > 0) {
       const varsNote =
         sync.missingVariables.length > 0
-          ? `\n  Also missing repository variable(s): ${sync.missingVariables.join(", ")} —` +
-            `\n  these are not secrets; set them with: gh variable set NAME --repo ${client.owner}/${client.repo}\n`
+          ? `\n  Also missing repository variable(s). These are not secrets, so set them directly:\n` +
+            sync.missingVariables
+              .map(
+                (name) =>
+                  `\n      gh variable set ${name} --repo ${client.owner}/${client.repo}` +
+                  (sync.variableHints?.[name] ? `\n        ↳ ${sync.variableHints[name]}` : ""),
+              )
+              .join("") +
+            "\n"
           : "";
       console.log(
         `\n  The ${sync.secretName} secret is not set on this repository, so the workflow` +
@@ -1161,10 +1189,12 @@ async function main() {
   // command. Reported all the same: a check missing a variable fails exactly
   // like a check missing a token.
   for (const name of missingCheckVariables) {
+    const hint = sync?.variableHints?.[name];
     console.log(
       `\n  The '${name}' repository variable is required by a configured check and is not set.` +
         `\n  It is not sensitive, so set it directly:` +
-        `\n\n      gh variable set ${name} --repo ${client.owner}/${client.repo}`,
+        `\n\n      gh variable set ${name} --repo ${client.owner}/${client.repo}` +
+        (hint ? `\n\n  Where to find it: ${hint}` : ""),
     );
   }
 

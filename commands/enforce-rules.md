@@ -259,6 +259,35 @@ The scope check's issue provider is derived from `taskSync.provider`, so never s
 configuring the tracker separately for it — switching the tracker rewrites the workflow.
 Both checks need `OPENROUTER_API_KEY` (see below).
 
+### The Trivy gate
+
+`prChecks.trivy` adds `.github/workflows/trivy-security.yml` and `.github/scripts/trivy-report.mjs`,
+plus a `TRIVY-SECURITY` ruleset requiring `trivy-security` on **every** environment. It needs no
+secret — Trivy pulls its database with the workflow token — so it can never be blocked by a missing
+credential the way the scope check can.
+
+Relay the `GATE` line verbatim. It states the policy the user is approving:
+
+```
+  GATE     TRIVY-SECURITY                 → status check 'trivy-security' on every environment:
+              CRITICAL blocks the merge, in the files a pull request touches
+              scanners: vuln, secret, misconfig; HIGH/MEDIUM reported only
+              a vulnerability with no released fix is reported, never blocking
+```
+
+Two things worth saying plainly when it appears:
+
+- **Only what a pull request touches blocks it.** A pre-existing finding elsewhere is reported, not
+  enforced, so adopting the gate does not stop the next unrelated PR. `blockScope: "repository"` is
+  the stricter setting, and the GATE line says which is in force.
+- **`CRITICAL` blocks, `HIGH` and below report.** If the user wants HIGH to block, that is
+  `blockOn`, not `severities` — narrowing `severities` would stop Trivy reporting those findings
+  at all rather than making them stricter.
+
+Turning Trivy off removes the ruleset and the workflow together, so there is no state where a
+required `trivy-security` check has nothing reporting it. Never suggest adding `trivy-security` to
+`baseline.statusChecks` by hand — that would create exactly that state.
+
 `PR-SCOPE-CHECK` covers **every declared environment**, from `baseline.statusChecks` — so
 an environment added by `--env` is checked from the moment it exists, and there is no
 per-environment edit to make. If a plan shows it scoped to fewer refs than the

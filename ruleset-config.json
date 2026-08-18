@@ -6,36 +6,48 @@
     "requiredApprovals": 0,
     "preventDeletion": true,
     "preventForcePush": true,
-    "allowedMergeMethods": ["merge", "squash", "rebase"],
-    "statusChecks": ["scope-check"],
+    "allowedMergeMethods": [
+      "merge",
+      "squash",
+      "rebase"
+    ],
+    "statusChecks": [
+      "scope-check"
+    ],
     "statusCheckRuleset": "PR-SCOPE-CHECK",
-    "statusCheckSecrets": ["OPENROUTER_API_KEY"]
+    "statusCheckSecrets": [
+      "OPENROUTER_API_KEY"
+    ]
   },
-
   "environments": {
     "dev": {}
   },
-
   "environmentProfiles": {
     "test": {},
     "prod": {
       "requiredApprovals": 1,
-      "reviewerTeams": ["tehvault/reviewers"],
+      "reviewerTeams": [
+        "tehvault/reviewers"
+      ],
       "reviewerRuleset": "team-only-reviewer"
     }
   },
-
   "teamSeeding": {
     "fromCodeowners": true,
     "includeRunner": "fallback",
     "populateEmptyTeams": true
   },
-
   "taskSync": {
     "enabled": true,
     "provider": "clickup",
     "taskIdPrefix": "",
-    "todoStatuses": ["to do", "todo", "open", "backlog", "pending"],
+    "todoStatuses": [
+      "to do",
+      "todo",
+      "open",
+      "backlog",
+      "pending"
+    ],
     "branchPushStatus": "in progress",
     "environmentStatuses": {
       "dev": "dev",
@@ -44,7 +56,6 @@
     },
     "secretName": "CLICKUP_TOKEN"
   },
-
   "prChecks": {
     "scopeCheck": {
       "enabled": true,
@@ -59,23 +70,59 @@
     "prAgent": {
       "enabled": true,
       "model": "openrouter/qwen/qwen3-coder",
-      "fallbackModels": ["openrouter/qwen/qwen-2.5-72b-instruct"],
+      "fallbackModels": [
+        "openrouter/qwen/qwen-2.5-72b-instruct"
+      ],
       "maxTokens": 32000,
       "numCodeSuggestions": 4,
       "keySecret": "OPENROUTER_API_KEY",
       "securityGate": true
+    },
+    "trivy": {
+      "enabled": true,
+      "severities": [
+        "CRITICAL",
+        "HIGH",
+        "MEDIUM"
+      ],
+      "blockOn": [
+        "CRITICAL"
+      ],
+      "blockScope": "changed-files",
+      "scanners": [
+        "vuln",
+        "secret",
+        "misconfig"
+      ],
+      "ignoreUnfixed": true,
+      "statusCheck": "trivy-security",
+      "rulesetName": "TRIVY-SECURITY",
+      "skipDirs": [
+        "node_modules",
+        "dist",
+        "build",
+        "vendor"
+      ],
+      "timeout": "10m"
     }
   },
-
   "branchNaming": {
     "rulesetName": "Enforce Branch Nomenclature",
-    "allowedPrefixes": ["feature", "bugfix", "hotfix", "docs", "chore"],
+    "allowedPrefixes": [
+      "feature",
+      "bugfix",
+      "hotfix",
+      "docs",
+      "chore"
+    ],
     "requireTaskId": true,
     "taskIdPrefix": "",
     "requireDescription": true,
     "restrictCreation": true,
     "preventForcePush": true,
     "requiredApprovals": 1,
-    "reviewerTeams": ["tehvault/reviewers"]
+    "reviewerTeams": [
+      "tehvault/reviewers"
+    ]
   }
 }
