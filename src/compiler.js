@@ -5,6 +5,11 @@
  * target repository arrives in `context`, so generation is fully testable.
  */
 
+// Only the two name constants, so the gate the compiler generates and the
+// workflow that reports it can never disagree. Nothing here touches the
+// filesystem, so the compiler stays pure.
+import { TRIVY_CONTEXT, DEFAULT_TRIVY_RULESET } from "./prchecks.js";
+
 const ref = (branch) => `refs/heads/${branch}`;
 
 /**
@@ -269,6 +274,57 @@ function statusCheckRuleset(name, include, checks) {
 }
 
 /**
+ * The status-check groups the baseline requires — one ruleset each.
+ *
+ * A group is `{ruleset, checks, secrets}`. Several exist because a gate should
+ * name itself: `PR-SCOPE-CHECK` requiring a Trivy scan would mislead anyone
+ * reading the repository's rules, and renaming a live ruleset is not a fix —
+ * rulesets are matched by name, so a rename creates a second one and leaves the
+ * original in place, still enforcing.
+ *
+ * `statusChecks` / `statusCheckRuleset` / `statusCheckSecrets` remain the
+ * single-group shorthand, so configs and committed per-repo overrides written
+ * before groups existed compile to exactly what they did before.
+ */
+export function statusCheckGroups(config) {
+  const baseline = config?.baseline ?? {};
+  const groups = [];
+
+  for (const group of baseline.statusCheckGroups ?? []) {
+    if ((group?.checks ?? []).length === 0) continue;
+    groups.push({
+      ruleset: group.ruleset ?? "status-checks",
+      checks: [...group.checks],
+      secrets: [...(group.secrets ?? [])],
+    });
+  }
+
+  if ((baseline.statusChecks ?? []).length > 0) {
+    groups.push({
+      ruleset: baseline.statusCheckRuleset ?? "status-checks",
+      checks: [...baseline.statusChecks],
+      secrets: [...(baseline.statusCheckSecrets ?? [])],
+    });
+  }
+
+  // DERIVED, not declared. The Trivy gate exists exactly when the workflow that
+  // reports it does, so turning Trivy off removes the requirement with it — a
+  // required check nobody reports is impossible here by construction. The scope
+  // check cannot work this way: an external suite may supply that context, which
+  // is why it stays declared and needs the drop-loudly guard instead.
+  const trivy = config?.prChecks?.trivy;
+  if (trivy?.enabled) {
+    groups.push({
+      ruleset: trivy.rulesetName ?? DEFAULT_TRIVY_RULESET,
+      checks: [trivy.statusCheck ?? TRIVY_CONTEXT],
+      secrets: [],
+    });
+  }
+
+  return groups;
+}
+
+/**
  * Status-check rulesets.
  *
  * `baseline.statusChecks` apply to EVERY declared environment, in one ruleset.
@@ -287,17 +343,17 @@ function statusCheckRuleset(name, include, checks) {
  */
 function statusCheckRulesets(config, context, degradations) {
   const environments = Object.keys(config.environments ?? {});
-  const baselineChecks = config.baseline?.statusChecks ?? [];
+  const groups = statusCheckGroups(config);
   const existing = context.existingRulesetNames ?? [];
   const rulesets = [];
 
   /**
    * Drops the checks nothing can report here.
    *
-   * A required check no workflow reports never turns green, so it does not
-   * guard the branch — it blocks every merge into it, forever. That is the same
+   * A required check no workflow reports never turns green, so it does not guard
+   * the branch — it blocks every merge into it, forever. That is the same
    * unsatisfiability rule the review requirements follow, and it matters more
-   * now that one ruleset can carry the check across every environment.
+   * now that one ruleset can carry a check across every environment.
    */
   const satisfiable = (checks, rulesetName, scope) => {
     const unavailable = new Set(context.unavailableStatusChecks ?? []);
@@ -315,19 +371,24 @@ function statusCheckRulesets(config, context, degradations) {
     return checks.filter((c) => !unavailable.has(c));
   };
 
-  if (baselineChecks.length > 0 && environments.length > 0) {
-    const name = config.baseline.statusCheckRuleset ?? "status-checks";
-    const kept = satisfiable(baselineChecks, name, environments.join(", "));
-    // Nothing survived: only worth emitting if a previous sync already created
-    // it, and then only to neuter it — dropping it from the desired set would
-    // leave the live ruleset demanding the same impossible check.
-    if (kept.length > 0 || existing.includes(name)) {
-      rulesets.push(statusCheckRuleset(name, environments.map(ref), kept));
+  if (environments.length > 0) {
+    for (const group of groups) {
+      const kept = satisfiable(group.checks, group.ruleset, environments.join(", "));
+      // Nothing survived: only worth emitting if a previous sync already created
+      // it, and then only to neuter it — dropping it from the desired set would
+      // leave the live ruleset demanding the same impossible check.
+      if (kept.length > 0 || existing.includes(group.ruleset)) {
+        rulesets.push(statusCheckRuleset(group.ruleset, environments.map(ref), kept));
+      }
     }
   }
 
+  // A check the baseline already requires everywhere is not demanded a second
+  // time by an environment's own ruleset.
+  const alreadyRequired = new Set(groups.flatMap((g) => g.checks));
+
   for (const [envName, env] of Object.entries(config.environments ?? {})) {
-    const own = (env.statusChecks ?? []).filter((check) => !baselineChecks.includes(check));
+    const own = (env.statusChecks ?? []).filter((check) => !alreadyRequired.has(check));
     if (own.length === 0) continue;
 
     const name = env.statusCheckRuleset ?? `status-checks-${envName}`;
@@ -533,6 +594,11 @@ export function referencedTeams(config) {
  */
 export function requiredStatusCheckSecrets(config) {
   const names = [
+    ...statusCheckGroups(config).flatMap((group) => group.secrets),
+    // Also read standalone, not only through a group: a repository may declare
+    // the secret a check needs while the check itself is supplied from outside
+    // this plugin, and dropping it would stop the sync verifying that secret
+    // exists at all. Deduped, so the shorthand group naming it too costs nothing.
     ...(config?.baseline?.statusCheckSecrets ?? []),
     ...Object.values(config?.environments ?? {}).flatMap((env) => env.statusCheckSecrets ?? []),
   ];

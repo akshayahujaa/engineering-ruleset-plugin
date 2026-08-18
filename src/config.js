@@ -122,8 +122,9 @@ const TOKEN_FLAGS = ["--set-token", "--set-clickup-token"];
 export function detectTokenMisuse(args) {
   const revoke =
     "If that was a real token it is now in your shell history and the process table: " +
-    "revoke it (ClickUp: Settings → Apps → API Token; Jira: id.atlassian.com → Security → " +
-    "API tokens) and generate a new one. The token is only ever accepted at gh's hidden " +
+    "revoke it and generate a new one — ClickUp: https://app.clickup.com/settings/apps, " +
+    "Jira: https://id.atlassian.com/manage-profile/security/api-tokens. " +
+    "The token is only ever accepted at gh's hidden " +
     "prompt — re-run with --set-token and nothing after it.";
 
   for (let i = 0; i < args.length; i += 1) {

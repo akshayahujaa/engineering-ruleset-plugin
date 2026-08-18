@@ -12,6 +12,7 @@ import {
   assertTeamSlugs,
   assertEnvironmentNames,
   requiredStatusCheckSecrets,
+  statusCheckGroups,
 } from "../src/compiler.js";
 
 const CANONICAL = JSON.parse(
@@ -65,6 +66,7 @@ test("a first sync generates every rule scoped to dev, and no reviewer ruleset",
   assert.deepEqual(rulesets.map((r) => r.name), [
     "Pull Request Compulsion",
     "PR-SCOPE-CHECK",
+    "TRIVY-SECURITY",
     "Enforce Branch Nomenclature",
   ]);
 });
@@ -257,6 +259,7 @@ test("a solo repo still gets the baseline, nomenclature and status-check rules",
   assert.deepEqual(rulesets.map((r) => r.name), [
     "Pull Request Compulsion",
     "PR-SCOPE-CHECK",
+    "TRIVY-SECURITY",
     "Enforce Branch Nomenclature",
   ]);
   // Nomenclature asks for 1 approval; on a solo repo that must not survive, or
@@ -790,4 +793,103 @@ test("baseline statusCheckSecrets are collected like the per-environment ones", 
   const both = clone(CANONICAL);
   both.environments.dev = { statusCheckSecrets: ["SNYK_TOKEN", "OPENROUTER_API_KEY"] };
   assert.deepEqual(requiredStatusCheckSecrets(both), ["OPENROUTER_API_KEY", "SNYK_TOKEN"], "deduped");
+});
+
+// --- status-check groups, and the Trivy gate derived from prChecks ----------------
+
+/**
+ * A gate should name itself. Before groups, every baseline status check landed in
+ * one ruleset, so requiring Trivy would have meant PR-SCOPE-CHECK gating a
+ * security scan — and renaming a live ruleset is no fix, since matching is by
+ * name and a rename leaves the original in place, still enforcing.
+ */
+test("each status-check group becomes its own ruleset, covering every environment", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["test", "prod"]);
+  const { rulesets } = compile(config, PERSONAL);
+
+  for (const name of ["PR-SCOPE-CHECK", "TRIVY-SECURITY"]) {
+    const rs = byName(rulesets, name);
+    assert.ok(rs, `${name} exists`);
+    assert.deepEqual(rs.conditions.ref_name.include, ["refs/heads/dev", "refs/heads/test", "refs/heads/prod"]);
+  }
+  assert.deepEqual(
+    byName(rulesets, "TRIVY-SECURITY").rules.find((r) => r.type === "required_status_checks").parameters
+      .required_status_checks,
+    [{ context: "trivy-security" }],
+  );
+});
+
+test("the Trivy gate reaches an environment added later, with no second edit", () => {
+  const config = clone(CANONICAL);
+  addEnvironments(config, ["staging"]);
+  assert.ok(
+    byName(compile(config, PERSONAL).rulesets, "TRIVY-SECURITY").conditions.ref_name.include.includes(
+      "refs/heads/staging",
+    ),
+  );
+});
+
+/**
+ * The gate is derived from prChecks.trivy rather than declared in baseline, so
+ * the requirement cannot outlive the workflow that reports it. That is what makes
+ * a required-but-unreported check impossible here, instead of merely unlikely.
+ */
+test("turning Trivy off removes its ruleset along with its workflow", () => {
+  const config = clone(CANONICAL);
+  config.prChecks.trivy.enabled = false;
+  const { rulesets } = compile(config, PERSONAL);
+
+  assert.equal(byName(rulesets, "TRIVY-SECURITY"), undefined);
+  assert.ok(byName(rulesets, "PR-SCOPE-CHECK"), "the scope check is unaffected");
+});
+
+test("a custom ruleset name and context are honoured together", () => {
+  const config = clone(CANONICAL);
+  config.prChecks.trivy.rulesetName = "SECURITY-SCAN";
+  config.prChecks.trivy.statusCheck = "sec-scan";
+  const rs = byName(compile(config, PERSONAL).rulesets, "SECURITY-SCAN");
+
+  assert.deepEqual(
+    rs.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
+    [{ context: "sec-scan" }],
+  );
+});
+
+test("statusCheckGroups reads the explicit form, the shorthand, and the derived gate", () => {
+  const explicit = {
+    baseline: { statusCheckGroups: [{ ruleset: "A", checks: ["a"], secrets: ["S"] }] },
+    prChecks: { trivy: { enabled: true } },
+  };
+  assert.deepEqual(statusCheckGroups(explicit), [
+    { ruleset: "A", checks: ["a"], secrets: ["S"] },
+    { ruleset: "TRIVY-SECURITY", checks: ["trivy-security"], secrets: [] },
+  ]);
+
+  // The shorthand every existing config and committed override uses.
+  assert.deepEqual(
+    statusCheckGroups({ baseline: { statusChecks: ["x"], statusCheckRuleset: "X", statusCheckSecrets: ["K"] } }),
+    [{ ruleset: "X", checks: ["x"], secrets: ["K"] }],
+  );
+  assert.deepEqual(statusCheckGroups({}), [], "nothing declared, nothing required");
+});
+
+test("a group's secrets are collected for the credential check", () => {
+  const config = {
+    baseline: { statusCheckGroups: [{ ruleset: "A", checks: ["a"], secrets: ["ALPHA"] }] },
+    environments: { dev: { statusCheckSecrets: ["BETA"] } },
+  };
+  assert.deepEqual(requiredStatusCheckSecrets(config), ["ALPHA", "BETA"]);
+});
+
+test("an environment does not re-require a check the baseline already gates", () => {
+  const config = clone(CANONICAL);
+  config.environments.dev = { statusChecks: ["trivy-security", "e2e/smoke"] };
+  const derived = byName(compile(config, PERSONAL).rulesets, "status-checks-dev");
+
+  assert.deepEqual(
+    derived.rules.find((r) => r.type === "required_status_checks").parameters.required_status_checks,
+    [{ context: "e2e/smoke" }],
+    "trivy-security is already required by TRIVY-SECURITY across every environment",
+  );
 });

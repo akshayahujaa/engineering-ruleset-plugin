@@ -347,6 +347,8 @@ Two more workflows are generated the same way the task-sync one is, when
 | `.github/workflows/pr-scope-check.yml` | asks an AI whether a PR's changes stay within its linked ticket's scope, and blocks the merge if not |
 | `.github/scripts/scope-check.mjs` | the logic that workflow runs — written alongside it, so the two can never drift apart |
 | `.github/workflows/pr-agent.yml` | runs [PR-Agent](https://github.com/qodo-ai/pr-agent) for an auto description, review and inline suggestions, plus a blocking security gate |
+| `.github/workflows/trivy-security.yml` | scans with [Trivy](https://github.com/aquasecurity/trivy) for vulnerable dependencies, hardcoded secrets and IaC misconfigurations |
+| `.github/scripts/trivy-report.mjs` | applies the threshold and scope, and posts the verdict — written alongside its workflow |
 
 ### The tracker is never configured twice
 
@@ -435,6 +437,90 @@ would leave the live one blocking merges forever.
 
 Both need `OPENROUTER_API_KEY`, which the sync offers to set for you — see
 *Secrets other status checks need* above.
+
+## Trivy security scan
+
+`prChecks.trivy` adds a security gate that every governed repository gets, on its own
+`TRIVY-SECURITY` ruleset covering **every declared environment** — so an environment added later is
+scanned with no second edit.
+
+It needs **no credentials**. Trivy pulls its vulnerability database using the workflow's own token,
+which is why this gate cannot be blocked by a missing secret the way the scope check can.
+
+### The threshold is the knob
+
+Trivy *looks* wider than it *blocks*. That separation is the whole design:
+
+```
+CRITICAL secret in a changed file  → 🚫 merge blocked
+CRITICAL CVE the PR introduced     → 🚫 merge blocked
+CRITICAL CVE with no released fix  → ⚠ reported — nothing the author could do would clear it
+HIGH misconfiguration              → ⚠ reported
+MEDIUM / LOW                       → ⚠ reported
+```
+
+Widen it by adding to `blockOn`, not by narrowing `severities` — dropping a severity from
+`severities` stops Trivy reporting it at all.
+
+### Blocking scope: what the pull request touched
+
+A finding blocks only when it sits in a file the pull request changed. This is what makes the check
+adoptable: a repository turning it on is not blocked on day one by a pre-existing secret nobody on
+that pull request wrote. Findings elsewhere still appear in the comment, so the debt stays visible
+rather than being silently forgiven.
+
+Set `blockScope: "repository"` for the stricter reading, where any blocking-class finding anywhere
+fails every pull request until it is fixed.
+
+### It says why it failed
+
+A blocked pull request gets one sticky comment naming each blocking finding — severity, class, file
+and line, identifier, and the fix:
+
+```
+🚫 Trivy security check failed — merge blocked
+
+**2 CRITICAL finding(s)** in files changed in this pull request.
+
+| Severity | Kind | Where | What | Fix |
+|---|---|---|---|---|
+| CRITICAL | vulnerability | package-lock.json | CVE-2024-0001 lodash 4.17.20 | 4.17.21 |
+| CRITICAL | secret | src/config/db.ts:14 | aws-access-key-id AWS access key | remove it and rotate the credential |
+
+▸ 3 further finding(s) — reported, not blocking (CRITICAL 1, HIGH 2)
+```
+
+A gate that only says "failed" is a gate people route around, so the comment carries the remedy and
+the log adds `::error file=…,line=…` annotations against the offending lines.
+
+### Configuration
+
+```jsonc
+"trivy": {
+  "enabled": true,
+  "severities": ["CRITICAL", "HIGH", "MEDIUM"],   // what Trivy looks for
+  "blockOn": ["CRITICAL"],                        // what fails the check
+  "blockScope": "changed-files",                  // or "repository"
+  "scanners": ["vuln", "secret", "misconfig"],
+  "ignoreUnfixed": true,
+  "statusCheck": "trivy-security",                // the job id AND the required context
+  "rulesetName": "TRIVY-SECURITY",
+  "skipDirs": ["node_modules", "dist", "build", "vendor"],
+  "timeout": "10m"
+}
+```
+
+### Why the gate is derived, not declared
+
+Unlike the scope check, the Trivy requirement is **not** listed in `baseline.statusChecks`. It is
+derived from `prChecks.trivy.enabled`, so the ruleset and the workflow appear and disappear
+together — a required check that nothing reports is impossible here by construction rather than by
+care. The scope check cannot work that way, because a separate suite may supply that context, which
+is exactly why it needs the drop-loudly guard instead.
+
+The scan step itself runs with `continue-on-error`. Trivy exits non-zero whenever it finds
+anything, so letting it fail the job would ignore the threshold and the scope, and the author would
+never be told what was found.
 
 ### Adopting a file you already wrote
 
@@ -737,6 +823,7 @@ takes precedence.
 |---|---|---|
 | `Pull Request Compulsion` | default branch + every environment | PR required; no deletion, no force-push |
 | `PR-SCOPE-CHECK` | every environment | status check `scope-check` |
+| `TRIVY-SECURITY` | every environment | status check `trivy-security` |
 | `team-only-reviewer` | `prod` | 1 approval, from `tehvault/reviewers` where available, else from a code owner |
 | `Enforce Branch Nomenclature` | everything else | restricts creation; permits `<prefix>/<task-id>/<description>`; PR + 1 approval |
 

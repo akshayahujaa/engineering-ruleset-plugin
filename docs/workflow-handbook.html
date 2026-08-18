@@ -1,0 +1,831 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The engineering ruleset workflow</title>
+<style>
+  :root {
+    --ground: #f6f7f9;
+    --surface: #ffffff;
+    --surface-sunk: #eef0f4;
+    --ink: #171b21;
+    --ink-muted: #5a6472;
+    --rule: #dde1e8;
+    --rule-strong: #c3cad4;
+    --accent: #2f5d8c;
+    --accent-soft: #e7eef6;
+    --pass: #2c6e49;
+    --pass-soft: #e6f1ea;
+    --block: #a33a2a;
+    --block-soft: #f8e9e6;
+    --warn: #8c5c0e;
+    --warn-soft: #f8f0dd;
+
+    --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #12151a;
+      --surface: #191d24;
+      --surface-sunk: #101318;
+      --ink: #e6e9ee;
+      --ink-muted: #98a2b1;
+      --rule: #2a303a;
+      --rule-strong: #3b434f;
+      --accent: #7aa8d8;
+      --accent-soft: #1b2733;
+      --pass: #6cc08b;
+      --pass-soft: #15241c;
+      --block: #e08a76;
+      --block-soft: #2a1a17;
+      --warn: #d6a94a;
+      --warn-soft: #261e10;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #12151a;
+    --surface: #191d24;
+    --surface-sunk: #101318;
+    --ink: #e6e9ee;
+    --ink-muted: #98a2b1;
+    --rule: #2a303a;
+    --rule-strong: #3b434f;
+    --accent: #7aa8d8;
+    --accent-soft: #1b2733;
+    --pass: #6cc08b;
+    --pass-soft: #15241c;
+    --block: #e08a76;
+    --block-soft: #2a1a17;
+    --warn: #d6a94a;
+    --warn-soft: #261e10;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 45rem; margin: 0 auto; }
+
+  /* ---- masthead ---- */
+  .masthead {
+    display: flex; flex-direction: column; gap: .9rem;
+    padding: 4rem 0 1.75rem;
+    border-bottom: 2px solid var(--ink);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .72rem; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--ink-muted);
+  }
+  h1 {
+    font-family: var(--sans); font-weight: 700; letter-spacing: -.025em;
+    font-size: clamp(2.1rem, 6vw, 3rem); line-height: 1.05;
+    margin: 0; text-wrap: balance;
+  }
+  .standfirst { font-size: 1.12rem; color: var(--ink-muted); margin: 0; max-width: 34rem; }
+
+  /* ---- headings ---- */
+  h2 {
+    font-family: var(--sans); font-weight: 680; letter-spacing: -.018em;
+    font-size: 1.62rem; line-height: 1.2;
+    margin: 3.75rem 0 0; padding-top: 1.1rem;
+    border-top: 1px solid var(--rule-strong);
+    text-wrap: balance;
+  }
+  h2 .num {
+    display: block; font-family: var(--mono); font-size: .72rem; font-weight: 400;
+    letter-spacing: .13em; text-transform: uppercase; color: var(--accent);
+    margin-bottom: .45rem;
+  }
+  h3 {
+    font-family: var(--sans); font-weight: 650; letter-spacing: -.01em;
+    font-size: 1.12rem; margin: 2.25rem 0 .4rem; text-wrap: balance;
+  }
+  p { margin: .85rem 0; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  code {
+    font-family: var(--mono); font-size: .86em;
+    background: var(--surface-sunk); border: 1px solid var(--rule);
+    border-radius: 3px; padding: .08em .32em;
+    word-break: break-word;
+  }
+  pre {
+    font-family: var(--mono); font-size: .82rem; line-height: 1.6;
+    background: var(--surface-sunk); border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule-strong);
+    border-radius: 4px; padding: .9rem 1rem; margin: 1rem 0;
+    overflow-x: auto;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+
+  /* ---- tables ---- */
+  .tw { overflow-x: auto; margin: 1.25rem 0; border: 1px solid var(--rule); border-radius: 5px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-family: var(--sans); font-size: .88rem; }
+  th, td { text-align: left; padding: .62rem .85rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th {
+    font-size: .7rem; letter-spacing: .09em; text-transform: uppercase; font-weight: 650;
+    color: var(--ink-muted); background: var(--surface-sunk); white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: 0; }
+  td code { font-size: .84em; }
+
+  /* ---- callouts ---- */
+  .note {
+    margin: 1.4rem 0; padding: .95rem 1.1rem;
+    border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+    background: var(--surface); border-radius: 4px;
+    font-size: .95rem;
+  }
+  .note > :first-child { margin-top: 0; }
+  .note > :last-child { margin-bottom: 0; }
+  .note.danger { border-left-color: var(--block); background: var(--block-soft); }
+  .note.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+  .note .lede {
+    font-family: var(--sans); font-weight: 650; font-size: .82rem;
+    letter-spacing: .04em; text-transform: uppercase;
+    display: block; margin-bottom: .3rem;
+    color: var(--accent);
+  }
+  .note.danger .lede { color: var(--block); }
+  .note.warn .lede { color: var(--warn); }
+
+  /* ---- credential tables ---- */
+  .cred th:first-child, .cred td:first-child { width: 12.5rem; }
+  .cred td:first-child { font-family: var(--mono); font-size: .8rem; }
+  .cred .kind {
+    display: block; margin-top: .25rem;
+    font-family: var(--sans); font-size: .66rem; letter-spacing: .07em; text-transform: uppercase;
+  }
+  .cred .kind.secret { color: var(--block); font-weight: 650; }
+  .cred .kind.variable { color: var(--ink-muted); }
+  .cred td:last-child { font-family: var(--mono); font-size: .78rem; color: var(--ink-muted); white-space: nowrap; }
+  .cred a { font-family: var(--mono); font-size: .95em; font-weight: 600; }
+  .subhead {
+    font-family: var(--sans); font-weight: 650; font-size: .78rem;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--ink-muted);
+    margin: 1.9rem 0 -.5rem;
+  }
+
+  /* ---- state chips ---- */
+  .chip {
+    font-family: var(--mono); font-size: .72rem; font-weight: 500;
+    padding: .12em .5em; border-radius: 3px; white-space: nowrap;
+    border: 1px solid currentColor;
+  }
+  .chip.ok { color: var(--pass); background: var(--pass-soft); }
+  .chip.no { color: var(--block); background: var(--block-soft); }
+
+  /* ---- numbered step rail ---- */
+  .step {
+    display: grid; grid-template-columns: 2.5rem 1fr; gap: 0 1.1rem;
+    margin: 2.5rem 0 0;
+  }
+  .step-n {
+    font-family: var(--mono); font-size: .8rem; font-weight: 500;
+    color: var(--accent); background: var(--accent-soft);
+    border: 1px solid var(--rule); border-radius: 4px;
+    height: 2.5rem; display: flex; align-items: center; justify-content: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .step-h {
+    font-family: var(--sans); font-weight: 650; font-size: 1.12rem;
+    letter-spacing: -.01em; margin: 0; align-self: center; text-wrap: balance;
+  }
+  .step-body { grid-column: 2; }
+  .step-body > :first-child { margin-top: .55rem; }
+
+  /* ---- branch name verdict list ---- */
+  .verdicts { display: flex; flex-direction: column; gap: .3rem; margin: 1.1rem 0; }
+  .verdict {
+    display: flex; align-items: baseline; gap: .7rem; flex-wrap: wrap;
+    font-family: var(--mono); font-size: .82rem;
+    padding: .42rem .7rem; border-radius: 4px; background: var(--surface);
+    border: 1px solid var(--rule);
+  }
+  .verdict .why { font-family: var(--sans); font-size: .78rem; color: var(--ink-muted); }
+  .verdict.yes { border-left: 3px solid var(--pass); }
+  .verdict.no { border-left: 3px solid var(--block); }
+
+  /* ---- figures ---- */
+  figure { margin: 2rem 0; }
+  .figbox { border: 1px solid var(--rule); border-radius: 5px; background: var(--surface); padding: 1.3rem 1rem 1rem; overflow-x: auto; }
+  figure svg { display: block; width: 100%; max-width: 100%; height: auto; color: var(--ink); min-width: 30rem; }
+  figcaption {
+    font-family: var(--sans); font-size: .82rem; color: var(--ink-muted);
+    margin-top: .7rem; line-height: 1.5;
+  }
+
+  ul { padding-left: 1.15rem; }
+  li { margin: .3rem 0; }
+
+  .kicker {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-muted);
+    margin: 2.5rem 0 -.4rem;
+  }
+
+  footer {
+    margin-top: 4rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+    font-family: var(--sans); font-size: .8rem; color: var(--ink-muted);
+  }
+
+  @media print {
+    body { background: #fff; color: #000; font-size: 11pt; padding: 0; }
+    .masthead { padding-top: 0; }
+    h2 { break-after: avoid; }
+    .step, .note, figure, .tw { break-inside: avoid; }
+    pre { white-space: pre-wrap; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+<style>
+  /* ---------- print build: pin the light palette, size for A4 ---------- */
+  @page { size: A4; margin: 15mm 14mm 16mm; }
+
+  /* Headless Chrome resolves neither ui-sans-serif nor -apple-system, so the
+     screen stacks fell through to Times for every heading. Name real families
+     so the embedded faces are the intended ones. */
+  :root {
+    --sans: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --serif: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+    --mono: Menlo, "SF Mono", Monaco, Consolas, monospace;
+  }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    background: #ffffff;
+    font-size: 10.4pt;
+    line-height: 1.55;
+    padding: 0;
+  }
+  .wrap { max-width: none; margin: 0; }
+
+  /* masthead: a title block, not a hero */
+  .masthead { padding: 0 0 1rem; gap: .5rem; border-bottom-width: 1.5pt; }
+  h1 { font-size: 25pt; }
+  .standfirst { font-size: 11.5pt; }
+
+  /* Each Part starts its own page — the first one continues the title page. */
+  h2 { break-before: page; break-after: avoid; font-size: 14.5pt; margin-top: 0; padding-top: 0; border-top: 0; }
+  h2:first-of-type { break-before: auto; margin-top: 2rem; }
+  h3, .step-h { break-after: avoid; }
+  h3 { font-size: 11.5pt; margin-top: 1.4rem; }
+
+  p { orphans: 2; widows: 2; margin: .6rem 0; }
+
+  /* Nothing worth reading should straddle a page boundary — but a whole step
+     kept together pushed half-empty pages, so a step may break while the parts
+     inside it stay intact. */
+  .note, figure, .verdict, tr, .tw { break-inside: avoid; }
+  .step { break-inside: auto; }
+  .tw { overflow: visible; }
+  pre { break-inside: avoid; white-space: pre-wrap; font-size: 8.4pt; padding: .55rem .7rem; }
+
+  /* `git branch -m` must not break after the hyphen. Inline code is short here,
+     so it stays whole; table cells and code blocks still wrap, where a long
+     value would otherwise overflow a fixed column. */
+  code { font-size: .84em; white-space: nowrap; }
+  pre code, td code, th code { white-space: inherit; }
+  td code, th code { white-space: normal; }
+
+  /* tables: fit the measure instead of scrolling, which print cannot do */
+  table { font-size: 8.5pt; table-layout: fixed; width: 100%; }
+  /* break-word, not anywhere: `home` splitting into `h` + `ome` is worse than a
+     slightly ragged column. */
+  th, td { padding: .38rem .5rem; word-break: normal; overflow-wrap: break-word; }
+
+  /* The URL column earns the most room — it is the column people act on. */
+  .cred th:nth-child(1), .cred td:nth-child(1) { width: 17%; }
+  .cred th:nth-child(2), .cred td:nth-child(2) { width: 24%; }
+  .cred th:nth-child(3), .cred td:nth-child(3) { width: 41%; }
+  .cred th:nth-child(4), .cred td:nth-child(4) { width: 18%; }
+  .cred td:first-child { font-size: 7.9pt; }
+  .cred td:last-child { white-space: normal; font-size: 7.6pt; }
+
+  /* the min-width that makes diagrams scroll on screen would clip on paper */
+  figure svg { min-width: 0; }
+  .figbox { padding: .8rem .6rem .6rem; break-inside: avoid; }
+  figcaption { font-size: 8.6pt; }
+
+  .step { margin-top: 1.5rem; }
+  .step-n { height: 1.9rem; font-size: 8.5pt; }
+  .step-h { font-size: 11.5pt; }
+  .verdict { font-size: 8.6pt; padding: .3rem .55rem; }
+  .verdict .why { font-size: 8.2pt; }
+  .note { padding: .65rem .8rem; font-size: 9.6pt; margin: .9rem 0; }
+  .subhead { font-size: 8.4pt; margin: 1.2rem 0 -.35rem; }
+  .kicker { margin: 2rem 0 -.3rem; }
+
+  /* Prose to a readable measure; tables, code and figures keep the full width. */
+  p, ul, .note, .verdicts, figcaption, .standfirst { max-width: 132mm; }
+
+  /* contents list on the title page */
+  .toc { max-width: 132mm; margin: 1.4rem 0 0; padding: 0; list-style: none; }
+  .toc li {
+    display: flex; gap: .6rem; align-items: baseline;
+    font-family: var(--sans); font-size: 9.6pt;
+    padding: .2rem 0; border-bottom: 1px solid var(--rule);
+  }
+  .toc .p { font-family: var(--mono); font-size: 8pt; color: var(--accent); min-width: 4.2rem; }
+  .toc a { flex: 0 1 auto; order: 1; }
+  .toc li::after {
+    content: ""; flex: 1 1 auto; min-width: .8rem; order: 2;
+    border-bottom: 1px dotted var(--rule-strong); transform: translateY(-.18em);
+  }
+  .toc .pg { font-family: var(--mono); font-size: 8.5pt; font-variant-numeric: tabular-nums; color: var(--ink-muted); order: 3; }
+
+  a { color: #1a4d7a; text-decoration: none; }
+  footer { margin-top: 2rem; font-size: 8.4pt; }
+</style>
+
+</head>
+<body>
+
+
+<div class="wrap">
+
+<header class="masthead">
+  <span class="eyebrow">engineering-ruleset-plugin · handbook</span>
+  <h1>The engineering ruleset workflow</h1>
+  <p class="standfirst">How a repository is set up, how a branch becomes a merge, and how the ticket moves itself along the way.</p>
+</header>
+
+<p>Two things are running in a governed repository.</p>
+
+<p><strong>Guardrails</strong> — GitHub rulesets that refuse pushes, branch names and merges server-side, for everyone, whether or not they have the plugin installed. And <strong>automation</strong> — generated workflows that move your ticket through its statuses as you work, and that review your pull request before a human does.</p>
+
+<p>Both come from one file, <code>ruleset-config.json</code>. Nothing is configured twice.</p>
+
+<ul class="toc">
+  <li><span class="p">Part 1</span><a href="#part1">Setting a repository up</a><span class="pg">1</span></li>
+  <li><span class="p">Part 2</span><a href="#part2">What now exists — the rulesets and workflows</a><span class="pg">5</span></li>
+  <li><span class="p">Part 3</span><a href="#loop">The developer loop, in eight steps</a><span class="pg">6</span></li>
+  <li><span class="p">Part 4</span><a href="#part4">When something blocks you</a><span class="pg">10</span></li>
+  <li><span class="p">Part 5</span><a href="#part5">Admin operations</a><span class="pg">11</span></li>
+</ul>
+
+<h2 id="part1"><span class="num">Part 1</span>Setting a repository up</h2>
+
+<p>Done once, by someone with <strong>admin</strong> on the repository. If you are joining a repo that already works, skip to <a href="#loop">Part&nbsp;3</a>.</p>
+
+<h3>Prerequisites</h3>
+
+<div class="tw"><table>
+  <thead><tr><th>Need</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>gh</code> CLI, authenticated</td><td>the plugin authenticates through it — <code>gh auth login</code></td></tr>
+    <tr><td>Admin on the target repo</td><td>rulesets are an admin-scoped API</td></tr>
+    <tr><td>Node 18+</td><td>the CLI runs on it; no install, no build step</td></tr>
+    <tr><td>ClickUp or Jira</td><td>the ticket is what the scope check reads and the sync moves</td></tr>
+    <tr><td>An OpenRouter API key</td><td>both AI checks call it</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note warn">
+  <span class="lede">Check this before anything else</span>
+  <p>Your tracker must already have the statuses the pipeline writes: <code>to do</code> → <code>in progress</code> → <code>dev</code> → <code>QA</code> → <code>done</code>. If your board names them differently, change <code>taskSync.environmentStatuses</code> — never the generated workflow, which is overwritten on every sync. A status the tracker does not have means that stage silently never lands on ClickUp, and fails the job on Jira.</p>
+</div>
+
+<h3>Run the plan, then apply</h3>
+
+<pre><code>/enforce-rules --repo owner/name</code></pre>
+
+<p>The plan <strong>writes nothing</strong>. Read it before applying — it lists every ruleset it would create, every rule it had to weaken for this repository, and every existing ruleset it will leave alone.</p>
+
+<p>On a repository with no rulesets yet you are asked two questions: <strong>which tracker</strong> (ClickUp, Jira, or none) and <strong>which environments</strong>. It starts at <code>dev</code> alone; <code>test</code> and <code>prod</code> are added on request and arrive with their own policy attached.</p>
+
+<h3>Set the credentials</h3>
+
+<p>The plugin never sees a token. On your own terminal it hands off to <code>gh</code>, which prompts with hidden input and uploads the encrypted value directly.</p>
+
+<p>Every value below can be generated from the link in its row — no hunting through a settings tree. Hand the relevant table to whoever holds the account.</p>
+
+<p class="subhead">If you use ClickUp</p>
+<div class="tw"><table class="cred">
+  <thead><tr><th>Value</th><th>Description</th><th>Where to get it</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>CLICKUP_TOKEN<span class="kind secret">secret</span></td>
+      <td>Personal API token the workflow uses to read and move the task.</td>
+      <td><a href="https://app.clickup.com/settings/apps">app.clickup.com/settings/apps</a> → <em>API Token</em> → <strong>Generate</strong>, then copy it.</td>
+      <td>pk_12345678_<br>ABCDEFGH…</td>
+    </tr>
+    <tr>
+      <td>CLICKUP_TEAM_ID<span class="kind secret">secret · optional</span></td>
+      <td>Workspace id. Needed only if your workspace uses <strong>Custom Task IDs</strong> — it switches the sync to the custom-id endpoint.</td>
+      <td>Open any page in the workspace; it is the number in the URL — <code>app.clickup.com/<strong>9013554321</strong>/home</code>.</td>
+      <td>9013554321</td>
+    </tr>
+  </tbody>
+</table></div>
+
+<p class="subhead">If you use Jira</p>
+<div class="tw"><table class="cred">
+  <thead><tr><th>Value</th><th>Description</th><th>Where to get it</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>JIRA_API_TOKEN<span class="kind secret">secret</span></td>
+      <td>Authentication token generated from your Atlassian account.</td>
+      <td><a href="https://id.atlassian.com/manage-profile/security/api-tokens">id.atlassian.com/manage-profile/security/api-tokens</a> → <em>Create API token</em> → label it → copy the value.</td>
+      <td>ATATT3xFfGF0…</td>
+    </tr>
+    <tr>
+      <td>JIRA_BASE_URL<span class="kind variable">variable</span></td>
+      <td>Root web address of your Jira Cloud site.</td>
+      <td>Look at the browser bar on any Jira page. Keep only the origin — drop any path or trailing slash after <code>.net</code>.</td>
+      <td>https://your-company<br>.atlassian.net</td>
+    </tr>
+    <tr>
+      <td>JIRA_EMAIL<span class="kind variable">variable</span></td>
+      <td>Email of the Atlassian account that created the token.</td>
+      <td><a href="https://id.atlassian.com/manage-profile/profile-and-visibility">id.atlassian.com/manage-profile/profile-and-visibility</a>, or your avatar → <em>Profile</em>.</td>
+      <td>you@example.com</td>
+    </tr>
+  </tbody>
+</table></div>
+
+<p class="subhead">Either way</p>
+<div class="tw"><table class="cred">
+  <thead><tr><th>Value</th><th>Description</th><th>Where to get it</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>OPENROUTER_API_KEY<span class="kind secret">secret</span></td>
+      <td>Key the scope check and PR-Agent both use to call the model.</td>
+      <td><a href="https://openrouter.ai/keys">openrouter.ai/keys</a> → <em>Create Key</em> → name it → copy it once; it is not shown again.</td>
+      <td>sk-or-v1-…</td>
+    </tr>
+  </tbody>
+</table></div>
+
+<p><code>JIRA_BASE_URL</code> and <code>JIRA_EMAIL</code> are <strong>variables</strong>, not secrets — they are not sensitive, so they are typed in the clear.</p>
+
+<pre><code>gh secret   set OPENROUTER_API_KEY --repo owner/name   # prompts, hidden
+gh variable set JIRA_BASE_URL      --repo owner/name   # typed in the clear</code></pre>
+
+<div class="note danger">
+  <span class="lede">Never paste a token anywhere but that prompt</span>
+  <p>Not into a chat, not onto a command line, not into a file. Anything pasted into a chat must be treated as exposed — revoke it and issue a new one. The hidden prompt is the only safe route, and the CLI refuses arguments that look like tokens for exactly this reason.</p>
+</div>
+
+<p><code>OPENROUTER_API_KEY</code> is not optional. The scope check is a <strong>required</strong> status check configured to block on its own errors, so a missing or invalid key stops every pull request. That is deliberate: a check that cannot run must not look like a check that passed.</p>
+
+<p>Then apply:</p>
+
+<pre><code>/enforce-rules --repo owner/name --apply</code></pre>
+
+<p>In order: environment branches are created, the workflow files are committed, then the rulesets go up. That order is forced — a ruleset requiring a pull request for <code>dev</code> also refuses the push that <em>creates</em> <code>dev</code>. On a repo already synced, the blocking rulesets are switched off for the few seconds this takes, then restored. The plan says so first.</p>
+
+<div class="note">
+  <span class="lede">After applying</span>
+  <p><code>main</code> requires a pull request — for every actor, including the repository owner. There are no bypass actors.</p>
+</div>
+
+<h2 id="part2"><span class="num">Part 2</span>What now exists</h2>
+
+<h3>The guardrails</h3>
+
+<div class="tw"><table>
+  <thead><tr><th>Ruleset</th><th>Covers</th><th>Refuses</th></tr></thead>
+  <tbody>
+    <tr><td><code>Pull Request Compulsion</code></td><td><code>main</code> + every environment</td><td>direct pushes, deletion, force-push. A PR is required (0 approvals)</td></tr>
+    <tr><td><code>PR-SCOPE-CHECK</code></td><td>every environment</td><td>merging until the <code>scope-check</code> status passes</td></tr>
+    <tr><td><code>TRIVY-SECURITY</code></td><td>every environment</td><td>merging until the <code>trivy-security</code> scan passes</td></tr>
+    <tr><td><code>team-only-reviewer</code></td><td><code>prod</code>, when added</td><td>merging without 1 approval from the reviewer team, or a code owner</td></tr>
+    <tr><td><code>Enforce Branch Nomenclature</code></td><td>everything else</td><td><strong>creating</strong> a branch not shaped <code>&lt;prefix&gt;/&lt;task-id&gt;/&lt;description&gt;</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>The automation</h3>
+
+<div class="tw"><table>
+  <thead><tr><th>File</th><th>Fires when</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>clickup-sync.yml</code><br>or <code>jira-sync.yml</code></td><td>you push a work branch; a PR merges into an environment</td><td>moves the ticket forward</td></tr>
+    <tr><td><code>pr-scope-check.yml</code></td><td>a PR targets any environment</td><td>asks an AI whether the diff matches the ticket</td></tr>
+    <tr><td><code>scripts/scope-check.mjs</code></td><td>—</td><td>the logic that workflow runs</td></tr>
+    <tr><td><code>pr-agent.yml</code></td><td>a PR opens, or you comment <code>/review</code></td><td>description, review, inline suggestions, security gate</td></tr>
+    <tr><td><code>trivy-security.yml</code></td><td>a PR targets any environment</td><td>scans for vulnerable dependencies, hardcoded secrets and IaC misconfigurations</td></tr>
+    <tr><td><code>scripts/trivy-report.mjs</code></td><td>—</td><td>applies the threshold and posts the verdict</td></tr>
+  </tbody>
+</table></div>
+
+<p>All four live under <code>.github/</code> and are <strong>regenerated on every sync</strong>. Edit the config, not the workflow.</p>
+
+<h2 id="loop"><span class="num">Part 3</span>The developer loop</h2>
+
+<div class="step">
+  <div class="step-n">1</div>
+  <h3 class="step-h">Take a ticket, copy its id</h3>
+  <div class="step-body">
+    <pre><code>ClickUp   86d3bzhgq        short alphanumeric
+Jira      PROJ-123</code></pre>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">2</div>
+  <h3 class="step-h">Create the branch</h3>
+  <div class="step-body">
+    <pre><code>git switch -c feature/86d3bzhgq/checkout-redirect</code></pre>
+    <p>The shape is <code>&lt;prefix&gt;/&lt;task-id&gt;/&lt;description&gt;</code>, and all three segments are required.</p>
+    <div class="verdicts">
+      <div class="verdict yes"><span class="chip ok">created</span> feature/86d3bzhgq/checkout-redirect</div>
+      <div class="verdict yes"><span class="chip ok">created</span> bugfix/PROJ-123/null-on-empty-cart</div>
+      <div class="verdict yes"><span class="chip ok">created</span> feature/86d3bzhgq/fix/retry <span class="why">the description may contain slashes</span></div>
+      <div class="verdict no"><span class="chip no">refused</span> feature/86d3bzhgq <span class="why">no description</span></div>
+      <div class="verdict no"><span class="chip no">refused</span> feature/checkout-redirect <span class="why">only two segments</span></div>
+      <div class="verdict no"><span class="chip no">refused</span> wip/86d3bzhgq/thing <span class="why">wip is not an allowed prefix</span></div>
+    </div>
+    <p>Allowed prefixes: <code>feature</code>, <code>bugfix</code>, <code>hotfix</code>, <code>docs</code>, <code>chore</code>. A refused branch fails at <em>creation</em>, when you first push it — <code>push declined due to repository rule violations</code>. Nothing is lost; rename and push again with <code>git branch -m</code>.</p>
+    <div class="note">
+      <span class="lede">What the rule can and cannot check</span>
+      <p>A ref pattern can enforce the <em>shape</em> — three segments, known prefix — but it cannot tell a real ticket id from any other word. That check happens at pull-request time, where the tracker can actually be asked. The two together are the guarantee.</p>
+    </div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">3</div>
+  <h3 class="step-h">Push — the card moves to <em>in progress</em></h3>
+  <div class="step-body">
+    <pre><code>git push -u origin feature/86d3bzhgq/checkout-redirect</code></pre>
+    <p>That push alone takes the ticket out of to-do. No merge, no pull request, no dragging a card across a board.</p>
+    <p>Every later push runs the job too and does nothing — the pipeline only moves forward, so a ticket already at <em>in progress</em> or past it stays exactly where it is. Recognised to-do spellings: <code>to do</code>, <code>todo</code>, <code>open</code>, <code>backlog</code>, <code>pending</code>.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">4</div>
+  <h3 class="step-h">Open a pull request into <code>dev</code></h3>
+  <div class="step-body">
+    <pre><code>gh pr create --base dev \
+  --title "Checkout redirect" \
+  --body "https://app.clickup.com/t/86d3bzhgq"</code></pre>
+    <p>Base is <code>dev</code>; head is your feature branch. The ticket link in the body is the most reliable way for the scope check to find the ticket — the branch name works too, and so does an id in the title.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">5</div>
+  <h3 class="step-h">The checks run</h3>
+  <div class="step-body">
+    <p><strong>PR-Agent</strong> writes a summary, posts a review with file and line references, and leaves inline suggestions. It also labels the PR when it finds a security concern — and a second job reads that label and <strong>fails the check</strong>, blocking the merge until it is resolved. Comment <code>/review</code>, <code>/describe</code> or <code>/improve</code> to run it again.</p>
+    <p><strong>The scope check</strong> reads the ticket, compares it against your diff, and posts one verdict:</p>
+    <div class="tw"><table>
+      <thead><tr><th>Verdict</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><span class="chip ok">in scope</span></td><td>check passes, merge unblocked</td></tr>
+        <tr><td><span class="chip no">out of scope</span></td><td>check fails <strong>and the pull request is closed automatically</strong></td></tr>
+        <tr><td><span class="chip no">no ticket</span></td><td>check fails — link the ticket and push again</td></tr>
+        <tr><td><span class="chip no">errored</span></td><td>check fails — it will not pass on an error</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Trivy</strong> scans for vulnerable dependencies, hardcoded secrets and IaC misconfigurations, and posts one verdict comment. It needs no credentials. What blocks you is a <strong>severity threshold</strong>, applied only to the files your pull request touched:</p>
+    <div class="verdicts">
+      <div class="verdict no"><span class="chip no">blocked</span> CRITICAL secret in a file you changed</div>
+      <div class="verdict no"><span class="chip no">blocked</span> CRITICAL CVE your PR introduced</div>
+      <div class="verdict yes"><span class="chip ok">reported</span> CRITICAL CVE with no released fix <span class="why">nothing you could do would clear it</span></div>
+      <div class="verdict yes"><span class="chip ok">reported</span> HIGH misconfiguration</div>
+      <div class="verdict yes"><span class="chip ok">reported</span> a finding in a file you did not touch</div>
+    </div>
+    <p>A blocked pull request gets a table naming each finding — severity, file and line, identifier and the fix — plus <code>::error</code> annotations on the offending lines. Fix them, or take those files out of the pull request, and push again.</p>
+    <div class="note danger">
+      <span class="lede">Out of scope closes your pull request</span>
+      <p>This is the behaviour most worth knowing before it happens to you. Either strip the unrelated changes into their own branch and ticket, or widen the ticket's description to cover the work — then open a new PR.</p>
+    </div>
+    <p>Incidental changes are fine — imports, types, small config, the tests that make your change work. What gets flagged is a genuinely unrelated edit riding along: a drive-by refactor, an unrelated dependency bump, a fix for something the ticket never mentions.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">6</div>
+  <h3 class="step-h">Merge — the card moves to <em>dev</em></h3>
+  <div class="step-body">
+    <p>No approval is needed for <code>dev</code>; the pull request itself is the requirement.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">7</div>
+  <h3 class="step-h">Promote to <code>test</code> — the card moves to <em>QA</em></h3>
+  <div class="step-body">
+    <div class="note danger">
+      <span class="lede">Merge the feature branch, not dev</span>
+      <p>The ticket id is read from the <em>head branch name</em> of the merged pull request. <code>dev</code> carries no task id, so a <code>dev → test</code> promotion moves no card at all — the job logs <code>No task id in 'dev'; nothing to sync</code> and exits cleanly. It looks like success and does nothing.</p>
+    </div>
+    <pre><code>gh pr create --base test --head feature/86d3bzhgq/checkout-redirect</code></pre>
+    <p>The scope check runs here too — every environment is covered.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-n">8</div>
+  <h3 class="step-h">Promote to <code>prod</code> — the card moves to <em>done</em></h3>
+  <div class="step-body">
+    <p>Same again with <code>--base prod</code>. If <code>prod</code> is configured, this one also needs <strong>1 approval</strong> from the reviewer team, or from a code owner.</p>
+  </div>
+</div>
+
+<figure>
+  <div class="figbox">
+    <svg viewBox="0 0 780 150" role="img" aria-label="The ticket moves through five ranked statuses: to do at rank 0, then in progress on push, dev on merge into dev, QA on merge into test, and done on merge into prod. A ticket only ever moves to a higher rank.">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- rank scale -->
+      <line x1="10" y1="122" x2="770" y2="122" stroke="currentColor" stroke-width="1" opacity=".18"/>
+      <text x="10" y="140" font-family="ui-monospace, monospace" font-size="10" fill="currentColor" opacity=".5">rank 0</text>
+      <text x="770" y="140" font-family="ui-monospace, monospace" font-size="10" fill="currentColor" opacity=".5" text-anchor="end">rank 4 — forwards only</text>
+
+      <!-- boxes -->
+      <g font-family="ui-monospace, monospace" font-size="12.5" fill="currentColor">
+        <rect x="10"  y="52" width="104" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.25" opacity=".55"/>
+        <text x="62"  y="77" text-anchor="middle">to do</text>
+        <text x="62"  y="112" text-anchor="middle" font-size="10" opacity=".5">0</text>
+
+        <rect x="174" y="52" width="104" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="226" y="77" text-anchor="middle">in progress</text>
+        <text x="226" y="112" text-anchor="middle" font-size="10" opacity=".5">1</text>
+
+        <rect x="338" y="52" width="104" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="390" y="77" text-anchor="middle">dev</text>
+        <text x="390" y="112" text-anchor="middle" font-size="10" opacity=".5">2</text>
+
+        <rect x="502" y="52" width="104" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="554" y="77" text-anchor="middle">QA</text>
+        <text x="554" y="112" text-anchor="middle" font-size="10" opacity=".5">3</text>
+
+        <rect x="666" y="52" width="104" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="718" y="77" text-anchor="middle">done</text>
+        <text x="718" y="112" text-anchor="middle" font-size="10" opacity=".5">4</text>
+      </g>
+
+      <!-- arrows -->
+      <g stroke="currentColor" stroke-width="1.4" marker-end="url(#ar)">
+        <line x1="120" y1="72" x2="168" y2="72"/>
+        <line x1="284" y1="72" x2="332" y2="72"/>
+        <line x1="448" y1="72" x2="496" y2="72"/>
+        <line x1="612" y1="72" x2="660" y2="72"/>
+      </g>
+
+      <!-- arrow labels -->
+      <g font-family="ui-monospace, monospace" font-size="11" fill="currentColor" text-anchor="middle">
+        <text x="144" y="40">push</text>
+        <text x="308" y="40">→ dev</text>
+        <text x="472" y="40">→ test</text>
+        <text x="636" y="40">→ prod</text>
+      </g>
+
+      <text x="10" y="20" font-family="ui-monospace, monospace" font-size="10" fill="currentColor" opacity=".5">the action that moves it</text>
+    </svg>
+  </div>
+  <figcaption>The first arrow is a <em>push</em> of the feature branch; the other three are <em>merges of that same feature branch</em> into each environment. Rank is why the order holds: a ticket only ever moves to a higher number, so merging an old branch into <code>dev</code> can never pull a finished ticket back — and a status nobody declared, like <code>blocked</code>, is left alone rather than guessed at.</figcaption>
+</figure>
+
+<h2 id="part4"><span class="num">Part 4</span>When something blocks you</h2>
+
+<div class="tw"><table>
+  <thead><tr><th>What you see</th><th>What it means</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>push declined due to repository rule violations</code> on a new branch</td><td>the name is not <code>&lt;prefix&gt;/&lt;task-id&gt;/&lt;description&gt;</code></td><td><code>git branch -m</code> to a valid name, push again</td></tr>
+    <tr><td>Scope check: <em>no ticket linked</em></td><td>nothing in the branch, title or body resolved to a ticket</td><td>paste the ticket URL in the PR body, push again</td></tr>
+    <tr><td>Scope check failed, <strong>PR closed</strong></td><td>the AI judged part of the diff unrelated to the ticket</td><td>split the unrelated work out, or widen the ticket, then open a new PR</td></tr>
+    <tr><td>Scope check: <em>couldn't complete</em></td><td>usually <code>OPENROUTER_API_KEY</code> missing, invalid, or out of credit</td><td>an admin re-sets the secret; it blocks by design until then</td></tr>
+    <tr><td>Security gate failed</td><td>PR-Agent flagged a security concern</td><td>read its review comment, fix, push — the check re-runs</td></tr>
+    <tr><td>Trivy check failed</td><td>a <code>CRITICAL</code> finding in a file this PR changed</td><td>the comment names the file, line and fix; resolve it, or move that file out of this PR</td></tr>
+    <tr><td>Trivy flagged a CVE with no fix</td><td>upstream has published no patched version</td><td>reported, not blocking — if it <em>is</em> blocking, someone set <code>ignoreUnfixed: false</code></td></tr>
+    <tr><td>Merge button greyed out on <code>prod</code></td><td>1 approval from the reviewer team is outstanding</td><td>request review from the team or a code owner</td></tr>
+    <tr><td>Card didn't move on merge</td><td>the head branch carried no id (a <code>dev → test</code> promotion), or the status name does not exist in the tracker</td><td>merge the feature branch itself; check <code>environmentStatuses</code> against your board</td></tr>
+    <tr><td>Card didn't move on push</td><td>branch prefix is not in <code>allowedPrefixes</code>, or the tracker token is missing</td><td>the workflow run log says which</td></tr>
+    <tr><td><code>⚠ THIS RULESET IS BLOCKING MERGES</code></td><td>a leftover ruleset the config no longer manages demands a review this repo cannot supply</td><td>delete or edit it in Settings → Rules</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Two that catch admins</h3>
+
+<div class="note warn">
+  <span class="lede">“Apply … in that file via a pull request, then re-run”</span>
+  <p>The repository commits its own <code>.github/ruleset-config.json</code>, and that file <strong>wins</strong> over the plugin's. Policy for that repo can then only change by a pull request to that repo. To govern it centrally instead, delete the override and the plugin's config takes over again.</p>
+</div>
+
+<div class="note warn">
+  <span class="lede">Plugin changes that don't take effect</span>
+  <p><code>/enforce-rules</code> runs the <strong>installed</strong> copy of the plugin, not your working tree. Editing a checkout on your Desktop changes nothing until the change reaches the plugin repo's default branch and the install is refreshed with <code>claude plugin marketplace update</code>. This is the single most common reason a policy change “didn't apply”.</p>
+</div>
+
+<figure>
+  <div class="figbox">
+    <svg viewBox="0 0 780 240" role="img" aria-label="Policy resolution: running enforce-rules against a repository checks whether that repository commits its own ruleset-config.json. If it does, that file wins and can only be changed by a pull request to that repository. If it does not, the installed plugin's config governs, and that install is only refreshed by claude plugin marketplace update.">
+      <defs>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <g font-family="ui-monospace, monospace" font-size="11.5" fill="currentColor">
+        <rect x="230" y="12" width="320" height="34" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <text x="390" y="34" text-anchor="middle">/enforce-rules --repo owner/name</text>
+
+        <rect x="200" y="82" width="380" height="34" rx="4" fill="none" stroke="currentColor" stroke-width="1.25" opacity=".6"/>
+        <text x="390" y="104" text-anchor="middle" font-size="11">does that repo commit .github/ruleset-config.json ?</text>
+
+        <rect x="20" y="168" width="320" height="52" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="180" y="189" text-anchor="middle">that repo's file wins</text>
+        <text x="180" y="207" text-anchor="middle" font-size="10" opacity=".65">changed only by a PR to that repo</text>
+
+        <rect x="440" y="168" width="320" height="52" rx="4" fill="none" stroke="currentColor" stroke-width="1.75"/>
+        <text x="600" y="189" text-anchor="middle">the installed plugin's config</text>
+        <text x="600" y="207" text-anchor="middle" font-size="10" opacity=".65">governs every repo at once</text>
+      </g>
+
+      <g stroke="currentColor" stroke-width="1.4" marker-end="url(#ar2)" fill="none">
+        <line x1="390" y1="46" x2="390" y2="78"/>
+        <path d="M 300 116 L 300 142 L 180 142 L 180 164"/>
+        <path d="M 480 116 L 480 142 L 600 142 L 600 164"/>
+      </g>
+
+      <g font-family="ui-monospace, monospace" font-size="10.5" fill="currentColor">
+        <text x="292" y="136" text-anchor="end">yes</text>
+        <text x="488" y="136">no</text>
+      </g>
+
+      <line x1="600" y1="220" x2="600" y2="234" stroke="currentColor" stroke-width="1.4" stroke-dasharray="4 3"/>
+      <text x="612" y="236" font-family="ui-monospace, monospace" font-size="10" fill="currentColor" opacity=".65">refreshed by: claude plugin marketplace update</text>
+    </svg>
+  </div>
+  <figcaption>Which config actually governs a repository — and, on the right, the refresh step that decides whether an edit to the plugin has reached the machine running the command.</figcaption>
+</figure>
+
+<div class="tw"><table>
+  <thead><tr><th></th><th>Central — no override</th><th>Per-repo — committed override</th></tr></thead>
+  <tbody>
+    <tr><td>Change policy</td><td>edit the plugin, refresh, re-sync</td><td>a pull request to that repository</td></tr>
+    <tr><td><code>--env</code> from the CLI</td><td>works</td><td>refused</td></tr>
+    <tr><td>Rolls out to</td><td>every repo at once</td><td>that repo only</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="part5"><span class="num">Part 5</span>Admin operations</h2>
+
+<h3>Add an environment</h3>
+<pre><code>/enforce-rules --repo owner/name --env staging --apply</code></pre>
+<p>It joins the pull-request requirement, gets the scope check, is excluded from the branch-naming rule, and becomes a task-sync stage — all from the same list. <strong>Declaration order is the pipeline order</strong>, so an environment added later lands last; reorder <code>environments</code> if that is wrong for your real pipeline. An environment with no entry in <code>environmentStatuses</code> maps to a status of its own name.</p>
+
+<h3>Switch tracker</h3>
+<p><code>--provider jira</code> rewrites the sync workflow and plans a <code>DELETE</code> of the other provider's — leaving it behind would have both trackers moving tickets on every merge.</p>
+
+<h3>Turn a check off</h3>
+<p>Set <code>prChecks.scopeCheck.enabled</code> or <code>prAgent.enabled</code> to <code>false</code>; the next sync removes the file — but only if the plugin wrote it. A hand-written workflow at the same path is never deleted.</p>
+
+<h3>Loosen the branch shape</h3>
+<p><code>requireDescription: false</code> permits the bare <code>&lt;prefix&gt;/&lt;task-id&gt;</code> form again. Setting <code>taskIdPrefix</code> (say <code>"CU-"</code>) narrows the id segment to that marker.</p>
+
+<p class="kicker">Quick reference</p>
+
+<pre><code># start work
+git switch -c feature/86d3bzhgq/checkout-redirect
+git push -u origin feature/86d3bzhgq/checkout-redirect   # → card: in progress
+
+# ship it — always the feature branch, never dev → test
+gh pr create --base dev  --head feature/86d3bzhgq/checkout-redirect   # merge → card: dev
+gh pr create --base test --head feature/86d3bzhgq/checkout-redirect   # merge → card: QA
+gh pr create --base prod --head feature/86d3bzhgq/checkout-redirect   # merge → card: done</code></pre>
+
+<div class="tw"><table>
+  <tbody>
+    <tr><th>Branch shape</th><td><code>&lt;prefix&gt;/&lt;task-id&gt;/&lt;description&gt;</code></td></tr>
+    <tr><th>Prefixes</th><td><code>feature</code> <code>bugfix</code> <code>hotfix</code> <code>docs</code> <code>chore</code></td></tr>
+    <tr><th>Card moves on</th><td>a push, and every merge into an environment</td></tr>
+    <tr><th>Direction</th><td>forwards only, never backwards</td></tr>
+    <tr><th>Promotion</th><td>merge the <strong>feature branch</strong> into each environment</td></tr>
+    <tr><th>Out of scope</th><td>closes the pull request</td></tr>
+    <tr><th>Trivy</th><td><code>CRITICAL</code> in a file you changed blocks; everything else reports</td></tr>
+    <tr><th><code>prod</code></th><td>1 approval from the reviewer team</td></tr>
+  </tbody>
+</table></div>
+
+<footer>
+  Generated from <code>ruleset-config.json</code> at plugin 1.13.0. The canonical copy of this document lives at <code>docs/WORKFLOW.md</code> in the plugin repository — if the two disagree, the config is the truth and this page is stale.
+</footer>
+
+</div>
+
+</body>
+</html>

@@ -16,6 +16,10 @@ import {
   SCOPE_CHECK_WORKFLOW_PATH,
   SCOPE_CHECK_SCRIPT_PATH,
   PR_AGENT_WORKFLOW_PATH,
+  renderTrivyWorkflow,
+  TRIVY_WORKFLOW_PATH,
+  TRIVY_SCRIPT_PATH,
+  TRIVY_CONTEXT,
 } from "../src/prchecks.js";
 
 const ON = { prChecks: { scopeCheck: { enabled: true }, prAgent: { enabled: true } } };
@@ -259,4 +263,114 @@ test("the .mjs script is matched by its own comment-syntax marker", async () => 
   const generated = `${GENERATED_MARKER_JS}\nconsole.log(1);\n`;
   const orphans = await planPrCheckOrphans(stubClient({ [SCOPE_CHECK_SCRIPT_PATH]: generated }), []);
   assert.deepEqual(orphans.map((o) => o.path), [SCOPE_CHECK_SCRIPT_PATH]);
+});
+
+// --- the Trivy security scan -----------------------------------------------------
+
+const TRIVY_ON = { environments: { dev: {}, prod: {} }, prChecks: { trivy: { enabled: true } } };
+
+test("trivy is off unless configured, and its defaults are a complete config", () => {
+  assert.equal(normalizePrChecks({}).trivy.enabled, false);
+
+  const t = normalizePrChecks(TRIVY_ON).trivy;
+  assert.deepEqual(t.blockOn, ["CRITICAL"], "CRITICAL blocks by default");
+  assert.deepEqual(t.severities, ["CRITICAL", "HIGH", "MEDIUM"], "HIGH and MEDIUM are still reported");
+  assert.equal(t.blockScope, "changed-files");
+  assert.equal(t.ignoreUnfixed, true);
+  assert.equal(t.statusCheck, "trivy-security");
+  assert.equal(t.rulesetName, "TRIVY-SECURITY");
+});
+
+test("the workflow's job id IS the required status-check context", () => {
+  // Renaming one without the other leaves a required check waiting forever.
+  const trivy = normalizePrChecks(TRIVY_ON).trivy;
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy });
+
+  assert.match(yaml, new RegExp(`^  ${trivy.statusCheck}:$`, "m"));
+  assert.equal(trivy.statusCheck, TRIVY_CONTEXT);
+});
+
+test("the scan triggers on pull requests targeting every declared environment", () => {
+  const yaml = renderTrivyWorkflow({
+    environments: ["dev", "test", "prod"],
+    trivy: normalizePrChecks(TRIVY_ON).trivy,
+  });
+  for (const env of ["dev", "test", "prod"]) assert.ok(yaml.includes(`      - '${env}'`), env);
+});
+
+test("the checkout is deep, because the changed-file list needs history", () => {
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy: normalizePrChecks(TRIVY_ON).trivy });
+  assert.match(yaml, /fetch-depth: 0/);
+});
+
+/**
+ * The scan step must not be the gate. Trivy exits non-zero when it finds
+ * anything, which would fail the job before the author is told what was found —
+ * and would ignore the threshold and scope entirely.
+ */
+test("the scan step cannot fail the job; the report script decides", () => {
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy: normalizePrChecks(TRIVY_ON).trivy });
+  assert.match(yaml, /continue-on-error: true/);
+  assert.match(yaml, /run: node \.github\/scripts\/trivy-report\.mjs/);
+});
+
+test("the action is pinned to a release, not a moving branch", () => {
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy: normalizePrChecks(TRIVY_ON).trivy });
+  assert.match(yaml, /aquasecurity\/trivy-action@\d+\.\d+\.\d+/);
+  assert.doesNotMatch(yaml, /trivy-action@(main|master)/, "a gate must not change on someone else's push");
+});
+
+test("the threshold and scope reach the script as environment values", () => {
+  const trivy = { ...normalizePrChecks(TRIVY_ON).trivy, blockOn: ["CRITICAL", "HIGH"], blockScope: "repository" };
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy });
+
+  assert.match(yaml, /BLOCK_ON: "CRITICAL,HIGH"/);
+  assert.match(yaml, /BLOCK_SCOPE: "repository"/);
+  assert.match(yaml, /severity: 'CRITICAL,HIGH,MEDIUM'/, "Trivy still looks wider than it blocks");
+});
+
+test("no environments means no workflow, and the plan says why", async () => {
+  const client = stubClient({});
+  const plan = await planPrChecks(client, { environments: {}, prChecks: { trivy: { enabled: true } } }, { provider: null });
+
+  assert.deepEqual(plan.files, []);
+  assert.ok(plan.blocked.some((b) => b.what === TRIVY_WORKFLOW_PATH && /nothing for it to trigger on/.test(b.reason)));
+});
+
+test("both trivy files are planned, and the policy rides along for the plan to print", async () => {
+  const client = stubClient({});
+  const plan = await planPrChecks(client, TRIVY_ON, { provider: null });
+
+  assert.deepEqual(plan.files.map((f) => f.path), [TRIVY_WORKFLOW_PATH, TRIVY_SCRIPT_PATH]);
+  assert.ok(plan.files.every((f) => f.action === "create"));
+  assert.deepEqual(plan.trivy.blockOn, ["CRITICAL"]);
+  assert.deepEqual(plan.secrets, [], "Trivy needs no secret — it pulls its database with the workflow token");
+});
+
+test("turning trivy off removes the files it wrote, and only those", async () => {
+  const client = stubClient({
+    [TRIVY_WORKFLOW_PATH]: `${GENERATED_MARKER} ...`,
+    [TRIVY_SCRIPT_PATH]: `${GENERATED_MARKER_JS} ...`,
+  });
+  const orphans = await planPrCheckOrphans(client, []);
+  assert.deepEqual(orphans.map((o) => o.path).sort(), [TRIVY_SCRIPT_PATH, TRIVY_WORKFLOW_PATH].sort());
+});
+
+test("a hand-written file at a trivy path is adopted loudly, never deleted", async () => {
+  const client = stubClient({ [TRIVY_WORKFLOW_PATH]: "name: our own trivy\n" });
+
+  const plan = await planPrChecks(client, TRIVY_ON, { provider: null });
+  assert.equal(plan.files.find((f) => f.path === TRIVY_WORKFLOW_PATH).adopting, true);
+
+  const orphans = await planPrCheckOrphans(client, []);
+  assert.deepEqual(orphans, [], "without the marker it is not ours to remove");
+});
+
+test("the generated script is the plugin's asset, marked as generated", async () => {
+  const client = stubClient({});
+  const plan = await planPrChecks(client, TRIVY_ON, { provider: null });
+  const script = plan.files.find((f) => f.path === TRIVY_SCRIPT_PATH);
+
+  assert.ok(script.content.startsWith(GENERATED_MARKER_JS));
+  assert.match(script.content, /export function isBlocking/, "the real logic, copied verbatim");
 });

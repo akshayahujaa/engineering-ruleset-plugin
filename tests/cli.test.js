@@ -807,3 +807,62 @@ test("a push stage with nothing to match is reported in the plan", () => {
   assert.equal(plan, null, "human output, not --json");
   assert.match(stdout, /no push stage: branchNaming\.allowedPrefixes is empty/);
 });
+
+// --- credentials: a link you can open, not a settings tree to navigate ----------
+
+/**
+ * The point of these assertions is the URL. A hint like "Settings → Apps → API
+ * Token" makes the reader hunt; a link means whoever holds the account can open
+ * one thing and generate the token there. Pinned so they cannot regress to prose.
+ */
+test("the plan links straight to ClickUp's token page", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_SYNC) }, []);
+  assert.match(stdout, /https:\/\/app\.clickup\.com\/settings\/apps/);
+  assert.match(stdout, /starts 'pk_'/, "and says what a real value looks like");
+});
+
+test("the plan links straight to Atlassian's API-token page", () => {
+  const jira = { ...MINIMAL, taskSync: { enabled: true, provider: "jira" } };
+  const { stdout } = run({ ...baseFixture(), ...override(jira) }, []);
+  assert.match(stdout, /https:\/\/id\.atlassian\.com\/manage-profile\/security\/api-tokens/);
+  assert.match(stdout, /starts 'ATATT'/);
+});
+
+test("the plan links straight to OpenRouter's key page", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_PR_CHECKS) }, []);
+  assert.match(stdout, /https:\/\/openrouter\.ai\/keys/);
+  assert.match(stdout, /starts 'sk-or-'/);
+});
+
+/**
+ * Jira's two variables are not secrets, so there is no hidden prompt for them —
+ * which makes "where do I find this value" the only useful thing the plan can
+ * say. One command each, not a NAME placeholder shared between them.
+ */
+test("each missing Jira variable gets its own command and its own source", () => {
+  const jira = { ...MINIMAL, taskSync: { enabled: true, provider: "jira" } };
+  const { stdout } = run({ ...baseFixture(), ...override(jira) }, []);
+
+  assert.match(stdout, new RegExp(`gh variable set JIRA_BASE_URL --repo ${REPO}`));
+  assert.match(stdout, new RegExp(`gh variable set JIRA_EMAIL --repo ${REPO}`));
+  assert.doesNotMatch(stdout, /gh variable set NAME/, "no placeholder to decode");
+  assert.match(stdout, /copy it from the browser bar/, "where JIRA_BASE_URL comes from");
+  assert.match(stdout, /profile-and-visibility/, "where JIRA_EMAIL comes from");
+});
+
+test("a token following --set-token is refused with the revoke links", () => {
+  const { stdout, status } = run({ ...baseFixture() }, ["--set-token", "pk_12345678abcdef"]);
+  assert.equal(status, 1);
+  assert.match(stdout, /--set-token takes no value/);
+  assert.match(stdout, /https:\/\/app\.clickup\.com\/settings\/apps/);
+  assert.match(stdout, /https:\/\/id\.atlassian\.com\/manage-profile\/security\/api-tokens/);
+  assert.doesNotMatch(stdout, /pk_12345678abcdef/, "the value itself is never echoed back in full");
+});
+
+test("a bare token anywhere in argv is refused with the same links", () => {
+  const { stdout, status } = run({ ...baseFixture() }, ["ATATT3xFfGF0abcdef"]);
+  assert.equal(status, 1);
+  assert.match(stdout, /looks like an API token/);
+  assert.match(stdout, /https:\/\/id\.atlassian\.com\/manage-profile\/security\/api-tokens/);
+  assert.doesNotMatch(stdout, /ATATT3xFfGF0abcdef/, "never echoed back in full");
+});
