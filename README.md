@@ -119,8 +119,8 @@ have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
 When `taskSync.enabled` is set (a legacy `clickup` section still works), the sync also installs a
 tracker workflow in the target repo — `.github/workflows/clickup-sync.yml` or `jira-sync.yml`,
-by `taskSync.provider`. It fires on a merged PR into **any** environment and moves the linked task
-to that environment's status.
+by `taskSync.provider`. It fires when a work branch is **pushed**, and on a merged PR into **any**
+environment, and moves the linked task to that stage's status.
 
 ### The pipeline
 
@@ -132,7 +132,8 @@ itself:
 ```jsonc
 "environments":  { "dev": {…}, "test": {…}, "prod": {…} },   // ← this order is the pipeline
 "taskSync": {
-  "environmentStatuses": { "dev": "in progress", "test": "QA", "prod": "done" }
+  "branchPushStatus": "in progress",                        // ← stage 1, before any merge
+  "environmentStatuses": { "dev": "dev", "test": "QA", "prod": "done" }
 }
 ```
 
@@ -140,28 +141,59 @@ An entry for an environment that is not declared does nothing — the shipped co
 three, but a repo that has only `dev` gets a one-stage pipeline until it adds the others.
 
 ```
-merge into dev   → in progress
-merge into test  → QA
-merge into prod  → done
-merge into staging → staging      (no entry needed: an env defaults to its own name)
+push feature/86d3bz/x → in progress
+merge into dev        → dev
+merge into test       → QA
+merge into prod       → done
+merge into staging    → staging   (no entry needed: an env defaults to its own name)
 ```
+
+Every status here has to exist in your tracker's own workflow. The shipped mapping assumes a board
+with **to do → in progress → dev → QA → done**; rename them in `environmentStatuses` if yours
+differ, rather than editing the generated workflow.
+
+### Pushing a branch starts the work
+
+`taskSync.branchPushStatus` is the first stage, ahead of every environment. Push
+`feature/86d3bz/add-login` and the linked task leaves to-do immediately — no merge, no pull
+request, no manual drag:
+
+```
+to do       → push feature/86d3bz/add-login  → in progress
+in progress → push again                     → left alone (already there)
+done        → push again                     → left alone (never backwards)
+```
+
+The trigger patterns are `<prefix>/**` for every `branchNaming.allowedPrefixes` entry, so the one
+list that decides which branch names are legal also decides which pushes count. Every push runs the
+job; only the first one moves anything, because the pipeline is forwards-only.
+
+It is **off unless configured** — a version bump must not start writing to the tracker on every
+push in every repo already synced. If it is set but `allowedPrefixes` is empty there is nothing for
+a push to match, and the plan says so rather than shipping a workflow that quietly ignores half the
+config.
 
 Add `staging` and it becomes a stage automatically, with a `staging` status — the workflow is
 regenerated with the new trigger branch and the new mapping. Set an environment's status to
 `null` to keep it out of task sync entirely; if that leaves no stages at all, no workflow is
 installed and an existing one is removed.
 
-**Forwards only.** Each stage has a rank; every to-do spelling is rank 0. A merge advances a task
-only when its current status ranks *below* the arriving stage, so merging an old branch into `dev`
-can never pull a finished task back to *in progress*:
+**Forwards only.** Each stage has a rank; every to-do spelling is rank 0, a push stage takes rank 1,
+and the environments follow behind it. A stage advances a task only when its current status ranks
+*below* the arriving one, so merging an old branch into `dev` can never pull a finished task back:
 
 ```
 to do       → merge to test  → moves to QA
-in progress → merge to test  → moves to QA
-QA          → merge to dev   → left alone (already past 'in progress')
+in progress → merge to dev   → moves to dev
+dev         → merge to test  → moves to QA
+QA          → merge to dev   → left alone (already past 'dev')
 done        → merge to prod  → left alone (already at 'done')
 blocked     → merge to test  → left alone (not in the pipeline — never guessed at)
 ```
+
+The push status is ranked too, which is what keeps it a head start rather than a dead end: a task
+sitting at *in progress* because its branch was pushed must still rank, or the first merge would
+read it as a status outside the pipeline and leave it there for good.
 
 A status the config never declares is deliberately left alone rather than ranked, because it could
 sit anywhere in the workflow — including past the end.
@@ -186,17 +218,31 @@ developer's machine can react to someone else merging a PR.
 
 ### The branch name is the link
 
-`branchNaming.requireTaskId` narrows every prefix from `feature/**` to `feature/CU-<id>[/…]`, so
-the ruleset itself guarantees each branch carries a task:
+`branchNaming.requireTaskId` plus `requireDescription` narrows every prefix from `feature/**` to
+**`feature/<task-id>/<description>`**, so the ruleset itself guarantees each branch carries a task
+and says what it is for:
 
 ```
-feature/CU-123/checkout-redirect     ✓ task 123
-feature/CU-86c1abcde                 ✓ task 86c1abcde
-feature/checkout-redirect            ✗ blocked at creation
+feature/86d3bzhgq/checkout-redirect  ✓ task 86d3bzhgq
+feature/PROJ-123/checkout-redirect   ✓ a Jira key is just as valid an id
+feature/86d3bzhgq/fix/retry          ✓ the description may contain slashes
+feature/86d3bzhgq                    ✗ blocked — no description
+feature/checkout-redirect            ✗ blocked — two segments
 ```
 
-**This tightens an existing rule.** Once applied, branches without an id are refused at creation.
-Existing branches are untouched, but the next one your team makes must carry a task id.
+There is no `CU-` (or any other) marker prefix: `taskIdPrefix` is `""`, so the id is simply the
+second segment, whatever the tracker calls it. Set `taskIdPrefix` if you do want one — it composes,
+narrowing the id segment to `<prefix>*` while the description stays mandatory.
+
+**A ref pattern cannot tell an id from a word.** With no marker prefix, `feature/*` matches
+anything, which is exactly why the description segment is required: the *shape* is what a ruleset
+can enforce. Whether the second segment names a **real** ticket is checked where the tracker can
+actually be asked — the scope check, at pull-request time, with `requireTask: true`. The two
+together are the guarantee; neither is on its own.
+
+**This tightens an existing rule.** Once applied, branches without both segments are refused at
+creation. Existing branches are untouched, but the next one your team makes must carry a task id and
+a description.
 
 ### The token
 
@@ -243,27 +289,32 @@ it is present.
 Without the secret the workflow still runs, logs a warning, and changes nothing. The sync only
 ever *checks whether* the secret exists — the API cannot return its value.
 
-### Secrets other status checks need
+### Every credential the checks need, at once
 
-`PR-SCOPE-CHECK` requires a status check named `scope-check` to pass before merging into `dev` —
-but the sync only **requires** it; it does not generate the workflow that produces it (unlike
-ClickUp/Jira sync, which it generates end to end). That check comes from a separate suite (the
-pr-guardrails scope-check workflow), and it needs `OPENROUTER_API_KEY` to call its AI provider.
+Choosing a tracker turns on more than the tracker: the scope check reads the ticket from it, and
+both PR checks call an AI provider. So **all** of it is reported the moment a provider is picked,
+rather than the tracker token now and the rest whenever someone next reads a plan closely.
 
-`environments.<env>.statusCheckSecrets` names any secrets a status check needs:
+Two kinds, and the wording says which:
+
+| Message | Meaning |
+|---|---|
+| `required for a configured status check` | a ruleset requires the check it feeds, so a merge can block on it |
+| `required by a pull-request check this sync generates` | the workflow is installed here and cannot run without it |
+
+`baseline.statusCheckSecrets` (or `environments.<env>.statusCheckSecrets`) names the secrets a
+required status check needs; the PR checks contribute their own from `aiKeySecret` / `keySecret`:
 
 ```jsonc
-"environments": {
-  "dev": {
-    "statusChecks": ["scope-check"],
-    "statusCheckSecrets": ["OPENROUTER_API_KEY"]
-  }
+"baseline": {
+  "statusChecks": ["scope-check"],
+  "statusCheckRuleset": "PR-SCOPE-CHECK",
+  "statusCheckSecrets": ["OPENROUTER_API_KEY"]
 }
 ```
 
 Missing ones get the **exact same treatment** as the tracker token: on a real terminal, checked on
-every interactive run (not just first sync, since this isn't a "you just picked something" moment
-— it's a standing requirement of the config),
+every interactive run (not just first sync, since these are a standing requirement of the config),
 
 ```
 The 'OPENROUTER_API_KEY' secret is required for a configured status check and is not set.
@@ -280,7 +331,11 @@ merges may block on it until it is. Set it yourself, in your own terminal:
     gh secret set OPENROUTER_API_KEY --repo owner/name
 ```
 
-`--json` carries the same list as `missingStatusCheckSecrets`.
+The tracker's own token and variables are **not** repeated here — they report through their own
+lines, so one plan never asks for the same secret twice. Non-sensitive values a check needs get a
+`gh variable set` line instead, since there is nothing to hide.
+
+`--json` carries `missingStatusCheckSecrets` and `missingCheckVariables`.
 
 ## PR checks: scope check and PR-Agent review
 
@@ -311,7 +366,7 @@ looking like a passing one:
            prChecks.scopeCheck.enabled to false
 ```
 
-### It follows your environments
+### It follows your environments — and so does the requirement
 
 The scope check triggers on pull requests targeting **every declared
 environment**, from the same list that drives every ruleset — add `staging` and
@@ -319,6 +374,38 @@ it is checked there too, with no second edit. The job id is `scope-check`,
 which is exactly the context `PR-SCOPE-CHECK` requires: they are generated from
 the same source so a rename can never leave a required check waiting on a
 workflow nobody reports.
+
+**Being required follows the same list.** `baseline.statusChecks` puts the check on every
+environment in one ruleset, so `PR-SCOPE-CHECK` covers `dev, test, prod` — and any name added
+later — instead of only the environment that happened to declare it:
+
+```
+  CREATE   PR-SCOPE-CHECK                 → dev, test, prod
+```
+
+That closes a real gap: the check used to be declared on `dev` alone, so an added environment had
+the workflow *running* on its pull requests with nothing *requiring* it to pass. An environment may
+still name extra checks of its own; those keep their own ruleset, and anything the baseline already
+requires is not demanded twice.
+
+Never the default branch, though. The check reports on pull requests targeting an
+*environment*, so requiring it on the default branch would demand a check nothing ever reports
+there — permanently unmergeable.
+
+For the same reason, a required check that **cannot be reported** is dropped rather than required.
+If the scope check is enabled but cannot be generated (no tracker), requiring `scope-check` would
+block every merge into every environment on a check that never runs, so the plan drops it and says
+so:
+
+```
+  SKIPPED  PR-SCOPE-CHECK                 → not created; nothing it asked for can apply here
+           [degraded: required_status_checks dropped — 'scope-check' cannot be reported on this
+            repository, so requiring it on dev, prod would block every merge instead of guarding it]
+```
+
+A ruleset a previous sync already created is **neutered** instead of abandoned — its deletion and
+force-push protection stay, its impossible check goes — because dropping it from the desired set
+would leave the live one blocking merges forever.
 
 ### Configuration
 
@@ -554,7 +641,7 @@ connected repo to one working environment instead of three, and means `prod` arr
 stricter policy intact rather than as a bare branch:
 
 ```jsonc
-"environments":        { "dev": { "statusChecks": ["scope-check"] } },
+"environments":        { "dev": {} },
 "environmentProfiles": {
   "test": {},
   "prod": { "requiredApprovals": 1, "reviewerTeams": ["tehvault/reviewers"] }
@@ -628,17 +715,18 @@ Everything is generated from `ruleset-config.json`. Adding an environment is one
 
 ```json
 "environments": {
-  "dev":     { "statusChecks": ["pr-scope/check"], "statusCheckRuleset": "PR-SCOPE-CHECK" },
+  "dev":     {},
   "test":    {},
   "staging": {},
   "prod":    { "requiredApprovals": 1, "reviewerTeams": ["tehvault/reviewers"] }
 }
 ```
 
-`staging` is now covered by the pull-request requirement *and* excluded from the branch-naming
-rule, because both rulesets are generated from the same environment list. An environment that
-declares its own `statusChecks` or `requiredApprovals` gets its own ruleset, named
-`status-checks-<env>` or `reviewers-<env>` unless you name it explicitly.
+`staging` is now covered by the pull-request requirement, required to pass the scope check, *and*
+excluded from the branch-naming rule, because all three rulesets are generated from the same
+environment list. An environment that declares its own extra `statusChecks` or `requiredApprovals`
+gets its own ruleset too, named `status-checks-<env>` or `reviewers-<env>` unless you name it
+explicitly.
 
 A repository can override the bundled policy by committing `.github/ruleset-config.json`, which
 takes precedence.
@@ -648,9 +736,9 @@ takes precedence.
 | Ruleset | Scope | Effect |
 |---|---|---|
 | `Pull Request Compulsion` | default branch + every environment | PR required; no deletion, no force-push |
-| `PR-SCOPE-CHECK` | `dev` | status check `pr-scope/check` |
+| `PR-SCOPE-CHECK` | every environment | status check `scope-check` |
 | `team-only-reviewer` | `prod` | 1 approval, from `tehvault/reviewers` where available, else from a code owner |
-| `Enforce Branch Nomenclature` | everything else | restricts creation; PR + 1 approval |
+| `Enforce Branch Nomenclature` | everything else | restricts creation; permits `<prefix>/<task-id>/<description>`; PR + 1 approval |
 
 ## Behaviour worth knowing
 
@@ -683,5 +771,6 @@ npm test
 
 ## Not included
 
-ClickUp task lifecycle, PR scope checks in CI, and Kubernetes/Argo access — steps 2–4 of the
-roadmap. Also: tag rulesets, org-level rulesets, and deleting undeclared rulesets.
+Kubernetes/Argo access — step 4 of the roadmap. Also: tag rulesets, org-level rulesets, and
+deleting undeclared rulesets. Validating that a branch's task id names a **real** ticket is not a
+ruleset's job either — the scope check does that at pull-request time.

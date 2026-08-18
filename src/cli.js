@@ -48,6 +48,8 @@ import {
   planPrCheckOrphans,
   applyPrCheckFile,
   removePrCheckOrphan,
+  SCOPE_CHECK_CONTEXT,
+  SCOPE_CHECK_WORKFLOW_PATH,
 } from "./prchecks.js";
 import {
   probeAccess,
@@ -69,6 +71,62 @@ const PROVIDER_CHOICES = ["clickup", "jira", "none"];
 const STATUS_CHECK_SECRETS = {
   OPENROUTER_API_KEY: { label: "OpenRouter", tokenHint: "openrouter.ai → Keys → Create Key" },
 };
+
+/**
+ * Every credential the configured checks need, with why each one is needed.
+ *
+ * One list, gathered once, so choosing a task tracker surfaces ALL of the
+ * repository's missing credentials at that moment — the AI key the scope check
+ * and PR-Agent both read included — instead of the tracker token now and the
+ * rest whenever someone next reads a plan closely. An absent secret makes a
+ * required check fail, and a check that cannot run looks exactly like a check
+ * that has not finished.
+ *
+ * The tracker's OWN secret and variables are excluded: they report through
+ * `sync.hasToken` / `sync.missingVariables`, and naming them here as well would
+ * say the same thing twice in one plan.
+ *
+ * @returns {{secrets: string[], variables: string[], reasons: Map<string, string>}}
+ */
+function requiredCredentials(config, sync, prChecks) {
+  const reasons = new Map();
+  // First writer wins, and status checks are written first on purpose: theirs
+  // is the strongest claim — a required check that cannot run blocks every
+  // merge — so it supplies the wording when two things want one secret.
+  const note = (name, reason) => {
+    if (!reasons.has(name)) reasons.set(name, reason);
+  };
+
+  for (const name of requiredStatusCheckSecrets(config)) {
+    note(name, "required for a configured status check");
+  }
+  for (const name of prChecks.secrets) {
+    note(name, "required by a pull-request check this sync generates");
+  }
+
+  const trackerOwned = new Set(
+    [sync?.secretName, ...(PROVIDERS[sync?.provider]?.requiredVariables ?? [])].filter(Boolean),
+  );
+  const variables = prChecks.variables.filter((name) => !trackerOwned.has(name));
+  for (const name of trackerOwned) reasons.delete(name);
+
+  return { secrets: [...reasons.keys()], variables, reasons };
+}
+
+/**
+ * Status checks the config requires that nothing here can report.
+ *
+ * Only a check this plugin was supposed to generate and could NOT is provably
+ * unreportable. A scope check merely switched off in `prChecks` is a different
+ * case: this plugin required that context for a long time before it generated
+ * one, and the separate pr-guardrails suite may still be supplying it — so that
+ * stays silent rather than quietly dropping a rule the repo does honour.
+ */
+function unavailableStatusChecks(prChecks) {
+  return prChecks.blocked.some((note) => note.what === SCOPE_CHECK_WORKFLOW_PATH)
+    ? [SCOPE_CHECK_CONTEXT]
+    : [];
+}
 
 /** True only on a real terminal; under the slash command stdin is a pipe. */
 const isInteractive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -501,16 +559,35 @@ async function main() {
     }
   }
 
-  // Any secret a configured status check needs to actually run — currently
-  // dev's scope-check, which needs OPENROUTER_API_KEY. This plugin never
-  // generates that workflow (it is the separate pr-guardrails scope-check
-  // suite), but a merge can depend on the check regardless, so it is worth
-  // making sure the ingredient exists before that happens. Checked once, up
-  // front, so the same list drives the interactive offer below AND the later
-  // --json / plan-fallback reporting without re-querying GitHub for it twice.
+  // The task-sync and PR-check plans are read-only, and they come first because
+  // two later decisions need them: which credentials the chosen provider makes
+  // mandatory (right below), and whether a required status check can be
+  // reported at all (the compiler, further down).
+  const sync = await planTaskSync(client, config);
+  const orphans = await planSyncOrphans(client, sync?.provider ?? null);
+
+  // PR-check workflows are generated the same way and land in the same place,
+  // so they share the relax window below. Their issue provider comes from the
+  // tracker already chosen, so ClickUp/Jira never has to be configured twice.
+  const prChecks = await planPrChecks(client, config, { provider: sync?.provider ?? null });
+  const prCheckOrphans = await planPrCheckOrphans(client, prChecks.files.map((f) => f.path));
+  const prCheckWrites = prChecks.files.filter((f) => f.action !== "unchanged");
+
+  // Every credential the configured checks need, in one list, so picking a
+  // provider surfaces ALL of it at once rather than the tracker token now and
+  // the AI key whenever someone next reads the plan closely.
+  //
+  // Excludes the tracker's own secret and variables: those have their own
+  // reporting path (sync.hasToken / sync.missingVariables) and would otherwise
+  // be named twice.
+  const required = requiredCredentials(config, sync, prChecks);
   const missingStatusCheckSecrets = [];
-  for (const name of requiredStatusCheckSecrets(config)) {
+  for (const name of required.secrets) {
     if (!(await client.hasSecret(name))) missingStatusCheckSecrets.push(name);
+  }
+  const missingCheckVariables = [];
+  for (const name of required.variables) {
+    if (!(await client.hasVariable(name))) missingCheckVariables.push(name);
   }
 
   // Same offer as the tracker's, above — but unlike that one, this is not
@@ -521,7 +598,7 @@ async function main() {
       const known = STATUS_CHECK_SECRETS[name];
       if (
         await askYesNo(
-          `\nThe '${name}' secret is required for a configured status check and is not set. ` +
+          `\nThe '${name}' secret is ${required.reasons.get(name)} and is not set. ` +
             `Set it up now, via gh's hidden prompt? [y/N] `,
         )
       ) {
@@ -658,6 +735,13 @@ async function main() {
     // must still be emitted (neutered) if it already exists, or the live one
     // keeps blocking merges while the plan calls it merely "unmanaged".
     existingRulesetNames: preexisting.map((r) => r.name),
+    // Checks the config requires that nothing here can report. The compiler
+    // drops these rather than requiring them: a required check no workflow
+    // reports never turns green, so it blocks every merge instead of guarding
+    // it — and one baseline ruleset now carries the check across EVERY
+    // environment, so getting this wrong would brick the whole pipeline, not
+    // one branch.
+    unavailableStatusChecks: unavailableStatusChecks(prChecks),
   };
   // A team this run creates or fills is as big as the seed it gets, which is
   // what makes its review satisfiable — a team review needs one approver who
@@ -666,15 +750,6 @@ async function main() {
 
   let { rulesets, degradations } = compile(config, compileContext);
   let { steps, undeclared } = await plan(client, rulesets);
-  const sync = await planTaskSync(client, config);
-  const orphans = await planSyncOrphans(client, sync?.provider ?? null);
-
-  // PR-check workflows are generated the same way and land in the same place,
-  // so they share the relax window below. Their issue provider comes from the
-  // tracker already chosen, so ClickUp/Jira never has to be configured twice.
-  const prChecks = await planPrChecks(client, config, { provider: sync?.provider ?? null });
-  const prCheckOrphans = await planPrCheckOrphans(client, prChecks.files.map((f) => f.path));
-  const prCheckWrites = prChecks.files.filter((f) => f.action !== "unchanged");
 
   const syncPending =
     Boolean(sync && sync.action !== "unchanged") ||
@@ -738,6 +813,9 @@ async function main() {
             // The pipeline is the whole subject of a task-sync change; a JSON
             // consumer approving an update must be able to see it.
             pipeline: sync.pipeline,
+            // Rank 1, ahead of every environment: the stage a push reaches.
+            push: sync.push,
+            pushBlocked: sync.pushBlocked,
           },
           removedSyncWorkflows: orphans.map((o) => o.path),
           prChecks: {
@@ -745,10 +823,12 @@ async function main() {
             blocked: prChecks.blocked,
             removed: prCheckOrphans.map((o) => o.path),
           },
-          // Secrets a configured status check needs (e.g. OPENROUTER_API_KEY
-          // for dev's scope-check) that are not set on the repository. This
-          // plugin does not generate that workflow, only names what it needs.
+          // Secrets the configured checks need (e.g. OPENROUTER_API_KEY, which
+          // both the scope check and PR-Agent read) that are not set on the
+          // repository. Excludes the tracker's own token — that is taskSync.hasToken.
           missingStatusCheckSecrets,
+          // Non-sensitive repository variables those same checks need.
+          missingCheckVariables,
           teamsToCreate,
           teamsToFill,
           teamSeed: {
@@ -957,11 +1037,26 @@ async function main() {
   }
 
   if (sync) {
+    // The push stage is printed first because it IS first: it is rank 1, ahead
+    // of every environment, and reading the pipeline without it would suggest a
+    // task only starts moving once something is merged.
+    const pushLine = sync.push
+      ? `\n${" ".repeat(13)} push ${sync.push.prefixes.map((p) => `${p}/**`).join(", ")} → '${sync.push.status}'`
+      : "";
     console.log(
       `\n  ${ICON[sync.action]}  ${sync.path.padEnd(30)} → ${sync.providerLabel} pipeline:` +
+        pushLine +
         `\n${sync.pipeline.map((st) => `${" ".repeat(13)} merge into ${st.env} → '${st.status}'`).join("\n")}` +
         `\n${" ".repeat(13)} (forwards only — a task at or past a stage is never pulled back)`,
     );
+    // Asked for and not delivered: an unmentioned push stage is indistinguishable
+    // from one nobody configured.
+    if (sync.pushBlocked) {
+      console.log(
+        `${" ".repeat(13)}[no push stage: ${sync.pushBlocked} —` +
+          `\n${" ".repeat(13)} tasks will only move on merges until then]`,
+      );
+    }
     if (sync.provider === "jira" && config.branchNaming && (config.branchNaming.taskIdPrefix ?? "CU-") === "CU-") {
       console.log(
         `             [branchNaming.taskIdPrefix is 'CU-' (ClickUp-flavoured); for Jira, set it to` +
@@ -1054,11 +1149,22 @@ async function main() {
   for (const name of missingStatusCheckSecrets) {
     const known = STATUS_CHECK_SECRETS[name];
     console.log(
-      `\n  The '${name}' secret is required for a configured status check and is not set —` +
+      `\n  The '${name}' secret is ${required.reasons.get(name)} and is not set —` +
         `\n  merges may block on it until it is. Set it yourself, in your own terminal:` +
         `\n\n      gh secret set ${name} --repo ${client.owner}/${client.repo}` +
         `\n\n  (or re-run this on a real terminal, which offers to set it up for you).` +
         (known ? ` Get one from ${known.tokenHint}.` : ""),
+    );
+  }
+
+  // Not secrets, so there is no hidden-prompt hand-off for these — just the
+  // command. Reported all the same: a check missing a variable fails exactly
+  // like a check missing a token.
+  for (const name of missingCheckVariables) {
+    console.log(
+      `\n  The '${name}' repository variable is required by a configured check and is not set.` +
+        `\n  It is not sensitive, so set it directly:` +
+        `\n\n      gh variable set ${name} --repo ${client.owner}/${client.repo}`,
     );
   }
 
