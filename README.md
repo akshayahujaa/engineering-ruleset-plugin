@@ -503,6 +503,7 @@ the log adds `::error file=…,line=…` annotations against the offending lines
   "blockScope": "changed-files",                  // or "repository"
   "scanners": ["vuln", "secret", "misconfig"],
   "ignoreUnfixed": true,
+  "actionVersion": "v0.36.0",                     // upstream tag — note the 'v'
   "statusCheck": "trivy-security",                // the job id AND the required context
   "rulesetName": "TRIVY-SECURITY",
   "skipDirs": ["node_modules", "dist", "build", "vendor"],

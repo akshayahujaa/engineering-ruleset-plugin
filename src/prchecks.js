@@ -123,6 +123,11 @@ export function normalizePrChecks(config) {
       // A vulnerability with no released fix is reported, never blocking: no
       // change the author could make would clear that gate.
       ignoreUnfixed: trivy.ignoreUnfixed ?? true,
+      // The upstream tag, v-prefixed — which is how aquasecurity tags releases.
+      // Configurable so an upstream retag does not need a plugin release, and
+      // pinned rather than tracking a branch so a security gate cannot change
+      // behaviour on someone else's push.
+      actionVersion: trivy.actionVersion ?? "v0.36.0",
       statusCheck: trivy.statusCheck ?? TRIVY_CONTEXT,
       rulesetName: trivy.rulesetName ?? DEFAULT_TRIVY_RULESET,
       skipDirs: trivy.skipDirs ?? ["node_modules", "dist", "build", "vendor"],
@@ -397,7 +402,7 @@ jobs:
       # this, a findings-present exit would fail the job before the author is
       # ever told what was found.
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@${trivy.actionVersion}
         continue-on-error: true
         with:
           scan-type: fs

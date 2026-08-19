@@ -314,10 +314,24 @@ test("the scan step cannot fail the job; the report script decides", () => {
   assert.match(yaml, /run: node \.github\/scripts\/trivy-report\.mjs/);
 });
 
-test("the action is pinned to a release, not a moving branch", () => {
-  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy: normalizePrChecks(TRIVY_ON).trivy });
-  assert.match(yaml, /aquasecurity\/trivy-action@\d+\.\d+\.\d+/);
+/**
+ * The regression this exists for: the pin was shipped as `@0.28.0`, and every
+ * run failed with "unable to find version 0.28.0" — aquasecurity tags releases
+ * v-PREFIXED. The original test asserted only `\d+\.\d+\.\d+`, so it matched
+ * the broken value and gave false confidence. The `v` is the whole point.
+ */
+test("the action is pinned to a v-prefixed release, not a moving branch", () => {
+  const trivy = normalizePrChecks(TRIVY_ON).trivy;
+  const yaml = renderTrivyWorkflow({ environments: ["dev"], trivy });
+
+  assert.match(trivy.actionVersion, /^v\d+\.\d+\.\d+$/, "the default tag must carry the v");
+  assert.match(yaml, new RegExp(`aquasecurity/trivy-action@${trivy.actionVersion}$`, "m"));
   assert.doesNotMatch(yaml, /trivy-action@(main|master)/, "a gate must not change on someone else's push");
+});
+
+test("the pinned version can be overridden without a plugin release", () => {
+  const trivy = { ...normalizePrChecks(TRIVY_ON).trivy, actionVersion: "v0.35.0" };
+  assert.match(renderTrivyWorkflow({ environments: ["dev"], trivy }), /trivy-action@v0\.35\.0$/m);
 });
 
 test("the threshold and scope reach the script as environment values", () => {
