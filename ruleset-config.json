@@ -52,7 +52,11 @@
     "environmentStatuses": {
       "dev": "dev",
       "test": "QA",
-      "prod": "done"
+      "prod": [
+        "done",
+        "complete",
+        "completed"
+      ]
     },
     "secretName": "CLICKUP_TOKEN"
   },

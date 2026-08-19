@@ -20,7 +20,13 @@ export const DEFAULT_TODO_STATUSES = ["to do", "todo", "open", "backlog", "pendi
  * environment name still falls back to itself, which is what makes a new
  * `staging` work with no configuration at all.
  */
-export const DEFAULT_ENVIRONMENT_STATUSES = { dev: "in progress", test: "QA", prod: "done" };
+export const DEFAULT_ENVIRONMENT_STATUSES = {
+  dev: "in progress",
+  test: "QA",
+  // Several names, because boards disagree about this one and all of them mean
+  // the same thing. The first that the board actually has is the one written.
+  prod: ["done", "complete", "completed"],
+};
 
 export const PROVIDERS = {
   clickup: {
@@ -116,6 +122,22 @@ export function normalizeTaskSync(config) {
 const optedOut = (status) => status === null || status === undefined || status === false || status === "";
 
 /**
+ * The names one stage accepts, in preference order.
+ *
+ * A stage's status may be a single name or a list of them. Trackers disagree
+ * about what the last column is called — `done`, `complete`, `completed` — and
+ * they all mean the same thing, so insisting on one spelling makes the sync fail
+ * on a board that is set up perfectly reasonably. The first name is preferred
+ * when writing; every name is recognised when ranking.
+ *
+ * A list whose entries are all opt-out spellings opts the stage out, exactly as
+ * a bare `null` does.
+ */
+export function statusNames(value) {
+  return (Array.isArray(value) ? value : [value]).filter((v) => !optedOut(v)).map((v) => String(v));
+}
+
+/**
  * The stage a task reaches when its branch is PUSHED, before any merge.
  *
  * It is always rank 1 — ahead of every environment — because pushing the branch
@@ -136,7 +158,8 @@ export function pushStage(config, sync) {
   const prefixes = config?.branchNaming?.allowedPrefixes ?? [];
   if (prefixes.length === 0) return null;
 
-  return { status: String(sync.branchPushStatus), rank: 1, prefixes: [...prefixes] };
+  const names = statusNames(sync.branchPushStatus);
+  return { status: names[0], statuses: names, rank: 1, prefixes: [...prefixes] };
 }
 
 /**
@@ -165,7 +188,9 @@ export function pushStageBlocked(config, sync) {
  * head start.
  */
 export const rankedStages = (push, pipeline = []) =>
-  push ? [{ env: null, status: push.status, rank: push.rank }, ...pipeline] : [...pipeline];
+  push
+    ? [{ env: null, status: push.status, statuses: push.statuses ?? [push.status], rank: push.rank }, ...pipeline]
+    : [...pipeline];
 
 /**
  * The ordered pipeline a task walks as its branch is merged onward.
@@ -190,21 +215,24 @@ export function statusPipeline(config, sync) {
   // The legacy single-branch form synced exactly one branch. Upgrading must
   // not quietly start moving tasks on merges into other environments.
   if (sync?.legacyBranch) {
-    const status = sync.environmentStatuses?.[sync.legacyBranch] ?? "in progress";
-    if (status === null || status === false || status === "") return [];
-    return [{ env: sync.legacyBranch, status: String(status), rank: 1 + offset }];
+    const names = statusNames(sync.environmentStatuses?.[sync.legacyBranch] ?? "in progress");
+    if (names.length === 0) return [];
+    return [{ env: sync.legacyBranch, status: names[0], statuses: names, rank: 1 + offset }];
   }
 
   const explicit = sync?.environmentStatuses;
   const stages = [];
 
   for (const env of Object.keys(config?.environments ?? {})) {
-    const status =
+    const configured =
       explicit && Object.hasOwn(explicit, env) ? explicit[env] : DEFAULT_ENVIRONMENT_STATUSES[env] ?? env;
     // null/false is the documented opt-out; "" would otherwise become a stage
-    // that matches an unreadable tracker status.
-    if (status === null || status === false || status === "") continue;
-    stages.push({ env, status: String(status), rank: stages.length + 1 + offset });
+    // that matches an unreadable tracker status. An empty list opts out too.
+    const names = statusNames(configured);
+    if (names.length === 0) continue;
+    // `status` stays the preferred name, so the plan output and everything that
+    // reads one status keep working; `statuses` is what ranking and writing use.
+    stages.push({ env, status: names[0], statuses: names, rank: stages.length + 1 + offset });
   }
 
   return stages;
@@ -296,10 +324,25 @@ const yamlQuote = (value) => `'${String(value).replace(/'/g, "''")}'`;
 const commentSafe = (value) => String(value).replace(/\s+/g, " ").trim();
 
 
-/** `dev) want='in progress'; want_rank=1 ;;` — one arm per pipeline stage. */
+/** Every name a stage accepts, as shell literals. */
+const acceptedNames = (stage) => (stage.statuses ?? [stage.status]).map((n) => shellQuote(n)).join(" ");
+
+/**
+ * `dev) want='in progress'; want_rank=1; set -- 'in progress' ;;` — one arm per
+ * stage.
+ *
+ * The accepted names go into the positional parameters rather than a delimited
+ * string: a status can contain a space ("in progress"), so there is no separator
+ * that is safe to split on, and `set --` sidesteps the question entirely. Nothing
+ * else in the generated script uses "$@".
+ */
 function branchCases(pipeline) {
   return pipeline
-    .map((st) => `            ${shellQuote(st.env)}) want=${shellQuote(st.status)}; want_rank=${st.rank} ;;`)
+    .map(
+      (st) =>
+        `            ${shellQuote(st.env)}) want=${shellQuote(st.status)}; want_rank=${st.rank}; ` +
+        `set -- ${acceptedNames(st)} ;;`,
+    )
     .join("\n");
 }
 
@@ -330,7 +373,7 @@ function stageSelection(push, pipeline) {
 
   return (
     `if [ "\${EVENT_NAME:-}" = "push" ]; then\n` +
-    `            want=${shellQuote(push.status)}; want_rank=${push.rank}\n` +
+    `            want=${shellQuote(push.status)}; want_rank=${push.rank}; set -- ${acceptedNames(push)}\n` +
     `          else\n` +
     `            ${cases.split("\n").join("\n  ")}\n` +
     `          fi`
@@ -350,10 +393,13 @@ function statusCases(pipeline, todo) {
     ? [`            ${todo.map((t) => shellQuote(String(t).toLowerCase())).join("|")}) rank=0 ;;`]
     : [];
   for (const st of pipeline) {
-    const key = st.status.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    arms.push(`            ${shellQuote(key)}) rank=${st.rank} ;;`);
+    // Every name the stage accepts ranks at that stage. Without this a card
+    // sitting in `completed` would be unranked, and the forwards-only guard
+    // would read it as "not in the pipeline" and never touch it again.
+    const keys = (st.statuses ?? [st.status]).map((n) => n.toLowerCase()).filter((k) => !seen.has(k));
+    if (keys.length === 0) continue;
+    for (const k of keys) seen.add(k);
+    arms.push(`            ${keys.map(shellQuote).join("|")}) rank=${st.rank} ;;`);
   }
   arms.push("            *) rank=-1 ;;");
   return arms.join("\n");
@@ -472,14 +518,16 @@ jobs:
           # Trimmed as well as lowered: the case patterns are exact literals,
           # so a padded status would fall through to "not in the pipeline".
           lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          want_lower="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
 
           # Two stages may share a status; arriving at one already held is a
-          # no-op. Jira has no self-transition, so writing it would fail the job.
-          if [ "$lower" = "$want_lower" ]; then
-            echo "Already '$want'; nothing to do."
-            exit 0
-          fi
+          # no-op. Any of the stage's accepted names counts as already there —
+          # a card in 'completed' must not be rewritten to 'done'.
+          for cand in "$@"; do
+            if [ "$lower" = "$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')" ]; then
+              echo "Already '$status'; nothing to do."
+              exit 0
+            fi
+          done
 
           rank=-1
           case "$lower" in
@@ -497,13 +545,35 @@ ${statusCases(rankedStages(push, stages), todo)}
             exit 0
           fi
 
-          curl -sS -f -X PUT \\
-            -H "Authorization: $CLICKUP_TOKEN" \\
-            -H "Content-Type: application/json" \\
-            -d "$(jq -nc --arg s "$want" '{status: $s}')" \\
-            "$url" > /dev/null
+          # Boards disagree about what the last column is called, so the stage
+          # may accept several names. Try them in order and keep the first the
+          # board accepts. A rejected NAME is not a failure; a rejected
+          # CREDENTIAL is, so those two are told apart rather than retried.
+          moved=""
+          for cand in "$@"; do
+            code="$(curl -sS -o /tmp/clickup-put.json -w '%{http_code}' -X PUT \\
+              -H "Authorization: $CLICKUP_TOKEN" \\
+              -H "Content-Type: application/json" \\
+              -d "$(jq -nc --arg s "$cand" '{status: $s}')" \\
+              "$url" || true)"
 
-          echo "Task $id moved to '$want'."
+            if [ "$code" = "200" ]; then moved="$cand"; break; fi
+            case "$code" in
+              401|403)
+                echo "::error::ClickUp rejected the credentials (HTTP $code). Check the CLICKUP_TOKEN secret."
+                exit 1
+                ;;
+            esac
+            echo "'$cand' was not accepted (HTTP $code); trying the next name for this stage."
+          done
+
+          if [ -z "$moved" ]; then
+            echo "::error::None of this stage's status names exist on task $id's board. Tried: $*"
+            echo "::error::Rename the column, or list the name your board uses in taskSync.environmentStatuses."
+            exit 1
+          fi
+
+          echo "Task $id moved to '$moved'."
 `;
 }
 
@@ -616,14 +686,16 @@ jobs:
           # Trimmed as well as lowered: the case patterns are exact literals,
           # so a padded status would fall through to "not in the pipeline".
           lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          want_lower="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
 
           # Two stages may share a status; arriving at one already held is a
-          # no-op. Jira has no self-transition, so writing it would fail the job.
-          if [ "$lower" = "$want_lower" ]; then
-            echo "Already '$want'; nothing to do."
-            exit 0
-          fi
+          # no-op, and Jira has no self-transition so writing it would fail the
+          # job. Any accepted name counts as already there.
+          for cand in "$@"; do
+            if [ "$lower" = "$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')" ]; then
+              echo "Already '$status'; nothing to do."
+              exit 0
+            fi
+          done
 
           rank=-1
           case "$lower" in
@@ -639,16 +711,25 @@ ${statusCases(rankedStages(push, stages), todo)}
             exit 0
           fi
 
-          # Transition ids are per-project; find the one whose name (or target
-          # status) matches at run time.
+          # Transition ids are per-project, so the transition is found by name at
+          # run time — matching ANY name this stage accepts, since a project may
+          # call the final column 'Complete' rather than 'Done'. --args puts the
+          # accepted names in $ARGS.positional, which keeps names containing
+          # spaces intact.
           transition="$(curl -sS -f -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \\
             "$base/rest/api/3/issue/$key/transitions" \\
-            | jq -r --arg t "$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')" \\
-              '.transitions[] | select(((.name // "") | ascii_downcase) == $t or ((.to.name // "") | ascii_downcase) == $t) | .id' \\
+            | jq -r --args '
+                ($ARGS.positional | map(ascii_downcase)) as $want
+                | .transitions[]
+                | . as $t
+                | select(($want | index(($t.name // "") | ascii_downcase))
+                      or ($want | index((($t.to.name) // "") | ascii_downcase)))
+                | .id' "$@" \\
             | head -1 || true)"
 
           if [ -z "$transition" ]; then
-            echo "::error::Issue $key has no transition to '$want' from '$status' — check the Jira workflow scheme."
+            echo "::error::Issue $key has no transition from '$status' to any of: $*"
+            echo "::error::Check the Jira workflow scheme, or list the name your project uses in taskSync.environmentStatuses."
             exit 1
           fi
 

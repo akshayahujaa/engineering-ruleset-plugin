@@ -785,10 +785,13 @@ test("the push stage is planned at rank 1, ahead of every environment", () => {
 
   assert.deepEqual(plan.taskSync.push, {
     status: "in progress",
+    statuses: ["in progress"],
     rank: 1,
     prefixes: ["feature"],
   });
-  assert.deepEqual(plan.taskSync.pipeline, [{ env: "dev", status: "dev", rank: 2 }]);
+  assert.deepEqual(plan.taskSync.pipeline, [
+    { env: "dev", status: "dev", statuses: ["dev"], rank: 2 },
+  ]);
 });
 
 test("the plan prints the push stage before the merge stages", () => {
