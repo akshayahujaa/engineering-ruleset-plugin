@@ -95,6 +95,7 @@
         "misconfig"
       ],
       "ignoreUnfixed": true,
+      "actionVersion": "v0.36.0",
       "statusCheck": "trivy-security",
       "rulesetName": "TRIVY-SECURITY",
       "skipDirs": [
