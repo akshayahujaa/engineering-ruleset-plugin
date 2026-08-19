@@ -133,9 +133,32 @@ itself:
 "environments":  { "dev": {…}, "test": {…}, "prod": {…} },   // ← this order is the pipeline
 "taskSync": {
   "branchPushStatus": "in progress",                        // ← stage 1, before any merge
-  "environmentStatuses": { "dev": "dev", "test": "QA", "prod": "done" }
+  "environmentStatuses": {
+    "dev": "dev",
+    "test": "QA",
+    "prod": ["done", "complete", "completed"]               // ← any of these; see below
+  }
 }
 ```
+
+### A stage can accept several names
+
+Boards disagree about what the last column is called — `done`, `complete`, `completed` — and they
+all mean the same thing. A stage's status may therefore be a **list**, and `prod` accepts all three
+by default:
+
+- **Writing** tries them in order and keeps the first the board actually has. On ClickUp a rejected
+  *name* moves on to the next; a rejected *credential* fails immediately, so the two are never
+  confused. On Jira the transition is matched against every name at run time.
+- **Ranking** recognises all of them. This is the part that matters most: if only `done` ranked, a
+  card sitting in `completed` would be unranked, and the forwards-only guard would read it as "not
+  in the pipeline" and never touch it again.
+- **Already there** counts for any of them, so a card in `completed` is not rewritten to `done` —
+  which on Jira would fail outright, since there is no self-transition.
+
+A single string still behaves exactly as before, and an empty list opts the stage out just like
+`null`. If none of the names exist on the board, the job says so and names what it tried rather than
+failing with an opaque 400.
 
 An entry for an environment that is not declared does nothing — the shipped config names all
 three, but a repo that has only `dev` gets a one-stage pipeline until it adds the others.

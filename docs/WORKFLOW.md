@@ -33,8 +33,12 @@ to do  →  in progress  →  dev  →  QA  →  done
 ```
 
 If your board calls them something else, change `taskSync.environmentStatuses` in the config —
-don't edit the generated workflow, it is overwritten on every sync. A status the tracker doesn't
-have means that stage silently never lands (ClickUp) or fails the job (Jira).
+don't edit the generated workflow, it is overwritten on every sync.
+
+A stage can accept **several names** for the same column, and `prod` accepts `done`, `complete` and
+`completed` out of the box. The sync writes the first one your board actually has, and recognises
+all of them when deciding whether a card has already moved past a stage. If none of them exist, the
+job says which names it tried.
 
 ### 1.2 Run the plan
 

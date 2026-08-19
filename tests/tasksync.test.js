@@ -15,6 +15,7 @@ import {
   pushStageBlocked,
   rankedStages,
   trackerCredentialsMissing,
+  statusNames,
   GENERATED_MARKER,
   DEFAULT_TODO_STATUSES,
 } from "../src/tasksync.js";
@@ -116,7 +117,7 @@ test("the to-do set and target are configurable", () => {
 // --- the generated workflow --------------------------------------------------
 
 /** Most render tests care about one aspect, not the pipeline; this is the stand-in. */
-const ONE = [{ env: "dev", status: "in progress", rank: 1 }];
+const ONE = [{ env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 }];
 
 test("the workflow never embeds the token, only the secret reference", () => {
   const yaml = renderWorkflow({}, ONE);
@@ -125,7 +126,7 @@ test("the workflow never embeds the token, only the secret reference", () => {
 });
 
 test("the workflow only fires on a merged PR into a pipeline branch", () => {
-  const yaml = renderWorkflow({}, [{ env: "dev", status: "in progress", rank: 1 }]);
+  const yaml = renderWorkflow({}, [{ env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 }]);
   assert.match(yaml, /branches:\n      - 'dev'/);
   assert.match(yaml, /types: \[closed\]/);
   assert.match(yaml, /github\.event\.pull_request\.merged == true/);
@@ -134,9 +135,9 @@ test("the workflow only fires on a merged PR into a pipeline branch", () => {
 // --- the multi-environment pipeline ---------------------------------------------
 
 const PIPELINE = [
-  { env: "dev", status: "in progress", rank: 1 },
-  { env: "test", status: "QA", rank: 2 },
-  { env: "prod", status: "done", rank: 3 },
+  { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
+  { env: "test", status: "QA", statuses: ["QA"], rank: 2 },
+  { env: "prod", status: "done", statuses: ["done"], rank: 3 },
 ];
 
 test("every pipeline environment becomes a trigger branch and a case arm", () => {
@@ -169,8 +170,8 @@ test("the base branch decides the target, and an unknown base is a no-op", () =>
 
 test("a status appearing at two stages is ranked once, at its first stage", () => {
   const yaml = renderWorkflow({}, [
-    { env: "dev", status: "in progress", rank: 1 },
-    { env: "staging", status: "in progress", rank: 2 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
+    { env: "staging", status: "in progress", statuses: ["in progress"], rank: 2 },
   ]);
   assert.equal((yaml.match(/'in progress'\) rank=/g) ?? []).length, 1, "no duplicate case arm");
   assert.match(yaml, /'in progress'\) rank=1/, "the earliest rank wins");
@@ -178,7 +179,7 @@ test("a status appearing at two stages is ranked once, at its first stage", () =
 
 test("the status is passed through jq, so a quote in it cannot break the payload", () => {
   const yaml = renderWorkflow({}, [{ env: "dev", status: `it's "done"`, rank: 1 }]);
-  assert.match(yaml, /jq -nc --arg s "\$want"/);
+  assert.match(yaml, /jq -nc --arg s "\$cand"/);
   assert.doesNotMatch(yaml, /-d '\{"status"/, "never a hand-built JSON literal");
 });
 
@@ -290,8 +291,8 @@ test("renderWorkflow dispatches on provider", () => {
 test("renderWorkflow and the direct ClickUp renderer agree for the same pipeline", () => {
   const bundled = { provider: "clickup", taskIdPrefix: "CU-", secretName: "CLICKUP_TOKEN" };
   const pipeline = [
-    { env: "dev", status: "in progress", rank: 1 },
-    { env: "prod", status: "done", rank: 2 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
+    { env: "prod", status: "done", statuses: ["done"], rank: 2 },
   ];
   assert.equal(renderWorkflow(bundled, pipeline), renderClickUpWorkflow(bundled, pipeline));
   assert.match(renderWorkflow(bundled, pipeline), /name: ClickUp task sync/);
@@ -372,9 +373,9 @@ test("environments map to their configured statuses, in declaration order", () =
     environmentStatuses: { dev: "in progress", test: "QA", prod: "done" },
   });
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "dev", status: "in progress", rank: 1 },
-    { env: "test", status: "QA", rank: 2 },
-    { env: "prod", status: "done", rank: 3 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
+    { env: "test", status: "QA", statuses: ["QA"], rank: 2 },
+    { env: "prod", status: "done", statuses: ["done"], rank: 3 },
   ]);
 });
 
@@ -382,8 +383,8 @@ test("environments map to their configured statuses, in declaration order", () =
 test("an environment with no configured status maps to its own name", () => {
   const cfg = CFG(["dev", "staging"], { environmentStatuses: { dev: "in progress" } });
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "dev", status: "in progress", rank: 1 },
-    { env: "staging", status: "staging", rank: 2 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
+    { env: "staging", status: "staging", statuses: ["staging"], rank: 2 },
   ]);
 });
 
@@ -398,14 +399,14 @@ test("an environment can opt out of task sync with null", () => {
 test("the legacy single-branch config becomes a one-stage pipeline", () => {
   const cfg = { environments: { dev: {} }, clickup: { enabled: true, targetBranch: "dev", targetStatus: "doing" } };
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "dev", status: "doing", rank: 1 },
+    { env: "dev", status: "doing", statuses: ["doing"], rank: 1 },
   ]);
 });
 
 test("a legacy target branch that is not a declared environment still gets a stage", () => {
   const cfg = { environments: {}, clickup: { enabled: true, targetBranch: "develop" } };
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "develop", status: "in progress", rank: 1 },
+    { env: "develop", status: "in progress", statuses: ["in progress"], rank: 1 },
   ]);
 });
 
@@ -454,7 +455,7 @@ test("status matching ignores case", () => {
 test("a status declared for an undeclared environment creates no stage", () => {
   const cfg = CFG(["dev"], { environmentStatuses: { dev: "in progress", test: "QA", prod: "done" } });
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "dev", status: "in progress", rank: 1 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
   ]);
 });
 
@@ -493,7 +494,7 @@ test("a legacy single-branch config stays a single stage even with other environ
     clickup: { enabled: true, targetBranch: "dev", targetStatus: "in progress" },
   };
   assert.deepEqual(statusPipeline(cfg, normalizeTaskSync(cfg)), [
-    { env: "dev", status: "in progress", rank: 1 },
+    { env: "dev", status: "in progress", statuses: ["in progress"], rank: 1 },
   ]);
 });
 
@@ -521,17 +522,15 @@ test("an empty todo list emits no case arm rather than invalid bash", () => {
   assert.doesNotMatch(yaml, /^\s*\) rank=0/m, "a patternless arm is a bash syntax error");
 });
 
-test("arriving at a status the task already holds is a no-op, not a write", () => {
-  const shared = [
-    { env: "dev", status: "in progress", rank: 1 },
-    { env: "test", status: "in progress", rank: 2 },
-  ];
-  // JS model
-  const result = decideTransition("in progress", { pipeline: shared, target: "in progress", targetRank: 2 });
-  assert.equal(result.move, false);
-  assert.match(result.reason, /already/);
-  // and the generated shell short-circuits the same way
-  assert.match(renderWorkflow({}, shared), /\[ "\$lower" = "\$want_lower" \]/);
+test("arriving at any name the stage accepts is a no-op, not a write", () => {
+  // A card sitting in 'completed' must not be rewritten to 'done': same column,
+  // and on Jira the self-transition would fail the job outright.
+  const yaml = renderWorkflow({}, [
+    { env: "prod", status: "done", statuses: ["done", "complete", "completed"], rank: 1 },
+  ]);
+  assert.match(yaml, /for cand in "\$@"; do/);
+  assert.match(yaml, /Already '\$status'; nothing to do\./);
+  assert.match(yaml, /set -- 'done' 'complete' 'completed'/, "every name is loaded for the comparison");
 });
 
 test("a target outside the pipeline is refused rather than treated as stage one", () => {
@@ -541,7 +540,7 @@ test("a target outside the pipeline is refused rather than treated as stage one"
 });
 
 test("environment names and statuses are YAML-quoted so they cannot change type", () => {
-  const yaml = renderWorkflow({}, [{ env: "no", status: "QA", rank: 1 }]);
+  const yaml = renderWorkflow({}, [{ env: "no", status: "QA", statuses: ["QA"], rank: 1 }]);
   assert.match(yaml, /      - 'no'/, "unquoted, YAML reads 'no' as false");
 });
 
@@ -577,13 +576,14 @@ test("a push stage takes rank 1 and shifts every environment behind it", () => {
   const sync = pushSync();
   assert.deepEqual(pushStage(WITH_PUSH, sync), {
     status: "in progress",
+    statuses: ["in progress"],
     rank: 1,
     prefixes: ["feature", "bugfix"],
   });
   assert.deepEqual(statusPipeline(WITH_PUSH, sync), [
-    { env: "dev", status: "dev", rank: 2 },
-    { env: "test", status: "QA", rank: 3 },
-    { env: "prod", status: "done", rank: 4 },
+    { env: "dev", status: "dev", statuses: ["dev"], rank: 2 },
+    { env: "test", status: "QA", statuses: ["QA"], rank: 3 },
+    { env: "prod", status: "done", statuses: ["done"], rank: 4 },
   ]);
 });
 
@@ -742,4 +742,90 @@ test("with no tracker there is nothing to offer", () => {
   assert.equal(trackerCredentialsMissing({}), false);
   assert.equal(trackerCredentialsMissing({ provider: "none", hasToken: false }), false);
   assert.equal(trackerCredentialsMissing({ provider: "bitbucket", hasToken: false }), false);
+});
+
+// --- a stage may accept several names for the same column -------------------------
+
+/**
+ * Boards disagree about the last column: done, complete, completed. They mean the
+ * same thing, so insisting on one spelling makes the sync fail on a board that is
+ * set up perfectly reasonably.
+ */
+test("statusNames takes a single name or a list, and filters the opt-outs", () => {
+  assert.deepEqual(statusNames("done"), ["done"]);
+  assert.deepEqual(statusNames(["done", "complete", "completed"]), ["done", "complete", "completed"]);
+  assert.deepEqual(statusNames(["done", null, "", false, "complete"]), ["done", "complete"]);
+  assert.deepEqual(statusNames([]), [], "an empty list opts the stage out");
+  assert.deepEqual(statusNames(null), [], "so does a bare null, as before");
+});
+
+test("prod accepts done, complete and completed out of the box", () => {
+  const config = { environments: { prod: {} } };
+  const sync = normalizeTaskSync({ ...config, taskSync: { enabled: true, provider: "clickup" } });
+  const [stage] = statusPipeline(config, sync);
+
+  assert.deepEqual(stage.statuses, ["done", "complete", "completed"]);
+  assert.equal(stage.status, "done", "the first name is still the preferred one");
+});
+
+test("a configured list is honoured, and a bare string still behaves as before", () => {
+  const cfg = (prod) => ({
+    environments: { prod: {} },
+    taskSync: { enabled: true, provider: "clickup", environmentStatuses: { prod: prod } },
+  });
+  const stages = (c) => statusPipeline(c, normalizeTaskSync(c));
+
+  assert.deepEqual(stages(cfg(["shipped", "released"]))[0].statuses, ["shipped", "released"]);
+  assert.deepEqual(stages(cfg("shipped"))[0].statuses, ["shipped"], "a string is a one-name list");
+  assert.deepEqual(stages(cfg(null)), [], "null still opts out");
+});
+
+test("every accepted name ranks at its stage, so a finished card is never rewritten", () => {
+  // The trap this closes: if only 'done' ranked, a card sitting in 'completed'
+  // would be unranked, and the forwards-only guard would read it as "not in the
+  // pipeline" and leave it there for good.
+  const yaml = renderWorkflow({}, [
+    { env: "prod", status: "done", statuses: ["done", "complete", "completed"], rank: 4 },
+  ]);
+  assert.match(yaml, /'done'\|'complete'\|'completed'\) rank=4/);
+});
+
+test("the accepted names go into the positional parameters, not a delimited string", () => {
+  // A status can contain a space ("in progress"), so there is no separator that is
+  // safe to split on. `set --` sidesteps the question.
+  const yaml = renderWorkflow({}, [
+    { env: "prod", status: "in progress", statuses: ["in progress", "in-progress"], rank: 1 },
+  ]);
+  assert.match(yaml, /set -- 'in progress' 'in-progress'/);
+});
+
+test("the ClickUp write tries each accepted name, and tells auth failure apart", () => {
+  const yaml = renderClickUpWorkflow({}, [
+    { env: "prod", status: "done", statuses: ["done", "complete"], rank: 1 },
+  ]);
+
+  assert.match(yaml, /for cand in "\$@"; do/, "each name is attempted");
+  assert.match(yaml, /--arg s "\$cand"/, "the payload is built from the candidate, through jq");
+  assert.match(yaml, /401\|403\)/, "a rejected credential is not a rejected name");
+  assert.match(yaml, /None of this stage's status names exist/, "exhausting them is a clear error");
+});
+
+test("the Jira transition is matched against every accepted name", () => {
+  const yaml = renderJiraWorkflow({}, [
+    { env: "prod", status: "done", statuses: ["done", "complete"], rank: 1 },
+  ]);
+
+  assert.match(yaml, /jq -r --args/, "the names are passed as jq positional args, so spaces survive");
+  assert.match(yaml, /\$ARGS\.positional \| map\(ascii_downcase\)/);
+  assert.match(yaml, /no transition from '\$status' to any of: \$\*/, "the error names what it tried");
+});
+
+test("a name shared between two stages is still ranked once, at the earlier stage", () => {
+  const yaml = renderWorkflow({}, [
+    { env: "test", status: "done", statuses: ["done", "complete"], rank: 1 },
+    { env: "prod", status: "complete", statuses: ["complete", "completed"], rank: 2 },
+  ]);
+  assert.equal((yaml.match(/'complete'/g) ?? []).filter(Boolean).length > 0, true);
+  assert.match(yaml, /'done'\|'complete'\) rank=1/, "the earlier stage claims the shared name");
+  assert.match(yaml, /'completed'\) rank=2/, "the later stage keeps only what is left");
 });
