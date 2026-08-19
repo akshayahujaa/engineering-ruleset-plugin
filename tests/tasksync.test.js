@@ -14,6 +14,7 @@ import {
   pushStage,
   pushStageBlocked,
   rankedStages,
+  trackerCredentialsMissing,
   GENERATED_MARKER,
   DEFAULT_TODO_STATUSES,
 } from "../src/tasksync.js";
@@ -701,4 +702,44 @@ test("a bare task id needs no prefix in the extraction step", () => {
   const yaml = renderClickUpWorkflow({ taskIdPrefix: "" }, PIPELINE);
   assert.match(yaml, /-v p='' /, "an empty prefix takes the whole second segment");
   assert.match(yaml, /No task id in/, "and the message does not read as a typo");
+});
+
+// --- when the tracker's credentials are offered ------------------------------------
+
+/**
+ * The regression this guards: the offer used to be gated on the provider having
+ * CHANGED. Since the bundled config already names `clickup`, `--provider clickup`
+ * changed nothing and so asked for nothing — no token, no prompt, on a real
+ * terminal. Choosing what is already the default is still choosing it.
+ */
+test("a missing token is offered whatever the provider was before", () => {
+  for (const provider of ["clickup", "jira"]) {
+    assert.equal(
+      trackerCredentialsMissing({ provider, hasToken: false, missingVariables: [] }),
+      true,
+      `${provider} with no token must be offered`,
+    );
+  }
+});
+
+test("nothing is offered once the credentials are all present", () => {
+  assert.equal(trackerCredentialsMissing({ provider: "clickup", hasToken: true }), false);
+  assert.equal(
+    trackerCredentialsMissing({ provider: "jira", hasToken: true, missingVariables: [] }),
+    false,
+  );
+});
+
+test("a missing variable alone is enough to offer, even with the token set", () => {
+  // Jira needs its base URL and email as well; a token on its own cannot sync.
+  assert.equal(
+    trackerCredentialsMissing({ provider: "jira", hasToken: true, missingVariables: ["JIRA_BASE_URL"] }),
+    true,
+  );
+});
+
+test("with no tracker there is nothing to offer", () => {
+  assert.equal(trackerCredentialsMissing({}), false);
+  assert.equal(trackerCredentialsMissing({ provider: "none", hasToken: false }), false);
+  assert.equal(trackerCredentialsMissing({ provider: "bitbucket", hasToken: false }), false);
 });

@@ -41,7 +41,14 @@ import {
 } from "./github.js";
 import { inspectCodeowners, planTeamSeed, describeSeed, assessCodeownerReview } from "./codeowners.js";
 import { plan, apply, isBlockingMerges } from "./sync.js";
-import { planTaskSync, applyTaskSync, planSyncOrphans, removeSyncOrphan, PROVIDERS } from "./tasksync.js";
+import {
+  planTaskSync,
+  applyTaskSync,
+  planSyncOrphans,
+  removeSyncOrphan,
+  trackerCredentialsMissing,
+  PROVIDERS,
+} from "./tasksync.js";
 import { planBranches, createMissingBranches, withRelaxedEnforcement } from "./branches.js";
 import {
   planPrChecks,
@@ -530,17 +537,27 @@ async function main() {
   // makes to "the plan never writes" — waiting for --apply would mean asking
   // the identical question twice for no reason. `sync` (below) isn't built
   // yet, so a small sync-shaped stub carries just what setupCredentials needs.
+  //
+  // Deliberately NOT gated on the provider having CHANGED. It used to be, and
+  // that left the commonest case unasked: the bundled config already says
+  // `clickup`, so `--provider clickup` — and any run on a repo that already has
+  // rulesets — changed nothing and asked nothing, even on a real terminal.
+  // Choosing what is already the default is still choosing it. The tracker's
+  // token is a standing requirement of the config, exactly like the AI key
+  // below, so it is offered whenever it is missing.
+  const activeProvider = chosenProvider ?? configuredProvider;
+  let trackerOfferMade = false;
   if (
-    (providerChanged || providerJustAsked) &&
-    chosenProvider !== "none" &&
+    activeProvider !== "none" &&
+    PROVIDERS[activeProvider] &&
     isInteractive() &&
     !asJson &&
     !setToken &&
     client.authMode === "gh cli"
   ) {
-    const known = PROVIDERS[chosenProvider];
+    const known = PROVIDERS[activeProvider];
     const credentialStub = {
-      secretName: syncSection?.secretName ?? known.secretName,
+      secretName: (activeProvider === configuredProvider ? syncSection?.secretName : undefined) ?? known.secretName,
       providerLabel: known.label,
       tokenHint: known.tokenHint,
       variableHints: known.variableHints ?? {},
@@ -551,13 +568,18 @@ async function main() {
     }
     credentialStub.hasToken = await client.hasSecret(credentialStub.secretName);
 
-    if (!credentialStub.hasToken || credentialStub.missingVariables.length > 0) {
+    if (trackerCredentialsMissing({ provider: activeProvider, ...credentialStub })) {
       if (
         await askYesNo(
           `\nSet up ${credentialStub.providerLabel} credentials now, via gh's hidden prompt? [y/N] `,
         )
       ) {
         credentialWrites = await setupCredentials(client, credentialStub);
+        trackerOfferMade = true;
+      } else {
+        // Declining counts as having been asked: repeating the same question at
+        // --apply is how a prompt turns into noise people click through.
+        trackerOfferMade = true;
       }
     }
   }
@@ -1130,8 +1152,8 @@ async function main() {
   // would put it in shell history and the process table. On a terminal the
   // hand-off to gh's hidden prompt is offered right here; anywhere else the
   // command to run is printed instead.
-  if (sync && (!sync.hasToken || sync.missingVariables.length > 0)) {
-    if (shouldApply && isInteractive() && client.authMode === "gh cli") {
+  if (trackerCredentialsMissing(sync ?? {})) {
+    if (shouldApply && isInteractive() && client.authMode === "gh cli" && !trackerOfferMade) {
       if (
         await askYesNo(
           `\n  ${sync.providerLabel} credentials are incomplete. Set them now?` +

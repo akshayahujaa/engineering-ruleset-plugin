@@ -54,6 +54,23 @@ export const PROVIDERS = {
 };
 
 /**
+ * Whether the tracker's credentials still need setting up.
+ *
+ * Deliberately says nothing about whether the provider was just *chosen*. That
+ * used to be the gate, and it left the commonest case unasked: the bundled
+ * config already names `clickup`, so `--provider clickup` changed nothing and
+ * therefore prompted for nothing — on a real terminal, with no token set. The
+ * only question that matters is whether the credentials are there.
+ *
+ * @param {{provider?: string, hasToken?: boolean, missingVariables?: string[]}} state
+ */
+export function trackerCredentialsMissing(state = {}) {
+  const { provider, hasToken, missingVariables = [] } = state;
+  if (!provider || !PROVIDERS[provider]) return false;
+  return !hasToken || missingVariables.length > 0;
+}
+
+/**
  * Resolves the task-sync section of the policy to one normalized shape.
  *
  * `taskSync` is the section's name; a legacy `clickup` section is honoured
