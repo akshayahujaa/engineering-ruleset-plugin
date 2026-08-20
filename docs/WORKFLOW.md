@@ -137,6 +137,7 @@ are no bypass actors.
 | `.github/workflows/pr-agent.yml` | a PR opens, or you comment `/review` | description, review, inline suggestions, security gate |
 | `.github/workflows/trivy-security.yml` | a PR targets any environment | scans for vulnerable dependencies, hardcoded secrets and IaC misconfigurations |
 | `.github/scripts/trivy-report.mjs` | — | applies the threshold and posts the verdict |
+| `.github/workflows/strix-pentest.yml` | **you start it from the Actions tab** | runs Strix, an AI pentesting agent; uploads findings as an artifact |
 
 These files are **regenerated on every sync**. Edit the config, not the workflow.
 
