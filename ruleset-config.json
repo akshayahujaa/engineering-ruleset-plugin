@@ -109,6 +109,15 @@
         "vendor"
       ],
       "timeout": "10m"
+    },
+    "strix": {
+      "enabled": true,
+      "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "keySecret": "OPENROUTER_API_KEY",
+      "scanMode": "quick",
+      "packageVersion": "1.5.3",
+      "pythonVersion": "3.12",
+      "timeoutMinutes": 45
     }
   },
   "branchNaming": {

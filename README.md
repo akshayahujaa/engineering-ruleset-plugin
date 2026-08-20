@@ -371,6 +371,7 @@ Two more workflows are generated the same way the task-sync one is, when
 | `.github/scripts/scope-check.mjs` | the logic that workflow runs — written alongside it, so the two can never drift apart |
 | `.github/workflows/pr-agent.yml` | runs [PR-Agent](https://github.com/qodo-ai/pr-agent) for an auto description, review and inline suggestions, plus a blocking security gate |
 | `.github/workflows/trivy-security.yml` | scans with [Trivy](https://github.com/aquasecurity/trivy) for vulnerable dependencies, hardcoded secrets and IaC misconfigurations |
+| `.github/workflows/strix-pentest.yml` | runs [Strix](https://github.com/usestrix/strix), an AI penetration-testing agent — **manual trigger only** |
 | `.github/scripts/trivy-report.mjs` | applies the threshold and scope, and posts the verdict — written alongside its workflow |
 
 ### The tracker is never configured twice
@@ -560,6 +561,56 @@ them — that is the point of adopting them — but never silently:
 Turning a check back off removes the file again, but **only** if the plugin
 wrote it: a hand-written workflow at a managed path is left exactly where it
 is, the same ownership rule the sync workflows follow.
+
+## Strix pentest — on demand
+
+`prChecks.strix` adds `.github/workflows/strix-pentest.yml`, which runs
+[Strix](https://github.com/usestrix/strix) — an AI penetration-testing agent — from the Actions tab.
+
+**Manual only, by design.** `workflow_dispatch`, no pull-request trigger, no status check and no
+ruleset. An agent run takes minutes and many model calls, so gating every pull request on it would
+be slow and expensive. Because nothing requires it, it cannot wedge a merge — which is why it needs
+none of the machinery Trivy did.
+
+You choose the target, the depth (`quick` / `standard` / `deep`), an optional focus
+("concentrate on IDOR and auth bypass"), and optionally a `diff_base` to scope it to recent changes.
+Findings upload as the **strix-findings** artifact.
+
+### It needs no new secret
+
+`LLM_API_KEY` reads the same `OPENROUTER_API_KEY` the scope check and PR-Agent already use, so
+adopting this adds nothing to any repository's secrets.
+
+The default model is **free**: `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` — 1M context, and
+it advertises tool calling, which an agent cannot work without whatever else a model does well.
+
+**Expect rate limits, not bad findings.** Free tiers throttle hard and an agent makes many calls, so
+a run that stops early is usually the tier rather than the code. The job **fails** in that case
+rather than reporting a clean scan, the partial findings still upload, and the run summary says so.
+Point `model` at a paid model for a full pass — because the trigger is manual, cost stays bounded by
+how often you press the button.
+
+### Two things done deliberately
+
+**Installed pinned from PyPI** (`strix-agent==1.5.3`), not `curl … | bash`. Piping a remote script
+into a shell is a poor way to install a security tool.
+
+**No dispatch input is interpolated into the script.** `${{ … }}` is substituted *before* the shell
+runs, so an input containing `; rm -rf /` would execute as code. Every input arrives through `env`
+and the command is built as an argv array — no `eval` anywhere. There is a test asserting no run
+block contains `${{` or `eval`, because this is exactly the mistake that would matter here.
+
+```jsonc
+"strix": {
+  "enabled": true,
+  "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+  "keySecret": "OPENROUTER_API_KEY",   // the key you already have
+  "scanMode": "quick",                 // quick | standard | deep
+  "packageVersion": "1.5.3",
+  "pythonVersion": "3.12",             // strix-agent requires >= 3.12
+  "timeoutMinutes": 45
+}
+```
 
 ## Reviewers and teams
 

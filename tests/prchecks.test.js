@@ -20,6 +20,8 @@ import {
   TRIVY_WORKFLOW_PATH,
   TRIVY_SCRIPT_PATH,
   TRIVY_CONTEXT,
+  renderStrixWorkflow,
+  STRIX_WORKFLOW_PATH,
 } from "../src/prchecks.js";
 
 const ON = { prChecks: { scopeCheck: { enabled: true }, prAgent: { enabled: true } } };
@@ -387,4 +389,110 @@ test("the generated script is the plugin's asset, marked as generated", async ()
 
   assert.ok(script.content.startsWith(GENERATED_MARKER_JS));
   assert.match(script.content, /export function isBlocking/, "the real logic, copied verbatim");
+});
+
+// --- the Strix pentest, on manual trigger ----------------------------------------
+
+const STRIX_ON = { environments: { dev: {} }, prChecks: { strix: { enabled: true } } };
+const strixYaml = () => renderStrixWorkflow({ strix: normalizePrChecks(STRIX_ON).strix });
+
+test("strix is off unless configured, and its defaults are a complete config", () => {
+  assert.equal(normalizePrChecks({}).strix.enabled, false);
+
+  const s = normalizePrChecks(STRIX_ON).strix;
+  assert.match(s.model, /^openrouter\//, "a LiteLLM model id, which is what STRIX_LLM takes");
+  assert.match(s.model, /:free$/, "the default is a free tier");
+  assert.equal(s.keySecret, "OPENROUTER_API_KEY", "reuses the key the other checks read");
+  assert.equal(s.scanMode, "quick");
+  assert.match(s.packageVersion, /^\d+\.\d+\.\d+$/, "pinned to an exact release");
+  assert.ok(Number(s.pythonVersion) >= 3.12, "strix-agent requires >= 3.12");
+});
+
+/**
+ * Manual by design, not by omission: an agent run takes minutes and many model
+ * calls. Nothing requires the check, so no ruleset is involved and it cannot
+ * wedge a merge — which is the whole reason it needs no compiler support.
+ */
+test("it triggers only on workflow_dispatch — never a pull request", () => {
+  const doc = parseYaml(strixYaml());
+  assert.deepEqual(Object.keys(triggers(doc)), ["workflow_dispatch"]);
+  assert.deepEqual(Object.keys(doc.jobs), ["strix-pentest"]);
+  assert.deepEqual(doc.permissions, { contents: "read" });
+});
+
+test("the dispatch form offers target, depth, focus and a diff base", () => {
+  const inputs = triggers(parseYaml(strixYaml())).workflow_dispatch.inputs;
+  assert.deepEqual(Object.keys(inputs), ["target", "scan_mode", "instruction", "diff_base"]);
+  assert.deepEqual(inputs.scan_mode.options, ["quick", "standard", "deep"]);
+});
+
+/**
+ * The regression that matters most here. `${{ … }}` is substituted BEFORE the
+ * shell runs, so an input interpolated into a run block executes as code. In a
+ * security tool that is indefensible — every input arrives through env instead.
+ */
+test("no dispatch input is interpolated into a script body", () => {
+  const doc = parseYaml(strixYaml());
+  for (const step of doc.jobs["strix-pentest"].steps) {
+    if (!step.run) continue;
+    assert.doesNotMatch(step.run, /\$\{\{/, `${step.name} must not expand a template into the shell`);
+    assert.doesNotMatch(step.run, /\beval\b/, `${step.name} must not eval`);
+  }
+});
+
+test("the inputs reach the agent as env, and the command is built as an argv array", () => {
+  const step = parseYaml(strixYaml()).jobs["strix-pentest"].steps.find((s) => s.id === "strix");
+
+  assert.deepEqual(Object.keys(step.env), [
+    "STRIX_LLM",
+    "LLM_API_KEY",
+    "INPUT_TARGET",
+    "INPUT_SCAN_MODE",
+    "INPUT_INSTRUCTION",
+    "INPUT_DIFF_BASE",
+  ]);
+  assert.match(step.run, /args=\(-n --target "\$\{INPUT_TARGET:-\.\/\}"/, "an array, not a string");
+  assert.match(step.run, /strix "\$\{args\[@\]\}"/, "expanded as separate words");
+});
+
+test("a missing key is reported rather than silently producing an empty scan", () => {
+  const step = parseYaml(strixYaml()).jobs["strix-pentest"].steps.find((s) => s.id === "strix");
+  assert.match(step.run, /OPENROUTER_API_KEY is not set/);
+});
+
+/**
+ * A half-finished agent still carries findings. Losing them is worse than the
+ * failure, so the upload runs regardless — and the job's result still follows
+ * the agent's, or a rate-limited run would read as a clean pass.
+ */
+test("findings upload even when the agent fails, and the job still fails", () => {
+  const steps = parseYaml(strixYaml()).jobs["strix-pentest"].steps;
+  const strixStep = steps.find((s) => s.id === "strix");
+  const upload = steps.find((s) => s.name === "Upload findings");
+  const reflect = steps.at(-1);
+
+  assert.equal(strixStep["continue-on-error"], true);
+  assert.equal(upload.if, "always()");
+  assert.match(upload.uses, /actions\/upload-artifact@v\d+/);
+  assert.match(reflect.if, /steps\.strix\.outcome != 'success'/);
+  assert.equal(reflect.run.trim(), "exit 1");
+});
+
+test("it is installed pinned from PyPI, not piped from a URL into a shell", () => {
+  const install = parseYaml(strixYaml()).jobs["strix-pentest"].steps.find((s) => s.name === "Install Strix");
+  assert.match(install.run, /pip install .*strix-agent==\d+\.\d+\.\d+/);
+  assert.doesNotMatch(install.run, /curl.*\|\s*bash/, "a security tool is not installed by curl | bash");
+});
+
+test("the run is time-bounded, so one stuck agent cannot burn hours", () => {
+  assert.equal(parseYaml(strixYaml()).jobs["strix-pentest"]["timeout-minutes"], 45);
+});
+
+test("it is planned as one file, needs the shared AI key, and is cleaned up when off", async () => {
+  const plan = await planPrChecks(stubClient(), STRIX_ON, { provider: null });
+  assert.deepEqual(plan.files.map((f) => f.path), [STRIX_WORKFLOW_PATH]);
+  assert.deepEqual(plan.secrets, ["OPENROUTER_API_KEY"], "no new secret is introduced");
+
+  const client = stubClient({ [STRIX_WORKFLOW_PATH]: `${GENERATED_MARKER} ...` });
+  assert.deepEqual((await planPrCheckOrphans(client, [])).map((o) => o.path), [STRIX_WORKFLOW_PATH]);
 });
