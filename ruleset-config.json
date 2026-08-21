@@ -138,5 +138,11 @@
     "reviewerTeams": [
       "tehvault/reviewers"
     ]
+  },
+  "secretsSource": {
+    "provider": "gcp-secret-manager",
+    "project": "tehvault-platform",
+    "version": "latest",
+    "mapping": {}
   }
 }

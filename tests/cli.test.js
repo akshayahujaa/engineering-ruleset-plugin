@@ -869,3 +869,86 @@ test("a bare token anywhere in argv is refused with the same links", () => {
   assert.match(stdout, /https:\/\/id\.atlassian\.com\/manage-profile\/security\/api-tokens/);
   assert.doesNotMatch(stdout, /ATATT3xFfGF0abcdef/, "never echoed back in full");
 });
+
+// --- credentials from a secret manager -------------------------------------------
+
+const WITH_SOURCE = {
+  ...MINIMAL,
+  taskSync: { enabled: true, provider: "clickup" },
+  prChecks: { scopeCheck: { enabled: true }, prAgent: { enabled: true } },
+  secretsSource: { provider: "gcp-secret-manager", project: "tehvault-platform" },
+};
+
+test("the plan names every credential it would fetch, and from which id", () => {
+  const { plan } = run({ ...baseFixture(), ...override(WITH_SOURCE) });
+  const src = plan.secretsSource;
+
+  assert.equal(src.provider, "gcp-secret-manager");
+  assert.equal(src.project, "tehvault-platform");
+  assert.deepEqual(
+    src.fetches.map((f) => [f.name, f.sourceName, f.kind]).sort(),
+    [
+      ["CLICKUP_TOKEN", "clickup-token", "secret"],
+      ["OPENROUTER_API_KEY", "openrouter-api-key", "secret"],
+    ].sort(),
+    "the tracker's own token is included, not just the check secrets",
+  );
+});
+
+test("Jira's variables are fetched as variables, not secrets", () => {
+  const jira = { ...WITH_SOURCE, taskSync: { enabled: true, provider: "jira" } };
+  const { plan } = run({ ...baseFixture(), ...override(jira) });
+
+  const byKind = Object.fromEntries(plan.secretsSource.fetches.map((f) => [f.name, f.kind]));
+  assert.equal(byKind.JIRA_API_TOKEN, "secret");
+  assert.equal(byKind.JIRA_BASE_URL, "variable");
+  assert.equal(byKind.JIRA_EMAIL, "variable");
+});
+
+test("a credential already present is not fetched again", () => {
+  const { plan } = run({
+    ...baseFixture(),
+    ...override(WITH_SOURCE),
+    [`GET repos/${REPO}/actions/secrets/OPENROUTER_API_KEY`]: { name: "OPENROUTER_API_KEY" },
+    [`GET repos/${REPO}/actions/secrets/CLICKUP_TOKEN`]: { name: "CLICKUP_TOKEN" },
+  });
+  assert.deepEqual(plan.secretsSource.fetches, [], "nothing missing, nothing to read");
+});
+
+/**
+ * The manual instructions exist for a human who must type the value. With a
+ * manager configured nobody types anything, so repeating them would tell the
+ * reader to do work the sync is about to do.
+ */
+test("the manual gh commands are replaced, not printed alongside", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_SOURCE) }, []);
+
+  assert.match(stdout, /SECRETS  Google Secret Manager/);
+  assert.match(stdout, /CLICKUP_TOKEN\s+← clickup-token/);
+  assert.match(stdout, /never enters this process/);
+  assert.doesNotMatch(stdout, /gh secret set/, "no instructions for a human to follow");
+});
+
+test("without a source configured the manual instructions are unchanged", () => {
+  const noSource = { ...WITH_SOURCE, secretsSource: undefined };
+  const { stdout, plan } = run({ ...baseFixture(), ...override(noSource) }, []);
+
+  assert.match(stdout, /gh secret set/, "the old path still works exactly as before");
+  assert.equal(plan, null);
+});
+
+/**
+ * "The plan writes nothing" is worth keeping true where it can be. The
+ * interactive prompt writes during a plan only because asking twice would be
+ * silly; automation has no such excuse.
+ */
+test("a plan reads nothing and writes nothing — the fetch happens on apply", () => {
+  const { stdout, calls } = run({ ...baseFixture(), ...override(WITH_SOURCE) }, []);
+  assert.match(stdout, /Plan only/);
+  assert.ok(!calls.some((c) => c.secretSet), "gh secret set is never invoked by a plan");
+});
+
+test("the pending count includes the credentials, so the plan cannot look empty", () => {
+  const { stdout } = run({ ...baseFixture(), ...override(WITH_SOURCE) }, []);
+  assert.doesNotMatch(stdout, /Already in sync/);
+});

@@ -293,6 +293,22 @@ an environment added by `--env` is checked from the moment it exists, and there 
 per-environment edit to make. If a plan shows it scoped to fewer refs than the
 environments in play, that is drift worth mentioning, not a default.
 
+## When credentials come from a secret manager
+
+If the plan shows a `SECRETS` block, `secretsSource` is configured and there is **nothing for the
+user to type**. Relay the block — it names each credential and the id it is read from — and do not
+also hand them `gh secret set` commands; the sync does it on `--apply`.
+
+Two things to relay if they appear:
+
+- The plan **reads and writes nothing**. Unlike the interactive prompt, which writes during a plan,
+  the fetch happens only on `--apply`. Say so, since a user used to the old behaviour may assume the
+  secret is already set.
+- A bracketed note about `gcloud` means the source is unreachable — either not installed or not
+  logged in, and the message says which because the fixes differ. **Never run `gcloud auth login`
+  through the Bash tool**; it is a browser flow that a pipe cannot answer, exactly like
+  `gh auth login`. Relay the command for the user to run themselves.
+
 ## Check credentials (e.g. OPENROUTER_API_KEY)
 
 If the plan reports `The '<NAME>' secret is required ...  and is not set`, this is a

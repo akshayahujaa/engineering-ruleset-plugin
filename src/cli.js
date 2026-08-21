@@ -59,6 +59,15 @@ import {
   SCOPE_CHECK_WORKFLOW_PATH,
 } from "./prchecks.js";
 import {
+  normalizeSecretsSource,
+  plannedFetches,
+  pushCredential,
+  resolveSourceName,
+  sourceAuthenticated,
+  sourceCliInstalled,
+  noSourceAccessMessage,
+} from "./secretsource.js";
+import {
   probeAccess,
   acceptAndReprobe,
   invitationGrantsAdmin,
@@ -527,6 +536,10 @@ async function main() {
   // this true the moment either path writes something, or it would print
   // "nothing written" right under a "✓ ... is set" line, the exact lie an
   // earlier review caught for --set-token alone.
+  // Resolved as soon as the policy is known, because the prompts below need to
+  // know whether a human will be asked at all.
+  const secretsSource = normalizeSecretsSource(config);
+
   let credentialWrites = false;
 
   // The moment a real tracker is chosen — accepting the default at the first-
@@ -550,6 +563,8 @@ async function main() {
   if (
     activeProvider !== "none" &&
     PROVIDERS[activeProvider] &&
+    // A secret manager is about to set this; asking as well is noise.
+    !secretsSource &&
     isInteractive() &&
     !asJson &&
     !setToken &&
@@ -615,10 +630,41 @@ async function main() {
     if (!(await client.hasVariable(name))) missingCheckVariables.push(name);
   }
 
+  // A configured secret manager takes over every credential the repository is
+  // missing — the tracker's token included, whichever provider was chosen. That
+  // is the whole point: no prompt, no per-repo copy-paste, and it works under
+  // the slash command where stdin is a pipe and nothing can be asked.
+  //
+  // The value still never enters this process; see secretsource.js for how.
+  const sourceFetches = secretsSource
+    ? plannedFetches(secretsSource, {
+        // The tracker's own credentials are excluded from `required` because
+        // they report separately — but a secret manager should fill them too, so
+        // they are added back here.
+        secrets: [
+          ...missingStatusCheckSecrets,
+          ...(sync && !sync.hasToken ? [sync.secretName] : []),
+        ],
+        variables: [...missingCheckVariables, ...(sync?.missingVariables ?? [])],
+      })
+    : [];
+
+  // Preconditions are checked once, and only when there is something to fetch:
+  // an unauthenticated gcloud does not matter on a repo that needs nothing.
+  let sourceBlocked = null;
+  if (secretsSource && sourceFetches.length > 0) {
+    const installed = sourceCliInstalled(secretsSource);
+    if (!installed || !sourceAuthenticated(secretsSource)) {
+      sourceBlocked = noSourceAccessMessage(secretsSource, { installed });
+    }
+  }
+
   // Same offer as the tracker's, above — but unlike that one, this is not
   // tied to a "just chosen" moment: it is a standing requirement of the
   // config, so it is checked on every interactive run, not only a first sync.
-  if (isInteractive() && !asJson && !setToken && client.authMode === "gh cli") {
+  // Skipped entirely when a secret manager is going to supply it: asking a human
+  // for something automation is about to do is just noise.
+  if (isInteractive() && !asJson && !setToken && client.authMode === "gh cli" && !secretsSource) {
     for (const name of [...missingStatusCheckSecrets]) {
       const known = STATUS_CHECK_SECRETS[name];
       if (
@@ -854,6 +900,15 @@ async function main() {
           missingStatusCheckSecrets,
           // Non-sensitive repository variables those same checks need.
           missingCheckVariables,
+          // Where the missing credentials come from, when a manager is configured.
+          // Names only — never a value.
+          secretsSource: secretsSource && {
+            provider: secretsSource.provider,
+            project: secretsSource.project,
+            version: secretsSource.version,
+            blocked: sourceBlocked,
+            fetches: sourceFetches,
+          },
           teamsToCreate,
           teamsToFill,
           teamSeed: {
@@ -1152,7 +1207,7 @@ async function main() {
   // would put it in shell history and the process table. On a terminal the
   // hand-off to gh's hidden prompt is offered right here; anywhere else the
   // command to run is printed instead.
-  if (trackerCredentialsMissing(sync ?? {})) {
+  if (!secretsSource && trackerCredentialsMissing(sync ?? {})) {
     if (shouldApply && isInteractive() && client.authMode === "gh cli" && !trackerOfferMade) {
       if (
         await askYesNo(
@@ -1193,10 +1248,26 @@ async function main() {
     }
   }
 
+  // A configured secret manager replaces every "set it yourself" message below,
+  // so the plan says what it will fetch instead of what the user must type.
+  if (secretsSource && sourceFetches.length > 0) {
+    console.log(
+      `\n  SECRETS  ${secretsSource.label.padEnd(30)} → ${sourceFetches.length} credential(s) will be read` +
+        `${secretsSource.project ? ` from project '${secretsSource.project}'` : ""} and written to this repository:` +
+        sourceFetches
+          .map((f) => `\n${" ".repeat(13)} ${f.name.padEnd(20)} ← ${f.sourceName}  (${f.kind})`)
+          .join("") +
+        `\n${" ".repeat(13)} the value goes ${secretsSource.provider} → gh → GitHub; it never enters this process`,
+    );
+    if (sourceBlocked) {
+      console.log(`${" ".repeat(13)}[${sourceBlocked.split("\n").join(`\n${" ".repeat(14)}`)}]`);
+    }
+  }
+
   // The interactive offer above already had its chance this run; anywhere
   // that offer could not fire (non-interactive, declined, no gh cli) gets the
   // manual command instead, exactly like the tracker's own fallback.
-  for (const name of missingStatusCheckSecrets) {
+  for (const name of secretsSource ? [] : missingStatusCheckSecrets) {
     const known = STATUS_CHECK_SECRETS[name];
     console.log(
       `\n  The '${name}' secret is ${required.reasons.get(name)} and is not set —` +
@@ -1210,7 +1281,7 @@ async function main() {
   // Not secrets, so there is no hidden-prompt hand-off for these — just the
   // command. Reported all the same: a check missing a variable fails exactly
   // like a check missing a token.
-  for (const name of missingCheckVariables) {
+  for (const name of secretsSource ? [] : missingCheckVariables) {
     const hint = sync?.variableHints?.[name];
     console.log(
       `\n  The '${name}' repository variable is required by a configured check and is not set.` +
@@ -1229,7 +1300,8 @@ async function main() {
     branches.missing.length +
     policyEdits.length +
     teamsToCreate.length +
-    teamsToFill.length;
+    teamsToFill.length +
+    sourceFetches.length;
 
   if (!shouldApply) {
     // The credential writes under --set-token are real even in plan mode;
@@ -1245,6 +1317,34 @@ async function main() {
   }
 
   console.log("");
+
+  // Credentials before anything that depends on them. A generated workflow whose
+  // secret is missing runs and skips silently, so filling them first is what
+  // makes the very first merge after a sync actually work.
+  //
+  // Deliberately NOT done in plan mode. The interactive prompt writes during a
+  // plan because asking the same question twice would be silly, but automation
+  // has no such excuse — and "the plan writes nothing" is worth keeping true
+  // wherever it can be.
+  if (secretsSource && sourceFetches.length > 0) {
+    if (sourceBlocked) {
+      console.log(`  ✗ ${sourceBlocked.split("\n").join("\n    ")}`);
+      process.exitCode = 1;
+    } else {
+      for (const fetch of sourceFetches) {
+        const result = pushCredential({ ...fetch, repo: `${client.owner}/${client.repo}`, source: secretsSource });
+        if (result.ok) {
+          console.log(`  ✓ ${fetch.name} set from ${fetch.sourceName}`);
+          credentialWrites = true;
+        } else {
+          // Named, never guessed at: a missing secret in the manager and a
+          // permissions failure need completely different fixes.
+          console.log(`  ✗ ${fetch.name}: ${result.error}`);
+          process.exitCode = 1;
+        }
+      }
+    }
+  }
 
   // Teams first: the ruleset payload needs a real team id, so the rulesets are
   // recompiled once the team exists. Creating a team and adding members

@@ -462,6 +462,83 @@ would leave the live one blocking merges forever.
 Both need `OPENROUTER_API_KEY`, which the sync offers to set for you — see
 *Secrets other status checks need* above.
 
+## Credentials from a secret manager
+
+Setting a token per secret, per repository, through `gh`'s hidden prompt is safe but manual.
+`secretsSource` automates it: pick a tracker and every credential the repository is missing is read
+from the secret manager and written straight into its Actions secrets.
+
+```jsonc
+"secretsSource": {
+  "provider": "gcp-secret-manager",
+  "project": "tehvault-platform",
+  "version": "latest",          // 'latest' so a rotation lands without editing configs
+  "mapping": {}                 // optional overrides; see below
+}
+```
+
+```
+  SECRETS  Google Secret Manager          → 2 credential(s) will be read from project
+           'tehvault-platform' and written to this repository:
+             OPENROUTER_API_KEY   ← openrouter-api-key  (secret)
+             CLICKUP_TOKEN        ← clickup-token  (secret)
+             the value goes gcp-secret-manager → gh → GitHub; it never enters this process
+```
+
+It covers **the tracker's own token too**, whichever provider is chosen — `CLICKUP_TOKEN`, or
+Jira's `JIRA_API_TOKEN` plus its `JIRA_BASE_URL` and `JIRA_EMAIL` variables — and everything the
+generated checks need. A credential already present is not fetched again.
+
+### The value still never enters this process
+
+The same guarantee the hidden prompt gives, by the same means. The fetch and the write are one
+shell, joined by a kernel pipe:
+
+```
+gcloud secrets versions access latest --secret=clickup-token | gh secret set CLICKUP_TOKEN --repo …
+```
+
+The plugin spawns that single shell and inherits nothing but its exit status. Piping the bytes
+through Node instead would put the plaintext in this process's heap, which is exactly what the
+prompt design exists to avoid — so it is not done that way. `stdout` is discarded and only `stderr`
+is captured, so even a failure cannot echo the value.
+
+**And the script cannot be injected.** Its text is a constant; the project, the secret id and the
+repository all arrive through the environment or as positional arguments. A project named
+`p; echo PWNED` travels as one argument and stays data. There is a test asserting no config value
+reaches the script text.
+
+**A failed fetch never writes.** The pipeline runs under `set -o pipefail` — without it `gh`'s exit
+status would mask a failed `gcloud` and an *empty* secret would be written over a working one, which
+is far worse than an error. A missing secret and a permissions failure are reported differently,
+because the fixes differ.
+
+### Naming
+
+A GitHub secret maps to a manager id by convention — `CLICKUP_TOKEN` → `clickup-token` — so most
+setups need no `mapping` at all. Override individual ones where your ids differ:
+
+```jsonc
+"mapping": { "CLICKUP_TOKEN": "clickup-token-prod" }
+```
+
+### What changes about the flow
+
+| | without a source | with one |
+|---|---|---|
+| Where the value comes from | a human, at gh's hidden prompt | the secret manager |
+| Needs a terminal | yes — so it never worked under `/enforce-rules` | **no** |
+| Rotation | re-run `--set-token` per repo | rotate once in the manager, re-sync |
+| Plan mode | the prompt writes during a plan | **reads and writes nothing** |
+
+That last row is a deliberate difference. The interactive prompt writes during a plan because asking
+the same question twice would be silly; automation has no such excuse, so "the plan writes nothing"
+stays true and the fetch happens on `--apply`.
+
+`gcloud` must be installed and logged in. If it is not, the plan says which of the two it is — the
+fixes differ — and it never runs `gcloud auth login` for you, the same rule that applies to
+`gh auth login`: a browser flow cannot be answered by a pipe.
+
 ## Trivy security scan
 
 `prChecks.trivy` adds a security gate that every governed repository gets, on its own
