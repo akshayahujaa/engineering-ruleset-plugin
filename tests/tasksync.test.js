@@ -6,6 +6,7 @@ import {
   renderWorkflow,
   renderClickUpWorkflow,
   renderJiraWorkflow,
+  renderKaneoWorkflow,
   normalizeTaskSync,
   statusPipeline,
   planTaskSync,
@@ -225,6 +226,13 @@ test("taskSync with provider jira gets Jira defaults", () => {
   assert.equal(sync.taskIdPrefix, "");
 });
 
+test("taskSync with provider kaneo gets Kaneo defaults", () => {
+  const sync = normalizeTaskSync({ taskSync: { enabled: true, provider: "kaneo" } });
+  assert.equal(sync.secretName, "KANEO_API_TOKEN");
+  assert.equal(sync.taskIdPrefix, "");
+  assert.deepEqual(sync.todoStatuses, ["to-do", "todo", "open", "backlog", "pending"]);
+});
+
 test("taskSync wins over a legacy clickup section when both exist", () => {
   const sync = normalizeTaskSync({
     taskSync: { enabled: true, provider: "jira" },
@@ -273,10 +281,21 @@ test("the Jira workflow never interpolates a credential into the YAML", () => {
   assert.match(yaml, /-u "\$JIRA_EMAIL:\$JIRA_API_TOKEN"/);
 });
 
+test("the Kaneo workflow uses its API variables and bearer token", () => {
+  const yaml = renderKaneoWorkflow({}, ONE);
+  assert.match(yaml, /KANEO_API_URL: \$\{\{ vars\.KANEO_API_URL \}\}/);
+  assert.match(yaml, /KANEO_PROJECT_ID: \$\{\{ vars\.KANEO_PROJECT_ID \}\}/);
+  assert.match(yaml, /KANEO_API_TOKEN: \$\{\{ secrets\.KANEO_API_TOKEN \}\}/);
+  assert.match(yaml, /feature\/PROJ-2\/thing/);
+  assert.match(yaml, /task\/tasks\/\$KANEO_PROJECT_ID/);
+  assert.match(yaml, /task\/status\/\$id/);
+});
+
 test("renderWorkflow dispatches on provider", () => {
   assert.match(renderWorkflow({ provider: "jira" }, ONE), /Jira issue sync/);
   assert.match(renderWorkflow({ provider: "clickup" }, ONE), /ClickUp task sync/);
   assert.match(renderWorkflow({}, ONE), /ClickUp task sync/);
+  assert.match(renderWorkflow({ provider: "kaneo" }, ONE), /Kaneo task sync/);
 });
 
 /**
@@ -713,7 +732,7 @@ test("a bare task id needs no prefix in the extraction step", () => {
  * terminal. Choosing what is already the default is still choosing it.
  */
 test("a missing token is offered whatever the provider was before", () => {
-  for (const provider of ["clickup", "jira"]) {
+  for (const provider of ["clickup", "jira", "kaneo"]) {
     assert.equal(
       trackerCredentialsMissing({ provider, hasToken: false, missingVariables: [] }),
       true,
@@ -735,6 +754,22 @@ test("a missing variable alone is enough to offer, even with the token set", () 
   assert.equal(
     trackerCredentialsMissing({ provider: "jira", hasToken: true, missingVariables: ["JIRA_BASE_URL"] }),
     true,
+  );
+});
+
+test("Kaneo requires its URL and project variables as well as the token", () => {
+  assert.equal(
+    trackerCredentialsMissing({ provider: "kaneo", hasToken: true, missingVariables: ["KANEO_PROJECT_ID"] }),
+    true,
+  );
+  assert.equal(trackerCredentialsMissing({ provider: "kaneo", hasToken: true, missingVariables: [] }), false);
+});
+
+test("Kaneo uses its documented hyphenated status defaults", () => {
+  const config = { environments: { dev: {}, test: {}, prod: {} }, taskSync: { enabled: true, provider: "kaneo" } };
+  assert.deepEqual(
+    statusPipeline(config, normalizeTaskSync(config)).map((stage) => stage.status),
+    ["in-progress", "in-review", "done"],
   );
 });
 
