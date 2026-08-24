@@ -19,6 +19,8 @@ import {
   statusNames,
   GENERATED_MARKER,
   DEFAULT_TODO_STATUSES,
+  DEFAULT_PUSH_STATUS_BY_PROVIDER,
+  DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER_WITH_PUSH,
 } from "../src/tasksync.js";
 
 const OPTS = { prefixes: ["feature", "bugfix", "hotfix", "docs", "chore"], taskIdPrefix: "CU-" };
@@ -717,6 +719,66 @@ test("both providers render the push trigger", () => {
   assert.match(yaml, /'in progress'\) rank=1/);
 });
 
+/**
+ * The bug this guards: a Kaneo repo set up with the shared example config —
+ * `branchPushStatus: "in progress"`, exactly as ClickUp and Jira document it —
+ * pushed a branch and the task never left to-do. Kaneo's own board uses the
+ * hyphenated "in-progress" (see DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER,
+ * which the merge stages already got right); the push stage had no such
+ * translation and tried the literal, nonexistent "in progress" only.
+ */
+test("a Kaneo push also accepts the provider's own hyphenated status", () => {
+  const kaneo = { ...WITH_PUSH, taskSync: { ...WITH_PUSH.taskSync, provider: "kaneo" } };
+  const sync = normalizeTaskSync(kaneo);
+  const push = pushStage(kaneo, sync);
+
+  assert.deepEqual(push.statuses, ["in progress", "in-progress"]);
+  assert.equal(push.status, "in progress", "the configured spelling is still what's reported and tried first");
+
+  const yaml = renderKaneoWorkflow(sync, statusPipeline(kaneo, sync), push);
+  assert.match(
+    yaml,
+    /if \[ "\$\{EVENT_NAME:-\}" = "push" \]; then\n\s+want='in progress'; want_rank=1; set -- 'in progress' 'in-progress'/,
+    "the write loop must try Kaneo's real status after the configured one",
+  );
+  assert.match(yaml, /'in progress'\|'in-progress'\) rank=1/, "either spelling ranks as having arrived");
+});
+
+test("a Kaneo push already at the provider's hyphenated status is left alone, not re-written", () => {
+  const kaneo = { ...WITH_PUSH, taskSync: { ...WITH_PUSH.taskSync, provider: "kaneo" } };
+  const sync = normalizeTaskSync(kaneo);
+  const push = pushStage(kaneo, sync);
+  const stages = rankedStages(push, statusPipeline(kaneo, sync));
+
+  assert.equal(
+    decideTransition("in-progress", { pipeline: stages, target: push.status, targetRank: push.rank }).move,
+    false,
+    "the task already arrived, whichever spelling the board used",
+  );
+});
+
+test("the provider fallback is not duplicated when the config already uses it", () => {
+  const kaneo = {
+    ...WITH_PUSH,
+    taskSync: { ...WITH_PUSH.taskSync, provider: "kaneo", branchPushStatus: "in-progress" },
+  };
+  const sync = normalizeTaskSync(kaneo);
+  assert.deepEqual(pushStage(kaneo, sync).statuses, ["in-progress"]);
+});
+
+test("an opted-out push stage (empty list) stays off even for a provider with a default", () => {
+  const kaneo = { ...WITH_PUSH, taskSync: { ...WITH_PUSH.taskSync, provider: "kaneo", branchPushStatus: [] } };
+  const sync = normalizeTaskSync(kaneo);
+  assert.deepEqual(pushStage(kaneo, sync).statuses, [], "no default status is smuggled in behind an explicit opt-out");
+});
+
+test("providers without their own convention are unaffected by the fallback", () => {
+  assert.equal(DEFAULT_PUSH_STATUS_BY_PROVIDER.clickup, undefined);
+  assert.equal(DEFAULT_PUSH_STATUS_BY_PROVIDER.jira, undefined);
+  const sync = pushSync();
+  assert.deepEqual(pushStage(WITH_PUSH, sync).statuses, ["in progress"]);
+});
+
 test("a bare task id needs no prefix in the extraction step", () => {
   const yaml = renderClickUpWorkflow({ taskIdPrefix: "" }, PIPELINE);
   assert.match(yaml, /-v p='' /, "an empty prefix takes the whole second segment");
@@ -771,6 +833,62 @@ test("Kaneo uses its documented hyphenated status defaults", () => {
     statusPipeline(config, normalizeTaskSync(config)).map((stage) => stage.status),
     ["in-progress", "in-review", "done"],
   );
+});
+
+/**
+ * The bug this guards: with push enabled, dev used to default to "in-progress"
+ * too — the same status push already set, so a dev merge never actually
+ * advanced the task. Push claims "in-progress"; dev and prod default to the
+ * two columns it leaves behind on Kaneo's board.
+ */
+test("with push enabled, Kaneo's dev/prod defaults shift to the columns push leaves behind", () => {
+  const config = {
+    environments: { dev: {}, prod: {} },
+    branchNaming: { allowedPrefixes: ["feature"] },
+    taskSync: { enabled: true, provider: "kaneo", branchPushStatus: "in progress" },
+  };
+  const sync = normalizeTaskSync(config);
+  const push = pushStage(config, sync);
+
+  assert.equal(push.statuses[0], "in progress");
+  assert.deepEqual(
+    statusPipeline(config, sync).map((stage) => [stage.env, stage.status]),
+    [
+      ["dev", "in-review"],
+      ["prod", "done"],
+    ],
+  );
+});
+
+test("without push, Kaneo's dev default is unchanged — still the first sign work started", () => {
+  const config = { environments: { dev: {}, prod: {} }, taskSync: { enabled: true, provider: "kaneo" } };
+  const sync = normalizeTaskSync(config);
+  assert.equal(pushStage(config, sync), null);
+  assert.deepEqual(
+    statusPipeline(config, sync).map((stage) => stage.status),
+    ["in-progress", "done"],
+  );
+});
+
+test("a third environment alongside push has no Kaneo default of its own, and falls back to the generic one", () => {
+  const config = {
+    environments: { dev: {}, test: {}, prod: {} },
+    branchNaming: { allowedPrefixes: ["feature"] },
+    taskSync: { enabled: true, provider: "kaneo", branchPushStatus: "in progress" },
+  };
+  const sync = normalizeTaskSync(config);
+  assert.deepEqual(
+    statusPipeline(config, sync).map((stage) => [stage.env, stage.status]),
+    [
+      ["dev", "in-review"],
+      ["test", "QA"],
+      ["prod", "done"],
+    ],
+  );
+});
+
+test("the push-aware Kaneo default has no entry for a third environment", () => {
+  assert.deepEqual(Object.keys(DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER_WITH_PUSH.kaneo), ["dev", "prod"]);
 });
 
 test("with no tracker there is nothing to offer", () => {

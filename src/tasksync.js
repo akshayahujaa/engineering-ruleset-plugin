@@ -40,6 +40,49 @@ export const DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER = {
   },
 };
 
+/**
+ * Kaneo's board has exactly four columns — to-do, in-progress, in-review,
+ * done. `DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER` above assumes none of them
+ * is claimed yet, so a merge into `dev` gets to be "in-progress": the first
+ * sign work has started.
+ *
+ * With a push stage configured, that sign already happened at push time —
+ * `DEFAULT_PUSH_STATUS_BY_PROVIDER` puts the task at "in-progress" before any
+ * merge exists to claim it. Reusing the same default for `dev` would not
+ * advance the task at all, just repeat a status it already has. Once push
+ * owns "in-progress", the two columns left on the board are what `dev` and
+ * `prod` advance to instead. There is deliberately no default for a third
+ * environment here — Kaneo has no fifth column to give it, so a repo that
+ * declares one (e.g. `test`) alongside push falls back to the generic
+ * `DEFAULT_ENVIRONMENT_STATUSES` and must name the real status itself in
+ * `environmentStatuses` if that generic guess is wrong.
+ */
+export const DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER_WITH_PUSH = {
+  kaneo: {
+    dev: "in-review",
+    prod: "done",
+  },
+};
+
+/**
+ * The push stage has no per-provider default the way `environmentStatuses`
+ * does — `branchPushStatus` is one scalar, not a map keyed by environment, so
+ * there is no "was this key explicitly set" to branch on. The shared example
+ * in the README sets it to `"in progress"`, which is ClickUp/Jira's own
+ * spelling; Kaneo's board uses the hyphenated `"in-progress"` (see
+ * `DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER` above). A Kaneo repo configured
+ * the same way as a ClickUp one — copying that example verbatim, exactly as
+ * every other provider's setup docs show — would ask Kaneo to write a status
+ * it does not have, and the push would never move the task out of to-do.
+ *
+ * `pushStage` folds this in as an *additional accepted name*, so both
+ * spellings are tried on write and both rank as "arrived" — the same
+ * many-names support `environmentStatuses` already has for `prod`.
+ */
+export const DEFAULT_PUSH_STATUS_BY_PROVIDER = {
+  kaneo: "in-progress",
+};
+
 export const PROVIDERS = {
   clickup: {
     label: "ClickUp",
@@ -176,6 +219,11 @@ export function statusNames(value) {
  * With no prefixes there is nothing to match, and no stage; see
  * `pushStageBlocked` for saying so out loud.
  *
+ * The configured status is tried first, but see
+ * `DEFAULT_PUSH_STATUS_BY_PROVIDER`: a provider whose own convention differs
+ * from the configured spelling gets it folded in as a second accepted name,
+ * so the shared example config works on that provider's real board too.
+ *
  * @returns {{status: string, rank: 1, prefixes: string[]}|null}
  */
 export function pushStage(config, sync) {
@@ -184,7 +232,15 @@ export function pushStage(config, sync) {
   const prefixes = config?.branchNaming?.allowedPrefixes ?? [];
   if (prefixes.length === 0) return null;
 
-  const names = statusNames(sync.branchPushStatus);
+  const configured = statusNames(sync.branchPushStatus);
+  // An empty list (`[]`) is a documented opt-out, same as `null` — it must not
+  // be rescued back to life by a provider default the operator never asked for.
+  const providerDefault = configured.length > 0 ? DEFAULT_PUSH_STATUS_BY_PROVIDER[sync?.provider] : undefined;
+  const names =
+    providerDefault && !configured.some((n) => n.toLowerCase() === providerDefault.toLowerCase())
+      ? [...configured, providerDefault]
+      : configured;
+
   return { status: names[0], statuses: names, rank: 1, prefixes: [...prefixes] };
 }
 
@@ -235,8 +291,16 @@ export const rankedStages = (push, pipeline = []) =>
  * @returns {Array<{env: string, status: string, rank: number}>}
  */
 export function statusPipeline(config, sync) {
-  // A push stage occupies rank 1, so every environment shifts up behind it.
-  const offset = pushStage(config, sync) ? 1 : 0;
+  // A push stage occupies rank 1, so every environment shifts up behind it —
+  // and, for a provider whose board has a fixed set of columns, changes which
+  // column each environment defaults to; see
+  // DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER_WITH_PUSH.
+  const push = pushStage(config, sync);
+  const offset = push ? 1 : 0;
+  const providerDefaults =
+    (push && DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER_WITH_PUSH[sync?.provider]) ??
+    DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER[sync?.provider] ??
+    {};
 
   // The legacy single-branch form synced exactly one branch. Upgrading must
   // not quietly start moving tasks on merges into other environments.
@@ -250,7 +314,6 @@ export function statusPipeline(config, sync) {
   const stages = [];
 
   for (const env of Object.keys(config?.environments ?? {})) {
-    const providerDefaults = DEFAULT_ENVIRONMENT_STATUSES_BY_PROVIDER[sync?.provider] ?? {};
     const configured =
       explicit && Object.hasOwn(explicit, env)
         ? explicit[env]
