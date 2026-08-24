@@ -1,5 +1,5 @@
 // Verifies that a PR's changed files stay within the scope of its linked
-// issue-tracker ticket (ClickUp or Jira). Runs inside GitHub Actions.
+// issue-tracker ticket (ClickUp, Jira, or Kaneo). Runs inside GitHub Actions.
 // Requires Node 18+ (global fetch).
 //
 // It: (1) finds the ticket id from the PR (link, marker, or branch name),
@@ -7,7 +7,7 @@
 // PR's changed files + diff from GitHub, (4) asks an AI whether the changes are
 // in scope, (5) posts a sticky comment and exits 0 (pass) or 1 (block).
 //
-// Issue tracker is selected with ISSUE_PROVIDER: "clickup" (default) | "jira".
+// Issue tracker is selected with ISSUE_PROVIDER: "clickup" (default) | "jira" | "kaneo".
 // AI provider is selected with AI_PROVIDER: "openrouter" (default) | "gemini" |
 // "github-models".
 
@@ -27,7 +27,7 @@ const {
   GEMINI_API_KEY,
 
   // ---- issue tracker ----
-  ISSUE_PROVIDER = 'clickup',      // "clickup" | "jira"
+  ISSUE_PROVIDER = 'clickup',      // "clickup" | "jira" | "kaneo"
 
   // ClickUp
   CLICKUP_TOKEN,
@@ -36,6 +36,11 @@ const {
   JIRA_BASE_URL,                          // e.g. https://your-org.atlassian.net
   JIRA_EMAIL,                             // Atlassian account email
   JIRA_API_TOKEN,                         // https://id.atlassian.com/manage-profile/security/api-tokens
+
+  // Kaneo
+  KANEO_API_URL,                          // e.g. https://cloud.kaneo.app/api
+  KANEO_PROJECT_ID,                       // project containing the branch task number
+  KANEO_API_TOKEN,
 
   // Optional override for id extraction; capture group 1 = id
   ISSUE_ID_REGEX,
@@ -89,7 +94,7 @@ async function getChangedFiles() {
 // ======================================================= ISSUE ID EXTRACTION
 // ClickUp default task ids look like "86d3bzhgq": a short alphanumeric token
 // mixing lowercase letters and digits.
-// Jira issue keys look like "PROJ-123": uppercase project key + dash + number.
+// Jira and Kaneo task keys look like "PROJ-123": project key + dash + number.
 
 const hasLetterAndDigit = (s) => /[a-z]/i.test(s) && /\d/.test(s);
 
@@ -138,6 +143,17 @@ function extractJiraId(pr) {
   return null;
 }
 
+function extractKaneoId(pr) {
+  const KEY = '[A-Z][A-Z0-9]*-\\d+';
+  const branch = pr.head?.ref || '';
+  const title = pr.title || '';
+  const body = pr.body || '';
+  const blob = `${body}\n${title}\n${branch}`;
+  const keyRe = new RegExp(`(?:^|[^A-Z0-9])(${KEY})(?![A-Z0-9])`, 'gi');
+  for (const m of blob.matchAll(keyRe)) return { taskId: m[1].toUpperCase(), source: 'kaneo-task-key' };
+  return null;
+}
+
 function extractIssueId(pr) {
   // Optional override wins if provided.
   if (ISSUE_ID_REGEX) {
@@ -149,7 +165,9 @@ function extractIssueId(pr) {
       console.error(`Invalid ISSUE_ID_REGEX: ${e.message}`);
     }
   }
-  return provider === 'jira' ? extractJiraId(pr) : extractClickUpId(pr);
+  if (provider === 'jira') return extractJiraId(pr);
+  if (provider === 'kaneo') return extractKaneoId(pr);
+  return extractClickUpId(pr);
 }
 
 // ============================================================ ISSUE FETCHING
@@ -202,7 +220,38 @@ async function getJiraTask(issueKey) {
   };
 }
 
-const getIssue = (id) => (provider === 'jira' ? getJiraTask(id) : getClickUpTask(id));
+async function getKaneoTask(taskKey) {
+  if (!KANEO_API_URL || !KANEO_PROJECT_ID || !KANEO_API_TOKEN) {
+    throw new Error('Kaneo requires KANEO_API_URL, KANEO_PROJECT_ID and KANEO_API_TOKEN.');
+  }
+  const base = KANEO_API_URL.replace(/\/$/, '');
+  const number = taskKey.match(/(\d+)$/)?.[1];
+  if (!number) throw new Error(`Invalid Kaneo task key: ${taskKey}`);
+  const res = await fetch(`${base}/task/tasks/${encodeURIComponent(KANEO_PROJECT_ID)}`, {
+    headers: { Authorization: `Bearer ${KANEO_API_TOKEN}`, Accept: 'application/json' },
+  });
+  if (!res.ok) throw new Error(`Kaneo API ${res.status} while listing project tasks: ${(await res.text()).slice(0, 400)}`);
+  const payload = await res.json();
+  const matches = [];
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (String(value.number ?? '') === number && value.id) matches.push(value);
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(payload);
+  const task = matches[0];
+  if (!task) throw new Error(`Kaneo task ${taskKey} was not found in project ${KANEO_PROJECT_ID}.`);
+  const text = (task.description || '').trim();
+  return {
+    id: taskKey,
+    name: task.title || '(no title)',
+    description: text.slice(0, 6000) || '(no description)',
+    url: `${base}/task/${task.id}`,
+  };
+}
+
+const getIssue = (id) =>
+  provider === 'jira' ? getJiraTask(id) : provider === 'kaneo' ? getKaneoTask(id) : getClickUpTask(id);
 
 // --------------------------------------------------------------- Diff / files
 function buildDiff(files) {
@@ -372,6 +421,13 @@ function howToLink() {
       `- Put the issue key in the branch name, e.g. \`PROJ-123-add-login\`\n` +
       `- Or put it in the PR title, e.g. \`[PROJ-123] Add login\`\n` +
       `- Or paste the issue link in the description, e.g. \`https://your-org.atlassian.net/browse/PROJ-123\``
+    );
+  }
+  if (provider === 'kaneo') {
+    return (
+      `- Put the task key in the branch name, e.g. \`feature/PROJ-2/add-login\`\n` +
+      `- Or put it in the PR title, e.g. \`[PROJ-2] Add login\`\n` +
+      `- Or put the task key in the PR description, e.g. \`PROJ-2\``
     );
   }
   return (

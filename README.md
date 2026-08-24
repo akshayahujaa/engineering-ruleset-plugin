@@ -115,10 +115,11 @@ have to be applied by the owner, or the repo moved into an organisation.
 Because the plugin authenticates through `gh`, running `gh auth switch` to an account that does
 have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
-## Task sync — ClickUp or Jira
+## Task sync — ClickUp, Jira, or Kaneo
 
 When `taskSync.enabled` is set (a legacy `clickup` section still works), the sync also installs a
-tracker workflow in the target repo — `.github/workflows/clickup-sync.yml` or `jira-sync.yml`,
+tracker workflow in the target repo — `.github/workflows/clickup-sync.yml`, `jira-sync.yml`, or
+`kaneo-sync.yml`,
 by `taskSync.provider`. It fires when a work branch is **pushed**, and on a merged PR into **any**
 environment, and moves the linked task to that stage's status.
 
@@ -225,11 +226,11 @@ Because rank follows the order of `environments`, an environment added later lan
 your real pipeline puts it earlier (staging before prod, say), reorder `environments` in the
 config; the plan prints the resulting pipeline every run so the order is visible before you apply.
 
-On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, or
+On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, Kaneo, or
 none — on a terminal by the CLI itself, under the slash command via a widget, and `--provider`
 answers it non-interactively. Switching provider later plans a `DELETE` of the other provider's
-workflow: leaving it behind would have both trackers moving tasks on every merge. Only the two
-managed workflow paths are ever considered for that.
+workflow: leaving it behind would have multiple trackers moving tasks on every merge. Only the
+managed provider workflow paths are ever considered for that.
 
 Jira credentials follow the same conventions as the pr-guardrails scope-check suite, so one
 repository setup feeds both: `JIRA_BASE_URL` and `JIRA_EMAIL` as repository **variables** (not
@@ -290,6 +291,12 @@ written; the plan falls back to printing the manual command instead.
 For **Jira**, the same moment first asks for `JIRA_BASE_URL` and `JIRA_EMAIL` — ordinary repository
 variables, not sensitive, answered in the clear — then takes `JIRA_API_TOKEN` at gh's hidden
 prompt the same way.
+
+For **Kaneo**, the same moment asks for `KANEO_API_URL` and `KANEO_PROJECT_ID` as repository
+variables, then takes `KANEO_API_TOKEN` at gh's hidden prompt. The workflow accepts branch names
+such as `feature/PROJ-2/description`, resolves task number `2` inside the configured Kaneo project,
+and updates the task through Kaneo's API. Use `https://cloud.kaneo.app/api` for Kaneo Cloud or the
+API URL of a reachable self-hosted instance.
 
 You can also trigger this later, standalone:
 
@@ -379,7 +386,8 @@ Two more workflows are generated the same way the task-sync one is, when
 The scope check reads the ticket from whichever tracker `taskSync.provider`
 already names. Pick ClickUp and the workflow gets `ISSUE_PROVIDER: "clickup"`
 and `CLICKUP_TOKEN`; pick Jira and it gets `ISSUE_PROVIDER: "jira"` with
-`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`. Switch provider and the
+`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`; pick Kaneo and it gets
+`KANEO_API_URL`, `KANEO_PROJECT_ID` and `KANEO_API_TOKEN`. Switch provider and the
 workflow is rewritten to match — there is no second place to keep in sync.
 
 With `provider: "none"` there is no ticket to read, so the scope check is
@@ -388,7 +396,7 @@ looking like a passing one:
 
 ```
   SKIPPED  .github/workflows/pr-scope-check.yml → it reads the ticket from a task tracker,
-           but taskSync is off (provider 'none') — enable ClickUp or Jira, or set
+           but taskSync is off (provider 'none') — enable ClickUp, Jira, or Kaneo, or set
            prChecks.scopeCheck.enabled to false
 ```
 
@@ -485,8 +493,9 @@ from the secret manager and written straight into its Actions secrets.
              the value goes gcp-secret-manager → gh → GitHub; it never enters this process
 ```
 
-It covers **the tracker's own token too**, whichever provider is chosen — `CLICKUP_TOKEN`, or
-Jira's `JIRA_API_TOKEN` plus its `JIRA_BASE_URL` and `JIRA_EMAIL` variables — and everything the
+It covers **the tracker's own token too**, whichever provider is chosen — `CLICKUP_TOKEN`,
+Jira's `JIRA_API_TOKEN` plus its `JIRA_BASE_URL` and `JIRA_EMAIL` variables, or Kaneo's
+`KANEO_API_TOKEN` plus its `KANEO_API_URL` and `KANEO_PROJECT_ID` variables — and everything the
 generated checks need. A credential already present is not fetched again.
 
 ### The value still never enters this process

@@ -8,7 +8,7 @@
  *   enforce-rules --json                machine-readable plan
  *   enforce-rules --accept-invite       accept a pending invitation to the target repo
  *   enforce-rules --env staging         add an environment; persisted on --apply
- *   enforce-rules --provider jira       choose the task tracker (clickup | jira | none)
+ *   enforce-rules --provider jira       choose the task tracker (clickup | jira | kaneo | none)
  *   enforce-rules --set-token           set the tracker's credentials (token via gh's hidden prompt)
  */
 
@@ -76,7 +76,7 @@ import {
 } from "./access.js";
 
 const ICON = { create: "CREATE ", update: "UPDATE ", unchanged: "UNCHANGED" };
-const PROVIDER_CHOICES = ["clickup", "jira", "none"];
+const PROVIDER_CHOICES = ["clickup", "jira", "kaneo", "none"];
 
 /**
  * Where to get, and what to call, a status-check secret this plugin does not
@@ -194,13 +194,13 @@ async function askProvider() {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = (
-      await rl.question("Task tracker to sync on merges — clickup (default), jira, or none: ")
+      await rl.question("Task tracker to sync on merges — clickup (default), jira, kaneo, or none: ")
     )
       .trim()
       .toLowerCase();
     if (answer === "" || answer === "clickup") return "clickup";
-    if (answer === "jira" || answer === "none") return answer;
-    throw new Error(`Unknown tracker '${answer}' — expected clickup, jira, or none.`);
+    if (["jira", "kaneo", "none"].includes(answer)) return answer;
+    throw new Error(`Unknown tracker '${answer}' — expected clickup, jira, kaneo, or none.`);
   } finally {
     rl.close();
   }
@@ -226,6 +226,12 @@ async function setupCredentials(client, sync) {
         }
         if (name === "JIRA_EMAIL" && !value.includes("@")) {
           throw new Error(`${name} does not look like an email address.`);
+        }
+        if (name === "KANEO_API_URL" && !/^https?:\/\/.+/.test(value)) {
+          throw new Error(`${name} must be an http:// or https:// URL.`);
+        }
+        if (name === "KANEO_PROJECT_ID" && !value) {
+          throw new Error(`${name} cannot be empty.`);
         }
         await client.setVariable(name, value);
         wroteAnything = true;
@@ -354,9 +360,9 @@ async function main() {
   const providerFlag =
     args.find((a) => a.startsWith("--provider="))?.split("=")[1] ??
     (args.includes("--provider") ? args[args.indexOf("--provider") + 1] : undefined);
-  if (providerFlagGiven && !["clickup", "jira", "none"].includes(providerFlag)) {
+  if (providerFlagGiven && !["clickup", "jira", "kaneo", "none"].includes(providerFlag)) {
     throw new Error(
-      `--provider must be one of: clickup, jira, none — got '${providerFlag ?? ""}'.`,
+      `--provider must be one of: clickup, jira, kaneo, none — got '${providerFlag ?? ""}'.`,
     );
   }
 
