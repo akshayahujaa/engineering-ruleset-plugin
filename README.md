@@ -115,10 +115,11 @@ have to be applied by the owner, or the repo moved into an organisation.
 Because the plugin authenticates through `gh`, running `gh auth switch` to an account that does
 have admin is all that is needed; nothing in the plugin has to be reconfigured.
 
-## Task sync — ClickUp or Jira
+## Task sync — ClickUp, Jira, or Kaneo
 
 When `taskSync.enabled` is set (a legacy `clickup` section still works), the sync also installs a
-tracker workflow in the target repo — `.github/workflows/clickup-sync.yml` or `jira-sync.yml`,
+tracker workflow in the target repo — `.github/workflows/clickup-sync.yml`, `jira-sync.yml`, or
+`kaneo-sync.yml`,
 by `taskSync.provider`. It fires when a work branch is **pushed**, and on a merged PR into **any**
 environment, and moves the linked task to that stage's status.
 
@@ -225,11 +226,11 @@ Because rank follows the order of `environments`, an environment added later lan
 your real pipeline puts it earlier (staging before prod, say), reorder `environments` in the
 config; the plan prints the resulting pipeline every run so the order is visible before you apply.
 
-On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, or
+On a repository's first sync you are asked which tracker to use — ClickUp (default), Jira, Kaneo, or
 none — on a terminal by the CLI itself, under the slash command via a widget, and `--provider`
 answers it non-interactively. Switching provider later plans a `DELETE` of the other provider's
-workflow: leaving it behind would have both trackers moving tasks on every merge. Only the two
-managed workflow paths are ever considered for that.
+workflow: leaving it behind would have multiple trackers moving tasks on every merge. Only the
+managed provider workflow paths are ever considered for that.
 
 Jira credentials follow the same conventions as the pr-guardrails scope-check suite, so one
 repository setup feeds both: `JIRA_BASE_URL` and `JIRA_EMAIL` as repository **variables** (not
@@ -290,6 +291,12 @@ written; the plan falls back to printing the manual command instead.
 For **Jira**, the same moment first asks for `JIRA_BASE_URL` and `JIRA_EMAIL` — ordinary repository
 variables, not sensitive, answered in the clear — then takes `JIRA_API_TOKEN` at gh's hidden
 prompt the same way.
+
+For **Kaneo**, the same moment asks for `KANEO_API_URL` and `KANEO_PROJECT_ID` as repository
+variables, then takes `KANEO_API_TOKEN` at gh's hidden prompt. The workflow accepts branch names
+such as `feature/PROJ-2/description`, resolves task number `2` inside the configured Kaneo project,
+and updates the task through Kaneo's API. Use `https://cloud.kaneo.app/api` for Kaneo Cloud or the
+API URL of a reachable self-hosted instance.
 
 You can also trigger this later, standalone:
 
@@ -379,7 +386,8 @@ Two more workflows are generated the same way the task-sync one is, when
 The scope check reads the ticket from whichever tracker `taskSync.provider`
 already names. Pick ClickUp and the workflow gets `ISSUE_PROVIDER: "clickup"`
 and `CLICKUP_TOKEN`; pick Jira and it gets `ISSUE_PROVIDER: "jira"` with
-`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`. Switch provider and the
+`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`; pick Kaneo and it gets
+`KANEO_API_URL`, `KANEO_PROJECT_ID` and `KANEO_API_TOKEN`. Switch provider and the
 workflow is rewritten to match — there is no second place to keep in sync.
 
 With `provider: "none"` there is no ticket to read, so the scope check is
@@ -388,7 +396,7 @@ looking like a passing one:
 
 ```
   SKIPPED  .github/workflows/pr-scope-check.yml → it reads the ticket from a task tracker,
-           but taskSync is off (provider 'none') — enable ClickUp or Jira, or set
+           but taskSync is off (provider 'none') — enable ClickUp, Jira, or Kaneo, or set
            prChecks.scopeCheck.enabled to false
 ```
 
@@ -461,6 +469,83 @@ would leave the live one blocking merges forever.
 
 Both need `OPENROUTER_API_KEY`, which the sync offers to set for you — see
 *Secrets other status checks need* above.
+
+## Credentials from a secret manager
+
+Setting a token per secret, per repository, through `gh`'s hidden prompt is safe but manual.
+`secretsSource` automates it: pick a tracker and every credential the repository is missing is read
+from the secret manager and written straight into its Actions secrets.
+
+```jsonc
+"secretsSource": {
+  "provider": "gcp-secret-manager",
+  "project": "tehvault-platform",
+  "version": "latest",          // 'latest' so a rotation lands without editing configs
+  "mapping": {}                 // optional overrides; see below
+}
+```
+
+```
+  SECRETS  Google Secret Manager          → 2 credential(s) will be read from project
+           'tehvault-platform' and written to this repository:
+             OPENROUTER_API_KEY   ← openrouter-api-key  (secret)
+             CLICKUP_TOKEN        ← clickup-token  (secret)
+             the value goes gcp-secret-manager → gh → GitHub; it never enters this process
+```
+
+It covers **the tracker's own token too**, whichever provider is chosen — `CLICKUP_TOKEN`, or
+Jira's `JIRA_API_TOKEN` plus its `JIRA_BASE_URL` and `JIRA_EMAIL` variables — and everything the
+generated checks need. A credential already present is not fetched again.
+
+### The value still never enters this process
+
+The same guarantee the hidden prompt gives, by the same means. The fetch and the write are one
+shell, joined by a kernel pipe:
+
+```
+gcloud secrets versions access latest --secret=clickup-token | gh secret set CLICKUP_TOKEN --repo …
+```
+
+The plugin spawns that single shell and inherits nothing but its exit status. Piping the bytes
+through Node instead would put the plaintext in this process's heap, which is exactly what the
+prompt design exists to avoid — so it is not done that way. `stdout` is discarded and only `stderr`
+is captured, so even a failure cannot echo the value.
+
+**And the script cannot be injected.** Its text is a constant; the project, the secret id and the
+repository all arrive through the environment or as positional arguments. A project named
+`p; echo PWNED` travels as one argument and stays data. There is a test asserting no config value
+reaches the script text.
+
+**A failed fetch never writes.** The pipeline runs under `set -o pipefail` — without it `gh`'s exit
+status would mask a failed `gcloud` and an *empty* secret would be written over a working one, which
+is far worse than an error. A missing secret and a permissions failure are reported differently,
+because the fixes differ.
+
+### Naming
+
+A GitHub secret maps to a manager id by convention — `CLICKUP_TOKEN` → `clickup-token` — so most
+setups need no `mapping` at all. Override individual ones where your ids differ:
+
+```jsonc
+"mapping": { "CLICKUP_TOKEN": "clickup-token-prod" }
+```
+
+### What changes about the flow
+
+| | without a source | with one |
+|---|---|---|
+| Where the value comes from | a human, at gh's hidden prompt | the secret manager |
+| Needs a terminal | yes — so it never worked under `/enforce-rules` | **no** |
+| Rotation | re-run `--set-token` per repo | rotate once in the manager, re-sync |
+| Plan mode | the prompt writes during a plan | **reads and writes nothing** |
+
+That last row is a deliberate difference. The interactive prompt writes during a plan because asking
+the same question twice would be silly; automation has no such excuse, so "the plan writes nothing"
+stays true and the fetch happens on `--apply`.
+
+`gcloud` must be installed and logged in. If it is not, the plan says which of the two it is — the
+fixes differ — and it never runs `gcloud auth login` for you, the same rule that applies to
+`gh auth login`: a browser flow cannot be answered by a pipe.
 
 ## Trivy security scan
 

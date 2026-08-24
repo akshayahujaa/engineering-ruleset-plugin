@@ -60,7 +60,7 @@ test("it triggers on exactly the declared environments, quoted so none become bo
   assert.deepEqual(triggers(parseYaml(yaml)).pull_request.branches, ["dev", "no", "2"]);
 });
 
-test("ClickUp wires only its token; Jira wires its two variables and token", () => {
+test("ClickUp, Jira, and Kaneo wire only their own credentials", () => {
   const envOf = (provider) => {
     const doc = parseYaml(renderScopeCheckWorkflow({ environments: ENVS, provider, scopeCheck: checks.scopeCheck }));
     return doc.jobs["scope-check"].steps.at(-1).env;
@@ -77,6 +77,13 @@ test("ClickUp wires only its token; Jira wires its two variables and token", () 
   assert.equal(jira.JIRA_EMAIL, "${{ vars.JIRA_EMAIL }}");
   assert.equal(jira.JIRA_API_TOKEN, "${{ secrets.JIRA_API_TOKEN }}");
   assert.equal(jira.CLICKUP_TOKEN, undefined);
+
+  const kaneo = envOf("kaneo");
+  assert.equal(kaneo.ISSUE_PROVIDER, "kaneo");
+  assert.equal(kaneo.KANEO_API_URL, "${{ vars.KANEO_API_URL }}");
+  assert.equal(kaneo.KANEO_PROJECT_ID, "${{ vars.KANEO_PROJECT_ID }}");
+  assert.equal(kaneo.KANEO_API_TOKEN, "${{ secrets.KANEO_API_TOKEN }}");
+  assert.equal(kaneo.JIRA_API_TOKEN, undefined);
 });
 
 test("behaviour flags reach the workflow as strings the script can read", () => {
@@ -124,10 +131,12 @@ test("the script has no acceptance-criteria gate", () => {
   assert.doesNotMatch(script, /hasAcceptanceCriteria/);
 });
 
-test("the script supports both trackers, so one file serves either provider", () => {
+test("the script supports all three trackers, so one file serves any provider", () => {
   const script = renderScopeCheckScript();
   assert.match(script, /getClickUpTask/);
   assert.match(script, /getJiraTask/);
+  assert.match(script, /getKaneoTask/);
+  assert.match(script, /KANEO_PROJECT_ID/);
 });
 
 // --- the PR-Agent workflow ---------------------------------------------------------
@@ -195,6 +204,10 @@ test("the credentials each enabled check needs are reported", async () => {
   const jira = await planPrChecks(stubClient(), { ...ON, environments: { dev: {} } }, { provider: "jira" });
   assert.deepEqual(jira.secrets.sort(), ["JIRA_API_TOKEN", "OPENROUTER_API_KEY"]);
   assert.deepEqual(jira.variables.sort(), ["JIRA_BASE_URL", "JIRA_EMAIL"]);
+
+  const kaneo = await planPrChecks(stubClient(), { ...ON, environments: { dev: {} } }, { provider: "kaneo" });
+  assert.deepEqual(kaneo.secrets.sort(), ["KANEO_API_TOKEN", "OPENROUTER_API_KEY"]);
+  assert.deepEqual(kaneo.variables.sort(), ["KANEO_API_URL", "KANEO_PROJECT_ID"]);
 });
 
 /** A scope check with no tracker could only ever fail; say so, don't write it. */

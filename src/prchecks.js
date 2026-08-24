@@ -79,6 +79,16 @@ const ISSUE_PROVIDER_ENV = {
     secrets: ["JIRA_API_TOKEN"],
     variables: ["JIRA_BASE_URL", "JIRA_EMAIL"],
   },
+  kaneo: {
+    label: "Kaneo",
+    lines: [
+      "KANEO_API_URL: ${{ vars.KANEO_API_URL }}",
+      "KANEO_PROJECT_ID: ${{ vars.KANEO_PROJECT_ID }}",
+      "KANEO_API_TOKEN: ${{ secrets.KANEO_API_TOKEN }}",
+    ],
+    secrets: ["KANEO_API_TOKEN"],
+    variables: ["KANEO_API_URL", "KANEO_PROJECT_ID"],
+  },
 };
 
 /**
@@ -663,7 +673,7 @@ export async function planPrChecks(client, config, { provider }) {
         what: SCOPE_CHECK_WORKFLOW_PATH,
         reason:
           "it reads the ticket from a task tracker, but taskSync is off (provider 'none') — " +
-          "enable ClickUp or Jira, or set prChecks.scopeCheck.enabled to false",
+          "enable ClickUp, Jira, or Kaneo, or set prChecks.scopeCheck.enabled to false",
       });
     } else if (environments.length === 0) {
       blocked.push({
